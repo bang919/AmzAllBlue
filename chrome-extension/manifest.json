@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Amazon Aggregator Collector",
+  "version": "0.2.0",
+  "description": "Silently collects Amazon Creator Connections chat APIs into the local Amazon Aggregator.",
+  "host_permissions": [
+    "https://advertising.amazon.com/*",
+    "http://localhost:4317/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["https://advertising.amazon.com/bi*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ]
+}

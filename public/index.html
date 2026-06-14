@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>亚马逊红人计划</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>亚马逊红人计划</h1>
+        <p>自动采集、解析和管理 Creator Connections 红人消息</p>
+      </div>
+      <div class="stats" id="stats"></div>
+    </header>
+
+    <main>
+      <div class="layout">
+        <section class="panel list-panel">
+          <div class="panel-head">
+            <h2>红人合作列表</h2>
+            <div class="actions slim">
+              <button id="bulkMailBtn">批量邮件</button>
+              <button id="reprocessBtn">重新解析</button>
+              <button id="refreshBtn">刷新</button>
+            </div>
+          </div>
+          <div class="filters">
+            <input id="search" placeholder="搜索姓名、邮箱、ASIN、地址、建议">
+            <select id="statusFilter">
+              <option value="__active__">全部状态（除忽略外）</option>
+              <option value="">全部状态</option>
+            </select>
+          </div>
+          <div id="requestList" class="request-list"></div>
+        </section>
+
+        <section class="panel detail-panel">
+          <div class="panel-head">
+            <h2>详情</h2>
+            <div class="actions slim">
+              <button id="emailBtn">生成邮件</button>
+              <button id="deleteBtn" class="danger">删除</button>
+            </div>
+          </div>
+          <form id="detailForm" class="detail-form"></form>
+          <pre id="emailDraft" class="answer"></pre>
+        </section>
+
+        <section class="panel mail-panel">
+          <div class="panel-head">
+            <h2>邮件过程</h2>
+            <div class="actions slim">
+              <button id="templateBtn">邮件模板</button>
+              <button id="gmailAuthBtn">授权 Gmail</button>
+              <button id="gmailRefreshBtn">刷新邮件</button>
+            </div>
+          </div>
+          <p id="gmailStatus" class="hint">正在检查 Gmail 状态...</p>
+          <div id="mailWorkspace" class="mail-workspace"></div>
+        </section>
+      </div>
+
+      <section class="panel assistant-panel bottom-assistant">
+        <div class="panel-head">
+          <h2>AI 问答</h2>
+        </div>
+        <label>
+          问题
+          <input id="question" placeholder="今天有多少红人联系我？">
+        </label>
+        <div class="actions">
+          <button id="askBtn">询问</button>
+        </div>
+        <pre id="answer" class="answer"></pre>
+      </section>
+    </main>
+
+    <template id="emptyTemplate">
+      <div class="empty">还没有记录。重新加载 Chrome 插件并刷新 Amazon Advertising 目标页面后，会自动采集和导入。</div>
+    </template>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
