@@ -40,10 +40,13 @@ const fields = [
 
 let requests = [];
 let products = [];
+let adsProfiles = [];
 let selectedId = "";
 let selectedProductAsin = "";
+let selectedAdsProfileId = "";
 let activeModule = "dashboard";
 let productsLoaded = false;
+let adsLoaded = false;
 const MAIL_TEMPLATE_KEY = "amazonAggregator.mailTemplate.v1";
 
 const $ = selector => document.querySelector(selector);
@@ -105,6 +108,12 @@ function switchModule(module) {
     renderProducts();
     if (!productsLoaded) loadProducts().catch(error => {
       $("#sandboxStatus").textContent = `FBA库存同步失败：${error.message}`;
+    });
+  }
+  if (module === "ads") {
+    renderAdsProfiles();
+    if (!adsLoaded) refreshAds().catch(error => {
+      $("#adsStatus").textContent = `Amazon Ads 检查失败：${error.message}`;
     });
   }
   if (module === "dashboard") renderDashboard();
@@ -1007,6 +1016,138 @@ async function syncSandboxProducts() {
   }
 }
 
+function renderAdsStatus(status = window.adsStatusMeta || {}) {
+  const statusNode = $("#adsStatus");
+  const summary = $("#adsSummary");
+  if (!statusNode || !summary) return;
+
+  const configured = Boolean(status.configured);
+  const authorized = Boolean(status.authorized);
+  const selected = status.selectedProfile || null;
+  if (!configured) {
+    statusNode.textContent = `缺少配置：${(status.missing || []).join("、") || "Amazon Ads .env"}`;
+  } else if (!authorized) {
+    statusNode.textContent = "已读取 Ads 配置，等待授权广告账户";
+  } else if (!selected?.profileId) {
+    statusNode.textContent = "广告账户已授权，请选择一个 Profile";
+  } else {
+    statusNode.textContent = `已连接 Profile ${selected.profileId}`;
+  }
+
+  summary.innerHTML = `
+    <div class="fba-summary-card">
+      <strong>${configured ? "已配置" : "缺配置"}</strong>
+      <span>Client ID / Secret</span>
+    </div>
+    <div class="fba-summary-card">
+      <strong>${authorized ? "已授权" : "未授权"}</strong>
+      <span>Refresh token</span>
+    </div>
+    <div class="fba-summary-card">
+      <strong>${escapeHtml(selected?.countryCode || "-")}</strong>
+      <span>当前国家</span>
+    </div>
+    <div class="fba-summary-card">
+      <strong>${escapeHtml(selected?.currencyCode || "-")}</strong>
+      <span>币种</span>
+    </div>
+    <div class="fba-summary-card wide-card">
+      <strong>${escapeHtml(status.endpoint || "-")}</strong>
+      <span>Ads API endpoint</span>
+    </div>
+    <div class="fba-summary-card wide-card">
+      <strong>${escapeHtml(status.redirectUri || "-")}</strong>
+      <span>授权回调地址</span>
+    </div>
+  `;
+
+  const quick = $("#adsQuickText");
+  if (quick) {
+    quick.textContent = selected?.profileId
+      ? `已选择 ${selected.countryCode || selected.profileId}`
+      : authorized ? "选择广告 Profile" : "授权 Amazon Ads";
+  }
+}
+
+function renderAdsProfiles() {
+  const container = $("#adsProfiles");
+  if (!container) return;
+  if (!adsProfiles.length) {
+    container.innerHTML = `<div class="empty">暂无广告 Profile。先点击“授权广告账户”，授权后再刷新。</div>`;
+    return;
+  }
+  container.innerHTML = adsProfiles.map(profile => {
+    const active = profile.profileId === selectedAdsProfileId;
+    return `
+      <button class="ads-profile-card${active ? " active" : ""}" data-profile-id="${escapeHtml(profile.profileId)}">
+        <strong>${escapeHtml(profile.accountName || profile.profileId)}</strong>
+        <span>${escapeHtml([profile.countryCode, profile.currencyCode, profile.type].filter(Boolean).join(" / ") || "Amazon Ads Profile")}</span>
+        <small>${escapeHtml(profile.profileId)}${profile.sellerStringId ? ` · ${escapeHtml(profile.sellerStringId)}` : ""}</small>
+      </button>
+    `;
+  }).join("");
+  container.querySelectorAll("[data-profile-id]").forEach(button => {
+    button.addEventListener("click", () => selectAdsProfile(button.dataset.profileId));
+  });
+}
+
+async function loadAdsStatus() {
+  const data = await api("/api/ads/status");
+  window.adsStatusMeta = data;
+  selectedAdsProfileId = data.selectedProfile?.profileId || selectedAdsProfileId;
+  renderAdsStatus(data);
+  return data;
+}
+
+async function loadAdsProfiles() {
+  const data = await api("/api/ads/profiles");
+  adsProfiles = data.profiles || [];
+  selectedAdsProfileId = data.selectedProfile?.profileId || selectedAdsProfileId;
+  renderAdsProfiles();
+  return data;
+}
+
+async function refreshAds() {
+  const status = await loadAdsStatus();
+  adsLoaded = true;
+  if (status.authorized) {
+    try {
+      await loadAdsProfiles();
+    } catch (error) {
+      $("#adsProfiles").innerHTML = `<div class="empty">读取 Amazon Ads Profile 失败：${escapeHtml(error.message)}</div>`;
+    }
+  }
+}
+
+async function authorizeAds() {
+  const button = $("#adsAuthBtn");
+  setBusy(button, true, "授权广告账户");
+  try {
+    const data = await api("/api/ads/auth-url");
+    window.open(data.url, "_blank", "noopener,noreferrer");
+    $("#adsStatus").textContent = "已打开 Amazon 授权页。授权完成后回到这里点击刷新。";
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    setBusy(button, false, "授权广告账户");
+  }
+}
+
+async function selectAdsProfile(profileId) {
+  if (!profileId) return;
+  const data = await api("/api/ads/select-profile", {
+    method: "POST",
+    body: { profileId }
+  });
+  selectedAdsProfileId = data.profile?.profileId || profileId;
+  window.adsStatusMeta = {
+    ...(window.adsStatusMeta || {}),
+    selectedProfile: data.profile
+  };
+  renderAdsStatus(window.adsStatusMeta);
+  renderAdsProfiles();
+}
+
 async function renderMailPanel() {
   const container = $("#mailWorkspace");
   const item = getSelected();
@@ -1189,6 +1330,8 @@ $("#statusFilter").addEventListener("change", renderList);
 $("#dashboardRefreshBtn").addEventListener("click", () => refreshWorkspace().catch(error => alert(error.message)));
 $("#refreshProductsBtn").addEventListener("click", () => loadProducts({ refresh: true }).catch(error => alert(error.message)));
 $("#syncProductsBtn").addEventListener("click", () => syncSandboxProducts().catch(error => alert(error.message)));
+$("#adsAuthBtn").addEventListener("click", authorizeAds);
+$("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
 $("#productSearch").addEventListener("input", renderProducts);
 $("#productSourceFilter").addEventListener("change", renderProducts);
 $("#salesStartDate").addEventListener("change", () => loadProducts({ refresh: true }).catch(error => alert(error.message)));
@@ -1201,6 +1344,11 @@ $("#globalSearch").addEventListener("input", () => {
   } else if (activeModule === "influencers") {
     $("#search").value = value;
     renderList();
+  } else if (activeModule === "ads") {
+    const needle = value.trim().toLowerCase();
+    document.querySelectorAll(".ads-profile-card").forEach(card => {
+      card.hidden = needle && !card.textContent.toLowerCase().includes(needle);
+    });
   }
 });
 document.querySelectorAll(".module-tab").forEach(tab => {

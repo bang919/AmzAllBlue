@@ -5,4 +5,6 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 data/gmail-token.json
+data/ads-token.json
+data/ads-profile.json
 data/network-debug.jsonl

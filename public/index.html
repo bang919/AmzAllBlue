@@ -19,6 +19,7 @@
         <nav class="side-nav">
           <button class="module-tab active" data-module="dashboard">仪表盘</button>
           <button class="module-tab" data-module="products">FBA库存</button>
+          <button class="module-tab" data-module="ads">广告管理</button>
           <button class="module-tab" data-module="influencers">红人营销</button>
           <button class="module-tab" data-module="orders">订单管理</button>
           <button class="module-tab" data-module="inventory">库存仓库</button>
@@ -70,13 +71,13 @@
               <strong>FBA库存</strong>
               <span id="productQuickText">查看库存和销量</span>
             </button>
+            <button class="quick-card" data-module-jump="ads">
+              <strong>广告管理</strong>
+              <span id="adsQuickText">授权 Amazon Ads</span>
+            </button>
             <button class="quick-card" data-module-jump="influencers">
               <strong>红人营销</strong>
               <span id="influencerQuickText">管理合作请求</span>
-            </button>
-            <button class="quick-card" data-module-jump="inventory">
-              <strong>库存仓库</strong>
-              <span>集中查看库存预警</span>
             </button>
           </div>
         </section>
@@ -141,6 +142,59 @@
                 <tbody id="productList"></tbody>
                 <tfoot id="fbaTotals"></tfoot>
               </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="adsPage" class="module-page">
+          <div class="page-head">
+            <div>
+              <h1>广告管理</h1>
+              <p>连接 Amazon Ads，选择广告 Profile，为花费、广告销售额和 ACOS 报表做准备</p>
+            </div>
+            <div class="actions slim">
+              <button id="adsAuthBtn">授权广告账户</button>
+              <button id="adsRefreshBtn">刷新</button>
+            </div>
+          </div>
+
+          <section class="panel ads-panel">
+            <div class="panel-head">
+              <h2>连接状态</h2>
+              <span id="adsStatus" class="hint">正在检查 Amazon Ads 状态...</span>
+            </div>
+            <div id="adsSummary" class="fba-summary"></div>
+          </section>
+
+          <section class="panel ads-panel">
+            <div class="panel-head">
+              <h2>广告 Profile</h2>
+              <span class="hint">Profile 决定后续报表读取哪个国家/店铺的广告数据</span>
+            </div>
+            <div id="adsProfiles" class="ads-profile-list"></div>
+          </section>
+
+          <section class="panel ads-panel">
+            <div class="panel-head">
+              <h2>下一步报表</h2>
+            </div>
+            <div class="ads-report-grid">
+              <div>
+                <strong>花费</strong>
+                <span>按日期、Campaign、ASIN 统计广告 spend</span>
+              </div>
+              <div>
+                <strong>广告销售额</strong>
+                <span>读取 attributed sales，用于核算投产</span>
+              </div>
+              <div>
+                <strong>ACOS / ROAS</strong>
+                <span>结合 spend 和广告销售额自动计算</span>
+              </div>
+              <div>
+                <strong>库存联动</strong>
+                <span>把广告销量和 FBA 库存放到同一张运营表</span>
+              </div>
             </div>
           </section>
         </section>

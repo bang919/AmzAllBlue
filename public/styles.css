@@ -459,6 +459,15 @@ h2 {
   font-size: 12px;
 }
 
+.fba-summary-card.wide-card {
+  grid-column: span 2;
+}
+
+.fba-summary-card.wide-card strong {
+  font-size: 13px;
+  word-break: break-all;
+}
+
 .fba-warning {
   grid-column: 1 / -1;
   border: 1px solid #fed7aa;
@@ -576,6 +585,75 @@ h2 {
 .stock-unknown {
   color: #6b7280 !important;
   background: #f3f4f6;
+}
+
+.ads-panel {
+  margin: 0 28px 16px;
+}
+
+.ads-profile-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
+  padding: 16px;
+}
+
+.ads-profile-card {
+  display: grid;
+  gap: 6px;
+  min-height: 104px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  text-align: left;
+}
+
+.ads-profile-card.active {
+  border-color: var(--accent);
+  background: var(--soft);
+}
+
+.ads-profile-card strong,
+.ads-profile-card span,
+.ads-profile-card small {
+  display: block;
+}
+
+.ads-profile-card span,
+.ads-profile-card small {
+  color: var(--muted);
+}
+
+.ads-profile-card small {
+  font-size: 12px;
+}
+
+.ads-report-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  padding: 16px;
+}
+
+.ads-report-grid > div {
+  min-height: 94px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+
+.ads-report-grid strong,
+.ads-report-grid span {
+  display: block;
+}
+
+.ads-report-grid span {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
 }
 
 .product-list {

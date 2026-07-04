@@ -11,6 +11,8 @@ const DATA_DIR = join(ROOT, "data");
 const DB_PATH = join(DATA_DIR, "db.json");
 const NETWORK_DEBUG_PATH = join(DATA_DIR, "network-debug.jsonl");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
+const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
+const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
 const ENV_PATH = join(ROOT, ".env");
 const fbaInventoryCache = new Map();
 
@@ -1843,6 +1845,201 @@ async function gmailFetch(path, options = {}) {
   return data;
 }
 
+function adsConfig() {
+  const endpoint = (process.env.AMZ_ADS_API_ENDPOINT || "https://advertising-api.amazon.com").replace(/\/+$/, "");
+  return {
+    clientId: process.env.AMZ_ADS_CLIENT_ID || "",
+    clientSecret: process.env.AMZ_ADS_CLIENT_SECRET || "",
+    redirectUri: process.env.AMZ_ADS_REDIRECT_URI || `http://localhost:${PORT}/api/ads/callback`,
+    scope: process.env.AMZ_ADS_SCOPE || "advertising::campaign_management",
+    endpoint
+  };
+}
+
+function adsPublicConfig() {
+  const config = adsConfig();
+  const missing = [];
+  if (!config.clientId) missing.push("AMZ_ADS_CLIENT_ID");
+  if (!config.clientSecret) missing.push("AMZ_ADS_CLIENT_SECRET");
+  return {
+    configured: missing.length === 0,
+    missing,
+    endpoint: config.endpoint,
+    redirectUri: config.redirectUri,
+    scope: config.scope
+  };
+}
+
+function assertAdsConfig() {
+  const config = adsConfig();
+  const missing = adsPublicConfig().missing;
+  if (missing.length) throw new Error(`请先在 .env 配置 ${missing.join("、")}`);
+  return config;
+}
+
+async function readAdsToken() {
+  if (!existsSync(ADS_TOKEN_PATH)) return null;
+  try {
+    return JSON.parse(await readFile(ADS_TOKEN_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeAdsToken(token) {
+  await ensureDb();
+  await writeFile(ADS_TOKEN_PATH, JSON.stringify(token, null, 2), "utf8");
+}
+
+async function readAdsProfileSelection() {
+  if (!existsSync(ADS_PROFILE_PATH)) return null;
+  try {
+    return JSON.parse(await readFile(ADS_PROFILE_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function writeAdsProfileSelection(profile) {
+  await ensureDb();
+  await writeFile(ADS_PROFILE_PATH, JSON.stringify(profile, null, 2), "utf8");
+}
+
+function adsAuthUrl() {
+  const config = assertAdsConfig();
+  const params = new URLSearchParams({
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    response_type: "code",
+    scope: config.scope
+  });
+  return `https://www.amazon.com/ap/oa?${params}`;
+}
+
+async function exchangeAdsCode(code) {
+  const config = assertAdsConfig();
+  const response = await fetch("https://api.amazon.com/auth/o2/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      redirect_uri: config.redirectUri,
+      grant_type: "authorization_code"
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error_description || data.error || "Amazon Ads 授权失败");
+  await writeAdsToken({
+    ...data,
+    expires_at: Date.now() + Number(data.expires_in || 3600) * 1000
+  });
+}
+
+async function getAdsAccessToken() {
+  const config = assertAdsConfig();
+  const token = await readAdsToken();
+  if (!token?.access_token && !token?.refresh_token) throw new Error("Amazon Ads 尚未授权");
+  if (token.access_token && token.expires_at && token.expires_at > Date.now() + 60_000) {
+    return token.access_token;
+  }
+  if (!token.refresh_token) throw new Error("Amazon Ads 授权已过期，请重新授权");
+
+  const response = await fetch("https://api.amazon.com/auth/o2/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: config.clientId,
+      client_secret: config.clientSecret,
+      refresh_token: token.refresh_token,
+      grant_type: "refresh_token"
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error_description || data.error || "Amazon Ads 刷新授权失败");
+  const next = {
+    ...token,
+    ...data,
+    refresh_token: data.refresh_token || token.refresh_token,
+    expires_at: Date.now() + Number(data.expires_in || 3600) * 1000
+  };
+  await writeAdsToken(next);
+  return next.access_token;
+}
+
+async function adsFetch(pathname, params = {}, options = {}) {
+  const accessToken = await getAdsAccessToken();
+  const config = assertAdsConfig();
+  const url = new URL(pathname, config.endpoint);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  });
+
+  const headers = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "authorization": `Bearer ${accessToken}`,
+    "amazon-advertising-api-clientid": config.clientId,
+    ...(options.headers || {})
+  };
+  if (options.requireProfile || options.profileId) {
+    const selected = options.profileId ? { profileId: options.profileId } : await readAdsProfileSelection();
+    if (!selected?.profileId) throw new Error("请先选择 Amazon Ads Profile");
+    headers["amazon-advertising-api-scope"] = String(selected.profileId);
+  }
+
+  const response = await fetch(url, {
+    method: options.method || "GET",
+    headers,
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = {};
+  }
+  if (!response.ok) {
+    const detail = data?.details || data?.message || data?.error_description || data?.error || text || `Ads API ${response.status}`;
+    throw new Error(`${response.status} ${detail}`);
+  }
+  return data;
+}
+
+function normalizeAdsProfile(profile) {
+  const accountInfo = profile.accountInfo || {};
+  return {
+    profileId: String(profile.profileId || ""),
+    countryCode: profile.countryCode || "",
+    currencyCode: profile.currencyCode || "",
+    timezone: profile.timezone || "",
+    dailyBudget: profile.dailyBudget ?? "",
+    accountName: accountInfo.name || accountInfo.sellerStringId || accountInfo.vendorGroupName || "",
+    marketplaceStringId: accountInfo.marketplaceStringId || "",
+    sellerStringId: accountInfo.sellerStringId || "",
+    type: accountInfo.type || ""
+  };
+}
+
+async function fetchAdsProfiles() {
+  const profiles = await adsFetch("/v2/profiles", {}, { requireProfile: false });
+  return (Array.isArray(profiles) ? profiles : []).map(normalizeAdsProfile).filter(profile => profile.profileId);
+}
+
+async function adsStatus() {
+  const publicConfig = adsPublicConfig();
+  const token = await readAdsToken();
+  const selectedProfile = await readAdsProfileSelection();
+  return {
+    ...publicConfig,
+    authorized: Boolean(token?.refresh_token),
+    hasAccessToken: Boolean(token?.access_token),
+    selectedProfile: selectedProfile || null
+  };
+}
+
 async function markGmailMessagesRead(messageIds = []) {
   const ids = messageIds.filter(Boolean);
   if (!ids.length) return null;
@@ -1994,6 +2191,40 @@ async function handleApi(req, res, url) {
     } catch (error) {
       return sendJson(res, { configured, authorized: false, error: error.message });
     }
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/auth-url") {
+    return sendJson(res, { url: adsAuthUrl() });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/callback") {
+    const code = url.searchParams.get("code");
+    if (!code) return sendJson(res, { error: "Missing Amazon Ads authorization code" }, 400);
+    await exchangeAdsCode(code);
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end("<p>Amazon Ads 授权成功，可以关闭此页面并回到工作台刷新广告管理。</p>");
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/status") {
+    return sendJson(res, await adsStatus());
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/profiles") {
+    const profiles = await fetchAdsProfiles();
+    const selectedProfile = await readAdsProfileSelection();
+    return sendJson(res, { profiles, selectedProfile });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/select-profile") {
+    const body = await parseBody(req);
+    const profileId = String(body.profileId || "");
+    if (!profileId) return sendJson(res, { error: "Missing profileId" }, 400);
+    const profiles = await fetchAdsProfiles();
+    const profile = profiles.find(item => item.profileId === profileId);
+    if (!profile) return sendJson(res, { error: "Profile not found" }, 404);
+    await writeAdsProfileSelection(profile);
+    return sendJson(res, { profile });
   }
 
   if (req.method === "GET" && url.pathname === "/api/gmail/messages") {
