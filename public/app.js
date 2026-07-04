@@ -39,7 +39,11 @@ const fields = [
 ];
 
 let requests = [];
+let products = [];
 let selectedId = "";
+let selectedProductAsin = "";
+let activeModule = "dashboard";
+let productsLoaded = false;
 const MAIL_TEMPLATE_KEY = "amazonAggregator.mailTemplate.v1";
 
 const $ = selector => document.querySelector(selector);
@@ -76,6 +80,10 @@ function getSelected() {
   return requests.find(item => item.id === selectedId) || null;
 }
 
+function getSelectedProduct() {
+  return products.find(item => item.asin === selectedProductAsin) || products[0] || null;
+}
+
 function formatDate(value) {
   if (!value) return "";
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
@@ -83,6 +91,62 @@ function formatDate(value) {
 
 function displayName(item) {
   return item.conversationName || item.influencerName || item.brandName || "未命名红人";
+}
+
+function switchModule(module) {
+  activeModule = module;
+  document.querySelectorAll(".module-tab").forEach(tab => {
+    tab.classList.toggle("active", tab.dataset.module === module);
+  });
+  document.querySelectorAll(".module-page").forEach(page => {
+    page.classList.toggle("active", page.id === `${module}Page`);
+  });
+  if (module === "products") {
+    renderProducts();
+    if (!productsLoaded) loadProducts().catch(error => {
+      $("#sandboxStatus").textContent = `FBA库存同步失败：${error.message}`;
+    });
+  }
+  if (module === "dashboard") renderDashboard();
+}
+
+function asMoney(value, currency = "USD") {
+  if (value === "" || value === null || value === undefined || Number.isNaN(Number(value))) return "未同步";
+  return new Intl.NumberFormat("zh-CN", { style: "currency", currency }).format(Number(value));
+}
+
+function productTitle(product) {
+  return product?.title || `Amazon 商品 ${product?.asin || ""}`.trim();
+}
+
+function productSourceLabel(source) {
+  return source === "sandbox" ? "Amazon sandbox" : "本地聚合";
+}
+
+function defaultDateRange() {
+  const end = new Date(Date.now() - 86400000);
+  const start = new Date(end);
+  return {
+    startDate: start.toISOString().slice(0, 10),
+    endDate: end.toISOString().slice(0, 10)
+  };
+}
+
+function formatNumber(value, digits = 0) {
+  if (value === null || value === undefined || value === "") return "-";
+  return new Intl.NumberFormat("zh-CN", {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: digits
+  }).format(Number(value || 0));
+}
+
+function stockLevelLabel(level) {
+  return {
+    low: "低库存",
+    medium: "中等",
+    healthy: "充足",
+    unknown: "无销量"
+  }[level] || "未知";
 }
 
 function renderStatusOptions() {
@@ -118,6 +182,101 @@ function renderStats() {
     <div class="stat"><strong>${contacted}</strong>已联系</div>
     <div class="stat"><strong>${important}</strong>重点标记</div>
   `;
+  renderDashboard();
+}
+
+function dateKey(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toISOString().slice(5, 10);
+}
+
+function renderTrendChart() {
+  const chart = $("#trendChart");
+  if (!chart) return;
+  const buckets = new Map();
+  const recent = [...requests]
+    .filter(item => item.createdAt)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .slice(-40);
+  recent.forEach(item => {
+    const key = dateKey(item.createdAt);
+    if (key) buckets.set(key, (buckets.get(key) || 0) + 1);
+  });
+  const rows = [...buckets.entries()].slice(-7);
+  if (!rows.length) {
+    chart.innerHTML = `<div class="empty">暂无趋势数据</div>`;
+    return;
+  }
+  const max = Math.max(...rows.map(([, count]) => count), 1);
+  const points = rows.map(([label, count], index) => ({
+    label,
+    count,
+    x: rows.length === 1 ? 50 : (index / (rows.length - 1)) * 100,
+    y: 100 - (count / max) * 82 - 8
+  }));
+  const segments = points.slice(1).map((point, index) => {
+    const previous = points[index];
+    const dx = point.x - previous.x;
+    const dy = point.y - previous.y;
+    const length = Math.sqrt(dx * dx + dy * dy);
+    const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    return `<span class="trend-segment" style="left:${previous.x}%;top:${previous.y}%;width:${length}%;transform:rotate(${angle}deg)"></span>`;
+  }).join("");
+  chart.innerHTML = `
+    <div class="trend-line">
+      ${segments}
+      ${points.map(point => `<span class="trend-point" title="${escapeHtml(point.label)}: ${point.count}" style="left:${point.x}%;top:${point.y}%"></span>`).join("")}
+    </div>
+  `;
+  const first = points[0]?.count || 0;
+  const last = points[points.length - 1]?.count || 0;
+  const delta = first ? Math.round(((last - first) / first) * 100) : (last ? 100 : 0);
+  const deltaNode = $("#trendDelta");
+  if (deltaNode) deltaNode.textContent = `${delta >= 0 ? "+" : ""}${delta}%`;
+}
+
+function renderProductBars() {
+  const container = $("#productBars");
+  if (!container) return;
+  const rows = products.slice(0, 6).map(product => ({
+    label: product.asin || "无 ASIN",
+    count: product.totalQuantity || 0
+  }));
+  if (!rows.length) {
+    container.innerHTML = `<div class="empty">暂无商品数据</div>`;
+    return;
+  }
+  const max = Math.max(...rows.map(row => row.count), 1);
+  container.innerHTML = rows.map(row => `
+    <div class="bar-row">
+      <span>${escapeHtml(row.label)}</span>
+      <span class="bar-track"><span class="bar-fill" style="width:${Math.max(6, row.count / max * 100)}%"></span></span>
+      <strong>${row.count}</strong>
+    </div>
+  `).join("");
+}
+
+function renderDashboard() {
+  const metrics = $("#dashboardMetrics");
+  if (!metrics) return;
+  const unread = requests.filter(item => item.status === "unread_email").length;
+  const activeCreators = requests.filter(item => item.status !== "ignored").length;
+  const waiting = requests.filter(item => item.autoStage === "waiting_video").length;
+  const published = requests.filter(item => ["published", "published_wants_more"].includes(item.autoStage) || item.publishedUrl).length;
+  metrics.innerHTML = `
+    <article class="metric-card"><span>FBA SKU</span><strong>${products.length}</strong><small>${formatNumber(window.fbaInventoryMeta?.totals?.fulfillableQuantity || 0)} 件可售</small></article>
+    <article class="metric-card"><span>红人记录</span><strong>${activeCreators}</strong><small>${unread} 条未读邮件</small></article>
+    <article class="metric-card"><span>待跟进视频</span><strong>${waiting}</strong><small>寄样后需追踪</small></article>
+    <article class="metric-card"><span>已发布内容</span><strong>${published}</strong><small>可复盘转化</small></article>
+  `;
+  const productQuick = $("#productQuickText");
+  if (productQuick) productQuick.textContent = `查看 ${products.length} 个 FBA SKU`;
+  const influencerQuick = $("#influencerQuickText");
+  if (influencerQuick) influencerQuick.textContent = `管理 ${activeCreators} 条合作`;
+  renderTrendChart();
+  renderProductBars();
 }
 
 function requestMatches(item) {
@@ -709,6 +868,145 @@ function renderMailMessages(messages) {
   `;
 }
 
+function productMatches(product) {
+  const keyword = ($("#productSearch")?.value || $("#globalSearch")?.value || "").trim().toLowerCase();
+  const source = $("#productSourceFilter")?.value || "";
+  if (source && product.stockLevel !== source) return false;
+  if (!keyword) return true;
+  return [
+    product.asin,
+    product.sellerSku,
+    product.fnSku,
+    product.title,
+    product.brand
+  ].join(" ").toLowerCase().includes(keyword);
+}
+
+function renderProducts() {
+  const list = $("#productList");
+  if (!list) return;
+  const visible = products.filter(productMatches);
+  const summary = $("#fbaSummary");
+  if (summary && window.fbaInventoryMeta) {
+    const { totals, range, config, warnings, sales } = window.fbaInventoryMeta;
+    summary.innerHTML = `
+      <div class="fba-summary-card"><strong>${formatNumber(products.length)}</strong><span>SKU 数</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(totals?.totalQuantity || 0)}</strong><span>总库存</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(totals?.fulfillableQuantity || 0)}</strong><span>可售</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(totals?.salesUnits || 0)}</strong><span>${escapeHtml(range?.dayCount || 0)} 天售卖数量</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(sales?.orderCount || 0)}</strong><span>订单数</span></div>
+      <div class="fba-summary-card"><strong>${escapeHtml(config?.marketplaceId || "-")}</strong><span>Marketplace</span></div>
+      ${warnings?.length ? `<div class="fba-warning">${escapeHtml(warnings[0])}${warnings.length > 1 ? `，另有 ${warnings.length - 1} 条提示` : ""}</div>` : ""}
+    `;
+  }
+  if (!visible.length) {
+    list.innerHTML = `<tr><td colspan="13"><div class="empty">暂无 FBA 库存数据。点击“同步库存”从 SP-API 拉取。</div></td></tr>`;
+    $("#fbaTotals").innerHTML = "";
+    return;
+  }
+  list.innerHTML = visible.map(product => `
+    <tr>
+      <td>${product.imageUrl ? `<img class="fba-thumb" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title || product.asin)}">` : `<div class="fba-thumb placeholder">无图</div>`}</td>
+      <td>
+        <a href="https://www.amazon.com/dp/${escapeHtml(product.asin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.asin || "-")}</a>
+        <span>${escapeHtml(product.sellerSku || "-")}</span>
+      </td>
+      <td>
+        <strong>${escapeHtml(product.fnSku || "-")}</strong>
+        <span>${escapeHtml(product.sellerSku || "-")}</span>
+      </td>
+      <td class="fba-name">${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span></td>
+      <td>${formatNumber(product.totalQuantity)}</td>
+      <td>${formatNumber(product.inTransitQuantity)}</td>
+      <td>${formatNumber(product.fulfillableQuantity)}</td>
+      <td>${formatNumber(product.inboundWorkingQuantity)}</td>
+      <td>${formatNumber(product.reservedQuantity)}</td>
+      <td>${formatNumber(product.salesOrders)}</td>
+      <td>${formatNumber(product.salesUnits)}</td>
+      <td>${formatNumber(product.dailySales, 2)}</td>
+      <td><span class="stock-pill stock-${escapeHtml(product.stockLevel)}">${product.coverDays === null ? "无销量" : `${formatNumber(product.coverDays)} 天`}</span></td>
+    </tr>
+  `).join("");
+  const totals = visible.reduce((acc, row) => {
+    acc.totalQuantity += row.totalQuantity || 0;
+    acc.inTransitQuantity += row.inTransitQuantity || 0;
+    acc.fulfillableQuantity += row.fulfillableQuantity || 0;
+    acc.inboundWorkingQuantity += row.inboundWorkingQuantity || 0;
+    acc.reservedQuantity += row.reservedQuantity || 0;
+    acc.salesOrders += row.salesOrders || 0;
+    acc.salesUnits += row.salesUnits || 0;
+    return acc;
+  }, { totalQuantity: 0, inTransitQuantity: 0, fulfillableQuantity: 0, inboundWorkingQuantity: 0, reservedQuantity: 0, salesOrders: 0, salesUnits: 0 });
+  $("#fbaTotals").innerHTML = `
+    <tr>
+      <td colspan="4">汇总</td>
+      <td>${formatNumber(totals.totalQuantity)}</td>
+      <td>${formatNumber(totals.inTransitQuantity)}</td>
+      <td>${formatNumber(totals.fulfillableQuantity)}</td>
+      <td>${formatNumber(totals.inboundWorkingQuantity)}</td>
+      <td>${formatNumber(totals.reservedQuantity)}</td>
+      <td>${formatNumber(totals.salesOrders)}</td>
+      <td>${formatNumber(totals.salesUnits)}</td>
+      <td colspan="2"></td>
+    </tr>
+  `;
+  renderDashboard();
+}
+
+async function loadProducts({ refresh = false } = {}) {
+  const range = defaultDateRange();
+  const startDate = $("#salesStartDate")?.value || range.startDate;
+  const endDate = $("#salesEndDate")?.value || range.endDate;
+  const params = new URLSearchParams({ startDate, endDate });
+  if (refresh) params.set("refresh", "1");
+  const data = await api(`/api/fba/inventory?${params.toString()}`);
+  products = data.rows || [];
+  productsLoaded = true;
+  window.fbaInventoryMeta = {
+    totals: data.totals || {},
+    range: data.range || {},
+    config: data.config || {},
+    sales: data.sales || {},
+    warnings: data.warnings || []
+  };
+  renderProducts();
+}
+
+async function loadSandboxStatus() {
+  const node = $("#sandboxStatus");
+  if (!node) return null;
+  try {
+    const data = await api("/api/spapi/status");
+    if (data.sellers?.ok) {
+      const marketplaceCount = data.sellers.marketplaces?.length || 0;
+      node.textContent = `SP-API 已连通${marketplaceCount ? `，${marketplaceCount} 个站点` : ""}`;
+    } else if (data.lwa?.ok) {
+      node.textContent = `LWA 已连通，SP-API 待确认：${data.sellers?.status || ""}`;
+    } else {
+      node.textContent = data.config?.missing?.length
+        ? `SP-API 缺少配置：${data.config.missing.join(", ")}`
+        : `SP-API 检查失败`;
+    }
+    return data;
+  } catch (error) {
+    node.textContent = `SP-API 检查失败：${error.message}`;
+    return null;
+  }
+}
+
+async function syncSandboxProducts() {
+  const button = $("#syncProductsBtn");
+  setBusy(button, true, "同步库存");
+  try {
+    await loadProducts({ refresh: true });
+    $("#sandboxStatus").textContent = `FBA库存已同步 ${products.length} 个 SKU`;
+  } catch (error) {
+    $("#sandboxStatus").textContent = `FBA库存同步失败：${error.message}`;
+  } finally {
+    setBusy(button, false, "同步库存");
+  }
+}
+
 async function renderMailPanel() {
   const container = $("#mailWorkspace");
   const item = getSelected();
@@ -803,9 +1101,11 @@ async function loadRequests() {
   renderList();
   renderDetail();
   renderMailPanel();
+  renderDashboard();
 }
 
 async function refreshWorkspace({ syncMail = true } = {}) {
+  await loadSandboxStatus();
   await loadGmailStatus();
   await loadRequests();
   if (syncMail) {
@@ -886,7 +1186,33 @@ $("#gmailRefreshBtn").addEventListener("click", async () => {
 });
 $("#search").addEventListener("input", renderList);
 $("#statusFilter").addEventListener("change", renderList);
+$("#dashboardRefreshBtn").addEventListener("click", () => refreshWorkspace().catch(error => alert(error.message)));
+$("#refreshProductsBtn").addEventListener("click", () => loadProducts({ refresh: true }).catch(error => alert(error.message)));
+$("#syncProductsBtn").addEventListener("click", () => syncSandboxProducts().catch(error => alert(error.message)));
+$("#productSearch").addEventListener("input", renderProducts);
+$("#productSourceFilter").addEventListener("change", renderProducts);
+$("#salesStartDate").addEventListener("change", () => loadProducts({ refresh: true }).catch(error => alert(error.message)));
+$("#salesEndDate").addEventListener("change", () => loadProducts({ refresh: true }).catch(error => alert(error.message)));
+$("#globalSearch").addEventListener("input", () => {
+  const value = $("#globalSearch").value;
+  if (activeModule === "products") {
+    $("#productSearch").value = value;
+    renderProducts();
+  } else if (activeModule === "influencers") {
+    $("#search").value = value;
+    renderList();
+  }
+});
+document.querySelectorAll(".module-tab").forEach(tab => {
+  tab.addEventListener("click", () => switchModule(tab.dataset.module));
+});
+document.querySelectorAll("[data-module-jump]").forEach(button => {
+  button.addEventListener("click", () => switchModule(button.dataset.moduleJump));
+});
 
+const initialRange = defaultDateRange();
+if ($("#salesStartDate")) $("#salesStartDate").value = initialRange.startDate;
+if ($("#salesEndDate")) $("#salesEndDate").value = initialRange.endDate;
 renderStatusOptions();
 refreshWorkspace().catch(error => alert(error.message));
 setInterval(syncGmailStatuses, 120000);

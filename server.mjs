@@ -12,6 +12,7 @@ const DB_PATH = join(DATA_DIR, "db.json");
 const NETWORK_DEBUG_PATH = join(DATA_DIR, "network-debug.jsonl");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
 const ENV_PATH = join(ROOT, ".env");
+const fbaInventoryCache = new Map();
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -529,6 +530,681 @@ function normalizeRequest(input) {
     emailLastError: input.emailLastError || "",
     emailLastErrorAt: input.emailLastErrorAt || "",
     important: Boolean(input.important)
+  };
+}
+
+function normalizeProduct(input) {
+  const asin = String(input.asin || "").trim().toUpperCase();
+  return {
+    id: input.id || asin || randomUUID(),
+    asin,
+    sku: String(input.sku || "").trim(),
+    title: String(input.title || input.itemName || "").trim(),
+    brand: String(input.brand || "").trim(),
+    imageUrl: String(input.imageUrl || "").trim(),
+    price: input.price === "" || input.price === undefined ? "" : Number(input.price),
+    currency: String(input.currency || "USD").trim(),
+    status: String(input.status || "active").trim(),
+    inventory: input.inventory === "" || input.inventory === undefined ? "" : Number(input.inventory),
+    source: String(input.source || "local").trim(),
+    marketplaceId: String(input.marketplaceId || "").trim(),
+    updatedAt: input.updatedAt || new Date().toISOString(),
+    raw: input.raw || null
+  };
+}
+
+function requestAsins(item) {
+  return unique([
+    item.asin,
+    ...(Array.isArray(item.requestedAsins) ? item.requestedAsins : [])
+  ].map(value => String(value || "").toUpperCase()).filter(value => /^B[A-Z0-9]{9}$/.test(value)));
+}
+
+function inferProductTitle(asin, requests) {
+  const pattern = new RegExp(`([^\\n.。]{8,120})\\s*\\(?${asin}\\)?`, "i");
+  const generic = /\b(?:your product|product page|creator connections|interested in|came across|shoppable review|shoppable video|promote your product|these products|sending two|different versions|guarantee|collaborate)\b/i;
+  for (const item of requests) {
+    const raw = String(item.rawText || item.conversationRaw || "");
+    const match = raw.match(pattern);
+    if (match?.[1]) {
+      const title = match[1]
+        .replace(/(?:your product|product page|ASIN|for|saw|interested in|products?:)$/ig, "")
+        .replace(/^[\s:：,，.-]+|[\s:：,，.-]+$/g, "")
+        .slice(-90)
+        .trim();
+      if (
+        title
+        && !generic.test(title)
+        && /^[A-Z0-9]/.test(title)
+        && !/\b(?:ASIN|product|page|with the)$/i.test(title)
+        && /\b[A-Z][A-Za-z0-9-]{2,}\b/.test(title)
+      ) return title;
+    }
+  }
+  return "";
+}
+
+function buildProductsFromDb(db) {
+  const requests = Array.isArray(db.requests) ? db.requests.map(item => normalizeRequest(item)) : [];
+  const manualProducts = Array.isArray(db.products) ? db.products.map(item => normalizeProduct(item)) : [];
+  const byAsin = new Map(manualProducts.filter(item => item.asin).map(item => [item.asin, item]));
+
+  for (const requestItem of requests) {
+    for (const asin of requestAsins(requestItem)) {
+      if (!byAsin.has(asin)) {
+        byAsin.set(asin, normalizeProduct({
+          asin,
+          title: `Amazon 商品 ${asin}`,
+          source: "local",
+          updatedAt: requestItem.createdAt || new Date().toISOString()
+        }));
+      }
+    }
+  }
+
+  return [...byAsin.values()]
+    .map(product => {
+      const relatedRequests = requests.filter(item => requestAsins(item).includes(product.asin));
+      const shipped = relatedRequests.filter(item => item.trackingNumber || item.shippedAt || ["waiting_video", "published", "published_wants_more"].includes(item.autoStage)).length;
+      const published = relatedRequests.filter(item => ["published", "published_wants_more"].includes(item.autoStage) || item.publishedUrl).length;
+      const waiting = relatedRequests.filter(item => item.autoStage === "waiting_video").length;
+      const important = relatedRequests.filter(item => item.important).length;
+      return {
+        ...product,
+        title: product.title || `Amazon 商品 ${product.asin}`,
+        metrics: {
+          influencerCount: relatedRequests.length,
+          shipped,
+          waiting,
+          published,
+          important
+        },
+        creators: relatedRequests.map(item => ({
+          id: item.id,
+          name: item.conversationName || item.influencerName || item.brandName || "未命名红人",
+          email: item.email || "",
+          status: item.status || "",
+          stage: item.autoStage || "",
+          aiScore: item.aiScore || 0,
+          trackingNumber: item.trackingNumber || "",
+          publishedUrl: item.publishedUrl || "",
+          createdAt: item.createdAt || ""
+        }))
+      };
+    })
+    .sort((a, b) => Number(b.metrics.influencerCount || 0) - Number(a.metrics.influencerCount || 0) || a.asin.localeCompare(b.asin));
+}
+
+function parseAmazonSandboxCredentials() {
+  const rawCredentials = process.env.AMZ_SANDBOX_CREDENTIALS || "";
+  const refreshToken = process.env.AMZ_SANDBOX_TOKEN || "";
+  const result = {
+    configured: Boolean(rawCredentials && refreshToken),
+    clientId: "",
+    clientSecret: "",
+    refreshToken
+  };
+  if (!rawCredentials) return result;
+  try {
+    const parsed = JSON.parse(rawCredentials);
+    result.clientId = parsed.clientId || parsed.client_id || parsed.lwaClientId || "";
+    result.clientSecret = parsed.clientSecret || parsed.client_secret || parsed.lwaClientSecret || "";
+    return result;
+  } catch {
+    const [clientId, clientSecret = ""] = rawCredentials.split(":");
+    result.clientId = clientId || rawCredentials;
+    result.clientSecret = clientSecret;
+    return result;
+  }
+}
+
+async function getAmazonSandboxAccessToken() {
+  const credentials = parseAmazonSandboxCredentials();
+  if (!credentials.configured) {
+    return { ok: false, configured: false, error: "AMZ_SANDBOX_CREDENTIALS / AMZ_SANDBOX_TOKEN 未配置完整" };
+  }
+  if (!credentials.clientId || !credentials.clientSecret) {
+    return {
+      ok: false,
+      configured: true,
+      error: "AMZ_SANDBOX_CREDENTIALS 需要包含 clientId 和 clientSecret，支持 JSON 或 clientId:clientSecret"
+    };
+  }
+
+  const response = await fetch("https://api.amazon.com/auth/o2/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: credentials.refreshToken,
+      client_id: credentials.clientId,
+      client_secret: credentials.clientSecret
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    return { ok: false, configured: true, error: data.error_description || data.error || `Amazon LWA ${response.status}` };
+  }
+  return { ok: true, configured: true, accessToken: data.access_token };
+}
+
+async function syncAmazonSandboxProducts(db) {
+  const token = await getAmazonSandboxAccessToken();
+  if (!token.ok) return { ...token, imported: 0, products: buildProductsFromDb(db) };
+
+  const marketplaceId = process.env.AMZ_SANDBOX_MARKETPLACE_ID || "ATVPDKIKX0DER";
+  const endpoint = process.env.AMZ_SANDBOX_ENDPOINT || "https://sandbox.sellingpartnerapi-na.amazon.com";
+  const response = await fetch(`${endpoint}/catalog/2022-04-01/items?marketplaceIds=${encodeURIComponent(marketplaceId)}&keywords=sample&pageSize=10`, {
+    headers: {
+      "x-amz-access-token": token.accessToken,
+      "accept": "application/json"
+    }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return { ok: false, configured: true, error: data.errors?.[0]?.message || `Amazon sandbox ${response.status}`, imported: 0, products: buildProductsFromDb(db) };
+  }
+
+  const incoming = (data.items || []).map(item => normalizeProduct({
+    asin: item.asin,
+    title: item.summaries?.[0]?.itemName || item.attributes?.item_name?.[0]?.value || "",
+    brand: item.summaries?.[0]?.brand || "",
+    imageUrl: item.images?.[0]?.images?.[0]?.link || "",
+    marketplaceId,
+    source: "sandbox",
+    raw: item
+  })).filter(item => item.asin);
+
+  const byAsin = new Map((Array.isArray(db.products) ? db.products : []).map(item => {
+    const normalized = normalizeProduct(item);
+    return [normalized.asin, normalized];
+  }));
+  for (const product of incoming) byAsin.set(product.asin, product);
+  db.products = [...byAsin.values()];
+  await writeDb(db);
+  return { ok: true, configured: true, imported: incoming.length, products: buildProductsFromDb(db) };
+}
+
+function getSpApiConfig() {
+  const config = {
+    clientId: process.env.AMZ_LWA_CLIENT_ID || "",
+    clientSecret: process.env.AMZ_LWA_CLIENT_SECRET || "",
+    refreshToken: process.env.AMZ_REFRESH_TOKEN || "",
+    endpoint: (process.env.AMZ_SP_API_ENDPOINT || "https://sellingpartnerapi-na.amazon.com").replace(/\/+$/, ""),
+    region: process.env.AMZ_SP_API_REGION || "us-east-1",
+    marketplaceId: process.env.AMZ_MARKETPLACE_ID || "ATVPDKIKX0DER",
+    sellerId: process.env.AMZ_SELLER_ID || ""
+  };
+  const missing = [];
+  if (!config.clientId) missing.push("AMZ_LWA_CLIENT_ID");
+  if (!config.clientSecret) missing.push("AMZ_LWA_CLIENT_SECRET");
+  if (!config.refreshToken) missing.push("AMZ_REFRESH_TOKEN");
+  if (!config.endpoint) missing.push("AMZ_SP_API_ENDPOINT");
+  if (!config.region) missing.push("AMZ_SP_API_REGION");
+  if (!config.marketplaceId) missing.push("AMZ_MARKETPLACE_ID");
+  return { ...config, missing };
+}
+
+async function requestSpApiAccessToken() {
+  const config = getSpApiConfig();
+  if (config.missing.length) {
+    return { ok: false, configured: false, config, error: `缺少配置：${config.missing.join(", ")}` };
+  }
+
+  const response = await fetch("https://api.amazon.com/auth/o2/token", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
+    body: new URLSearchParams({
+      grant_type: "refresh_token",
+      refresh_token: config.refreshToken,
+      client_id: config.clientId,
+      client_secret: config.clientSecret
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.access_token) {
+    return {
+      ok: false,
+      configured: true,
+      config,
+      status: response.status,
+      error: data.error_description || data.error || `LWA token request failed: ${response.status}`
+    };
+  }
+  return {
+    ok: true,
+    configured: true,
+    config,
+    accessToken: data.access_token,
+    tokenType: data.token_type || "bearer",
+    expiresIn: data.expires_in || 0
+  };
+}
+
+async function checkSpApiStatus() {
+  const token = await requestSpApiAccessToken();
+  const publicConfig = {
+    endpoint: token.config?.endpoint || "",
+    region: token.config?.region || "",
+    marketplaceId: token.config?.marketplaceId || "",
+    sellerIdConfigured: Boolean(token.config?.sellerId),
+    missing: token.config?.missing || []
+  };
+  if (!token.ok) {
+    return {
+      ok: false,
+      configured: token.configured,
+      config: publicConfig,
+      lwa: { ok: false, status: token.status || 0, error: token.error }
+    };
+  }
+
+  const sellersUrl = `${token.config.endpoint}/sellers/v1/marketplaceParticipations`;
+  const response = await fetch(sellersUrl, {
+    headers: {
+      "accept": "application/json",
+      "host": new URL(token.config.endpoint).host,
+      "user-agent": "AmzAllBlue/0.1 (Language=JavaScript)",
+      "x-amz-access-token": token.accessToken,
+      "x-amz-date": new Date().toISOString().replace(/[:-]|\.\d{3}/g, "")
+    }
+  });
+  const data = await response.json().catch(() => ({}));
+  const marketplaces = Array.isArray(data.payload)
+    ? data.payload.map(entry => ({
+      marketplaceId: entry.marketplace?.id || "",
+      countryCode: entry.marketplace?.countryCode || "",
+      name: entry.marketplace?.name || "",
+      participating: Boolean(entry.participation?.isParticipating),
+      suspended: Boolean(entry.participation?.hasSuspendedListings)
+    }))
+    : [];
+
+  return {
+    ok: response.ok,
+    configured: true,
+    config: publicConfig,
+    lwa: { ok: true, expiresIn: token.expiresIn, tokenType: token.tokenType },
+    sellers: {
+      ok: response.ok,
+      status: response.status,
+      marketplaces,
+      error: response.ok ? "" : (data.errors?.[0]?.message || data.message || JSON.stringify(data).slice(0, 500))
+    }
+  };
+}
+
+function toIsoDateStart(value) {
+  const input = value || new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+  return `${input.slice(0, 10)}T00:00:00Z`;
+}
+
+function toIsoDateEnd(value) {
+  const input = value || new Date().toISOString().slice(0, 10);
+  return `${input.slice(0, 10)}T23:59:59Z`;
+}
+
+function daysBetweenInclusive(startDate, endDate) {
+  const start = new Date(`${startDate.slice(0, 10)}T00:00:00Z`);
+  const end = new Date(`${endDate.slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return 1;
+  return Math.max(1, Math.round((end - start) / 86400000) + 1);
+}
+
+function wait(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function spApiFetch(pathname, params = {}, options = {}) {
+  const token = await requestSpApiAccessToken();
+  if (!token.ok) throw new Error(token.error || "SP-API LWA token failed");
+  const url = new URL(pathname, token.config.endpoint);
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+  });
+  const response = await fetch(url, {
+    method: options.method || "GET",
+    headers: {
+      "accept": "application/json",
+      "content-type": "application/json",
+      "host": url.host,
+      "user-agent": "AmzAllBlue/0.1 (Language=JavaScript)",
+      "x-amz-access-token": token.accessToken,
+      "x-amz-date": new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""),
+      ...(options.headers || {})
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = data.errors?.[0]
+      ? `${data.errors[0].code || ""} ${data.errors[0].message || ""} ${data.errors[0].details || ""}`.trim()
+      : (data.message || JSON.stringify(data).slice(0, 800) || `SP-API ${response.status}`);
+    throw new Error(`${response.status} ${error}`);
+  }
+  return data;
+}
+
+async function spApiFetchWithRetry(pathname, params = {}, options = {}) {
+  const retries = Number(options.retries ?? 2);
+  const retryDelayMs = Number(options.retryDelayMs ?? 1200);
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await spApiFetch(pathname, params, options);
+    } catch (error) {
+      const retryable = /\b(429|500|502|503|504)\b|QuotaExceeded|throttl/i.test(error.message || "");
+      if (!retryable || attempt === retries) throw error;
+      await wait(retryDelayMs * (attempt + 1));
+    }
+  }
+  throw new Error("SP-API request failed");
+}
+
+async function fetchFbaInventorySummaries() {
+  const config = getSpApiConfig();
+  const summaries = [];
+  let nextToken = "";
+  for (let page = 0; page < 20; page += 1) {
+    const params = nextToken
+      ? {
+        nextToken,
+        details: "true",
+        granularityType: "Marketplace",
+        granularityId: config.marketplaceId,
+        marketplaceIds: config.marketplaceId
+      }
+      : {
+        details: "true",
+        granularityType: "Marketplace",
+        granularityId: config.marketplaceId,
+        marketplaceIds: config.marketplaceId
+      };
+    const data = await spApiFetchWithRetry("/fba/inventory/v1/summaries", params);
+    const payload = data.payload || data;
+    summaries.push(...(payload.inventorySummaries || []));
+    nextToken = payload.nextToken || data.pagination?.nextToken || "";
+    if (!nextToken) break;
+  }
+  return summaries;
+}
+
+function findCatalogImageLink(value) {
+  if (!value) return "";
+  if (Array.isArray(value)) {
+    const main = value.find(item => item?.variant === "MAIN" && item?.link);
+    if (main?.link) return main.link;
+    for (const item of value) {
+      const link = findCatalogImageLink(item);
+      if (link) return link;
+    }
+    return "";
+  }
+  if (typeof value === "object") {
+    if (value.variant === "MAIN" && value.link) return value.link;
+    if (value.link) return value.link;
+    return findCatalogImageLink(value.images);
+  }
+  return "";
+}
+
+async function fetchCatalogDetails(asins) {
+  const config = getSpApiConfig();
+  const enrichLimit = Number(process.env.AMZ_CATALOG_ENRICH_LIMIT || 300);
+  const uniqueAsins = unique(asins).slice(0, Math.max(20, enrichLimit));
+  const chunkSize = Math.max(1, Math.min(20, Number(process.env.AMZ_CATALOG_CHUNK_SIZE || 10)));
+  const delayMs = Number(process.env.AMZ_CATALOG_DELAY_MS || 250);
+  const byAsin = new Map();
+  for (let index = 0; index < uniqueAsins.length; index += chunkSize) {
+    const identifiers = uniqueAsins.slice(index, index + chunkSize);
+    try {
+      const data = await spApiFetchWithRetry("/catalog/2022-04-01/items", {
+        marketplaceIds: config.marketplaceId,
+        identifiers: identifiers.join(","),
+        identifiersType: "ASIN",
+        includedData: "images,summaries"
+      });
+      for (const item of data.items || []) {
+        const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
+        byAsin.set(item.asin, {
+          title: summary?.itemName || "",
+          brand: summary?.brand || "",
+          imageUrl: findCatalogImageLink(item.images)
+        });
+      }
+    } catch {
+      for (const asin of identifiers) {
+        try {
+          const data = await spApiFetchWithRetry("/catalog/2022-04-01/items", {
+            marketplaceIds: config.marketplaceId,
+            identifiers: asin,
+            identifiersType: "ASIN",
+            includedData: "images,summaries"
+          }, { retries: 1, retryDelayMs: 1600 });
+          const item = (data.items || [])[0];
+          if (!item) continue;
+          const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
+          byAsin.set(item.asin, {
+            title: summary?.itemName || "",
+            brand: summary?.brand || "",
+            imageUrl: findCatalogImageLink(item.images)
+          });
+        } catch {
+          // Catalog enrichment is useful but should not block inventory.
+        }
+      }
+    }
+    if (delayMs > 0 && index + chunkSize < uniqueAsins.length) await wait(delayMs);
+  }
+  return byAsin;
+}
+
+async function fetchOrderItems(orderId) {
+  const items = [];
+  let nextToken = "";
+  for (let page = 0; page < 10; page += 1) {
+    const data = await spApiFetchWithRetry(
+      `/orders/v0/orders/${encodeURIComponent(orderId)}/orderItems`,
+      nextToken ? { NextToken: nextToken } : {},
+      { retries: 4, retryDelayMs: 2500 }
+    );
+    const payload = data.payload || data;
+    items.push(...(payload.OrderItems || payload.orderItems || []));
+    nextToken = payload.NextToken || payload.nextToken || "";
+    if (!nextToken) break;
+  }
+  return items;
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const current = nextIndex;
+      nextIndex += 1;
+      results[current] = await worker(items[current], current);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+async function fetchSalesBySku(startDate, endDate) {
+  const config = getSpApiConfig();
+  const bySku = new Map();
+  const orders = [];
+  const warnings = [];
+  let nextToken = "";
+  for (let page = 0; page < 20; page += 1) {
+    const params = nextToken
+      ? { NextToken: nextToken }
+      : {
+        MarketplaceIds: config.marketplaceId,
+        CreatedAfter: toIsoDateStart(startDate),
+        CreatedBefore: toIsoDateEnd(endDate),
+        OrderStatuses: "Shipped,Unshipped,PartiallyShipped"
+      };
+    const data = await spApiFetchWithRetry("/orders/v0/orders", params);
+    const payload = data.payload || data;
+    orders.push(...(payload.Orders || payload.orders || []));
+    nextToken = payload.NextToken || payload.nextToken || "";
+    if (!nextToken) break;
+  }
+
+  const orderItemGroups = await mapWithConcurrency(orders, Number(process.env.AMZ_ORDER_ITEMS_CONCURRENCY || 2), async order => {
+    const orderId = order.AmazonOrderId || order.amazonOrderId;
+    if (!orderId) return { orderId: "", items: [] };
+    try {
+      return { orderId, items: await fetchOrderItems(orderId) };
+    } catch (error) {
+      return { orderId, items: [], error: error.message };
+    }
+  });
+
+  for (const group of orderItemGroups) {
+    const orderId = group.orderId;
+    const orderItems = group.items || [];
+    if (group.error) {
+      warnings.push(`订单 ${orderId} 的明细拉取失败：${group.error}`);
+    }
+    if (!orderId || !orderItems.length) continue;
+    const skusInOrder = new Set();
+    for (const item of orderItems) {
+      const sku = item.SellerSKU || item.sellerSKU || item.SellerSku || "";
+      if (!sku) continue;
+      const asin = item.ASIN || item.asin || "";
+      const quantity = Number(item.QuantityOrdered || item.quantityOrdered || 0);
+      const existing = bySku.get(sku) || { sku, asin, units: 0, orderIds: new Set() };
+      existing.units += quantity;
+      if (asin && !existing.asin) existing.asin = asin;
+      if (!skusInOrder.has(sku)) {
+        existing.orderIds.add(orderId);
+        skusInOrder.add(sku);
+      }
+      bySku.set(sku, existing);
+    }
+  }
+
+  return {
+    orderCount: orders.length,
+    orderItemErrorCount: warnings.length,
+    warnings: warnings.slice(0, 10),
+    bySku: new Map([...bySku.entries()].map(([sku, value]) => [sku, {
+      sku,
+      asin: value.asin,
+      units: value.units,
+      orders: value.orderIds.size
+    }]))
+  };
+}
+
+function normalizeInventoryRow(summary, sales, catalog, dayCount) {
+  const details = summary.inventoryDetails || {};
+  const reserved = details.reservedQuantity || {};
+  const researching = details.researchingQuantity || {};
+  const asin = summary.asin || "";
+  const sku = summary.sellerSku || summary.sellerSKU || "";
+  const catalogInfo = catalog.get(asin) || {};
+  const fulfillable = Number(details.fulfillableQuantity || 0);
+  const inboundWorking = Number(details.inboundWorkingQuantity || 0);
+  const inboundShipped = Number(details.inboundShippedQuantity || 0);
+  const inboundReceiving = Number(details.inboundReceivingQuantity || 0);
+  const reservedTotal = Number(reserved.totalReservedQuantity || 0);
+  const total = Number(summary.totalQuantity || 0);
+  const soldUnits = Number(sales?.units || 0);
+  const dailySales = soldUnits / dayCount;
+  const coverDays = dailySales > 0 ? Math.floor(fulfillable / dailySales) : null;
+  return {
+    asin,
+    sellerSku: sku,
+    fnSku: summary.fnSku || summary.fnSKU || "",
+    title: catalogInfo.title || summary.productName || "",
+    brand: catalogInfo.brand || "",
+    imageUrl: catalogInfo.imageUrl || "",
+    condition: summary.condition || "",
+    totalQuantity: total,
+    inTransitQuantity: inboundShipped + inboundReceiving,
+    inboundWorkingQuantity: inboundWorking,
+    inboundShippedQuantity: inboundShipped,
+    inboundReceivingQuantity: inboundReceiving,
+    fulfillableQuantity: fulfillable,
+    reservedQuantity: reservedTotal,
+    unfulfillableQuantity: Number(details.unfulfillableQuantity || 0),
+    researchingQuantity: Number(researching.totalResearchingQuantity || 0),
+    salesOrders: Number(sales?.orders || 0),
+    salesUnits: soldUnits,
+    dailySales: Number(dailySales.toFixed(2)),
+    coverDays,
+    stockLevel: coverDays === null ? "unknown" : coverDays < 14 ? "low" : coverDays < 30 ? "medium" : "healthy",
+    lastUpdatedTime: summary.lastUpdatedTime || ""
+  };
+}
+
+async function buildFbaInventoryView(startDate, endDate) {
+  const config = getSpApiConfig();
+  const safeStart = (startDate || new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10)).slice(0, 10);
+  const safeEnd = (endDate || new Date().toISOString().slice(0, 10)).slice(0, 10);
+  const dayCount = daysBetweenInclusive(safeStart, safeEnd);
+  let inventory = [];
+  let sales = { orderCount: 0, bySku: new Map() };
+  let catalog = new Map();
+  const warnings = [];
+  try {
+    inventory = await fetchFbaInventorySummaries();
+  } catch (error) {
+    throw new Error(`FBA Inventory 拉取失败：${error.message}`);
+  }
+  try {
+    sales = await fetchSalesBySku(safeStart, safeEnd);
+  } catch (error) {
+    warnings.push(`Orders 销量拉取失败：${error.message}`);
+    sales = { orderCount: 0, bySku: new Map(), orderItemErrorCount: 0, warnings: [] };
+  }
+  try {
+    catalog = await fetchCatalogDetails(inventory.map(item => item.asin).filter(Boolean));
+  } catch (error) {
+    warnings.push(`Catalog 图片和品名富集失败：${error.message}`);
+    catalog = new Map();
+  }
+  warnings.push(...(sales.warnings || []));
+  const rows = inventory.map(summary => {
+    const sale = sales.bySku.get(summary.sellerSku || summary.sellerSKU || "") || null;
+    return normalizeInventoryRow(summary, sale, catalog, dayCount);
+  }).sort((a, b) => b.totalQuantity - a.totalQuantity);
+
+  const totals = rows.reduce((acc, row) => {
+    acc.totalQuantity += row.totalQuantity;
+    acc.inTransitQuantity += row.inTransitQuantity;
+    acc.inboundWorkingQuantity += row.inboundWorkingQuantity;
+    acc.fulfillableQuantity += row.fulfillableQuantity;
+    acc.reservedQuantity += row.reservedQuantity;
+    acc.salesOrders += row.salesOrders;
+    acc.salesUnits += row.salesUnits;
+    return acc;
+  }, {
+    totalQuantity: 0,
+    inTransitQuantity: 0,
+    inboundWorkingQuantity: 0,
+    fulfillableQuantity: 0,
+    reservedQuantity: 0,
+    salesOrders: 0,
+    salesUnits: 0
+  });
+
+  return {
+    range: { startDate: safeStart, endDate: safeEnd, dayCount },
+    config: {
+      marketplaceId: config.marketplaceId,
+      sellerId: config.sellerId,
+      endpoint: config.endpoint
+    },
+    totals,
+    warnings,
+    sales: {
+      orderCount: sales.orderCount || 0,
+      orderItemErrorCount: sales.orderItemErrorCount || 0
+    },
+    rows
   };
 }
 
@@ -1392,6 +2068,48 @@ async function handleApi(req, res, url) {
     return sendJson(res, { requests: db.requests || [] });
   }
 
+  if (req.method === "GET" && url.pathname === "/api/products") {
+    const db = await readDb();
+    return sendJson(res, { products: buildProductsFromDb(db) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/products/sandbox-status") {
+    const credentials = parseAmazonSandboxCredentials();
+    return sendJson(res, {
+      configured: credentials.configured,
+      hasClientId: Boolean(credentials.clientId),
+      hasClientSecret: Boolean(credentials.clientSecret),
+      hasRefreshToken: Boolean(credentials.refreshToken),
+      ready: Boolean(credentials.configured && credentials.clientId && credentials.clientSecret && credentials.refreshToken)
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/spapi/status") {
+    const result = await checkSpApiStatus();
+    return sendJson(res, result, result.lwa?.ok ? 200 : 400);
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/fba/inventory") {
+    const startDate = url.searchParams.get("startDate") || "";
+    const endDate = url.searchParams.get("endDate") || "";
+    const refresh = url.searchParams.get("refresh") === "1";
+    const cacheKey = `${startDate}:${endDate}:${getSpApiConfig().marketplaceId}`;
+    const cacheTtlMs = Number(process.env.AMZ_FBA_CACHE_TTL_MS || 300000);
+    const cached = fbaInventoryCache.get(cacheKey);
+    if (!refresh && cached && Date.now() - cached.cachedAt < cacheTtlMs) {
+      return sendJson(res, { ...cached.data, cached: true, cachedAt: cached.cachedAt });
+    }
+    const result = await buildFbaInventoryView(startDate, endDate);
+    fbaInventoryCache.set(cacheKey, { cachedAt: Date.now(), data: result });
+    return sendJson(res, result);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/products/sync-sandbox") {
+    const db = await readDb();
+    const result = await syncAmazonSandboxProducts(db);
+    return sendJson(res, result, result.ok ? 200 : 400);
+  }
+
   if (req.method === "POST" && url.pathname === "/api/extract") {
     const body = await parseBody(req);
     const extracted = await aiExtract(body.rawText || "");
@@ -1619,4 +2337,3 @@ await ensureDb();
 server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
 });
-

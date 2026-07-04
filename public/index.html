@@ -3,79 +3,240 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>亚马逊红人计划</title>
+    <title>电商运营 ERP</title>
     <link rel="stylesheet" href="/styles.css">
   </head>
   <body>
-    <header class="topbar">
-      <div>
-        <h1>亚马逊红人计划</h1>
-        <p>自动采集、解析和管理 Creator Connections 红人消息</p>
-      </div>
-      <div class="stats" id="stats"></div>
-    </header>
-
-    <main>
-      <div class="layout">
-        <section class="panel list-panel">
-          <div class="panel-head">
-            <h2>红人合作列表</h2>
-            <div class="actions slim">
-              <button id="bulkMailBtn">批量邮件</button>
-              <button id="reprocessBtn">重新解析</button>
-              <button id="refreshBtn">刷新</button>
-            </div>
+    <div class="erp-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-mark">A</span>
+          <div>
+            <strong>电商自动化</strong>
+            <span>Amazon Ops ERP</span>
           </div>
-          <div class="filters">
-            <input id="search" placeholder="搜索姓名、邮箱、ASIN、地址、建议">
-            <select id="statusFilter">
-              <option value="__active__">全部状态（除忽略外）</option>
-              <option value="">全部状态</option>
-            </select>
-          </div>
-          <div id="requestList" class="request-list"></div>
-        </section>
-
-        <section class="panel detail-panel">
-          <div class="panel-head">
-            <h2>详情</h2>
-            <div class="actions slim">
-              <button id="emailBtn">生成邮件</button>
-              <button id="deleteBtn" class="danger">删除</button>
-            </div>
-          </div>
-          <form id="detailForm" class="detail-form"></form>
-          <pre id="emailDraft" class="answer"></pre>
-        </section>
-
-        <section class="panel mail-panel">
-          <div class="panel-head">
-            <h2>邮件过程</h2>
-            <div class="actions slim">
-              <button id="templateBtn">邮件模板</button>
-              <button id="gmailAuthBtn">授权 Gmail</button>
-              <button id="gmailRefreshBtn">刷新邮件</button>
-            </div>
-          </div>
-          <p id="gmailStatus" class="hint">正在检查 Gmail 状态...</p>
-          <div id="mailWorkspace" class="mail-workspace"></div>
-        </section>
-      </div>
-
-      <section class="panel assistant-panel bottom-assistant">
-        <div class="panel-head">
-          <h2>AI 问答</h2>
         </div>
-        <label>
-          问题
-          <input id="question" placeholder="今天有多少红人联系我？">
-        </label>
-        <div class="actions">
-          <button id="askBtn">询问</button>
-        </div>
-        <pre id="answer" class="answer"></pre>
-      </section>
-    </main>
+        <nav class="side-nav">
+          <button class="module-tab active" data-module="dashboard">仪表盘</button>
+          <button class="module-tab" data-module="products">FBA库存</button>
+          <button class="module-tab" data-module="influencers">红人营销</button>
+          <button class="module-tab" data-module="orders">订单管理</button>
+          <button class="module-tab" data-module="inventory">库存仓库</button>
+          <button class="module-tab" data-module="settings">系统设置</button>
+        </nav>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <label class="global-search">
+            <input id="globalSearch" placeholder="搜索商品、红人、ASIN、邮箱">
+          </label>
+          <div class="topbar-user">
+            <span id="sandboxStatus">SP-API 未检查</span>
+            <strong>管理员</strong>
+          </div>
+        </header>
+
+        <section id="dashboardPage" class="module-page active">
+          <div class="page-head">
+            <div>
+              <h1>仪表盘</h1>
+              <p>实时监控您的亚马逊运营数据</p>
+            </div>
+            <button id="dashboardRefreshBtn">刷新</button>
+          </div>
+
+          <div class="metric-grid" id="dashboardMetrics"></div>
+
+          <div class="dashboard-grid">
+            <section class="panel chart-panel">
+              <div class="panel-head">
+                <h2>红人营销趋势</h2>
+                <span id="trendDelta" class="trend-positive">+0%</span>
+              </div>
+              <div id="trendChart" class="trend-chart"></div>
+            </section>
+
+            <section class="panel">
+              <div class="panel-head">
+                <h2>商品分布</h2>
+              </div>
+              <div id="productBars" class="bar-chart"></div>
+            </section>
+          </div>
+
+          <div class="quick-grid">
+            <button class="quick-card" data-module-jump="products">
+              <strong>FBA库存</strong>
+              <span id="productQuickText">查看库存和销量</span>
+            </button>
+            <button class="quick-card" data-module-jump="influencers">
+              <strong>红人营销</strong>
+              <span id="influencerQuickText">管理合作请求</span>
+            </button>
+            <button class="quick-card" data-module-jump="inventory">
+              <strong>库存仓库</strong>
+              <span>集中查看库存预警</span>
+            </button>
+          </div>
+        </section>
+
+        <section id="productsPage" class="module-page">
+          <div class="page-head">
+            <div>
+              <h1>FBA库存</h1>
+              <p>按 ASIN/MSKU 统计真实 FBA 库存、销量和库存充足天数</p>
+            </div>
+            <div class="actions slim">
+              <button id="syncProductsBtn">同步库存</button>
+              <button id="refreshProductsBtn">刷新</button>
+            </div>
+          </div>
+
+          <section class="panel fba-panel">
+            <div class="fba-toolbar">
+              <label>
+                开始日期
+                <input id="salesStartDate" type="date">
+              </label>
+              <label>
+                结束日期
+                <input id="salesEndDate" type="date">
+              </label>
+              <label>
+                搜索
+                <input id="productSearch" placeholder="搜索 ASIN、MSKU、FNSKU、品名">
+              </label>
+              <label>
+                库存水平
+                <select id="productSourceFilter">
+                  <option value="">全部库存</option>
+                  <option value="low">低库存</option>
+                  <option value="medium">中等库存</option>
+                  <option value="healthy">充足</option>
+                  <option value="unknown">无销量</option>
+                </select>
+              </label>
+            </div>
+            <div id="fbaSummary" class="fba-summary"></div>
+            <div class="fba-table-wrap">
+              <table class="fba-table">
+                <thead>
+                  <tr>
+                    <th>图片</th>
+                    <th>ASIN/MSKU</th>
+                    <th>FNSKU/SKU</th>
+                    <th>品名</th>
+                    <th>总库存</th>
+                    <th>在途</th>
+                    <th>可售</th>
+                    <th>入库中</th>
+                    <th>预留</th>
+                    <th>售卖订单</th>
+                    <th>售卖数量</th>
+                    <th>日销量</th>
+                    <th>充足天数</th>
+                  </tr>
+                </thead>
+                <tbody id="productList"></tbody>
+                <tfoot id="fbaTotals"></tfoot>
+              </table>
+            </div>
+          </section>
+        </section>
+
+        <section id="influencersPage" class="module-page">
+          <div class="page-head">
+            <div>
+              <h1>红人营销</h1>
+              <p>自动采集、解析和管理 Creator Connections 红人合作</p>
+            </div>
+            <div class="stats" id="stats"></div>
+          </div>
+
+          <div class="layout">
+            <section class="panel list-panel">
+              <div class="panel-head">
+                <h2>红人合作列表</h2>
+                <div class="actions slim">
+                  <button id="bulkMailBtn">批量邮件</button>
+                  <button id="reprocessBtn">重新解析</button>
+                  <button id="refreshBtn">刷新</button>
+                </div>
+              </div>
+              <div class="filters">
+                <input id="search" placeholder="搜索姓名、邮箱、ASIN、地址、建议">
+                <select id="statusFilter">
+                  <option value="__active__">全部状态（除忽略外）</option>
+                  <option value="">全部状态</option>
+                </select>
+              </div>
+              <div id="requestList" class="request-list"></div>
+            </section>
+
+            <section class="panel detail-panel">
+              <div class="panel-head">
+                <h2>详情</h2>
+                <div class="actions slim">
+                  <button id="emailBtn">生成邮件</button>
+                  <button id="deleteBtn" class="danger">删除</button>
+                </div>
+              </div>
+              <form id="detailForm" class="detail-form"></form>
+              <pre id="emailDraft" class="answer"></pre>
+            </section>
+
+            <section class="panel mail-panel">
+              <div class="panel-head">
+                <h2>邮件过程</h2>
+                <div class="actions slim">
+                  <button id="templateBtn">邮件模板</button>
+                  <button id="gmailAuthBtn">授权 Gmail</button>
+                  <button id="gmailRefreshBtn">刷新邮件</button>
+                </div>
+              </div>
+              <p id="gmailStatus" class="hint">正在检查 Gmail 状态...</p>
+              <div id="mailWorkspace" class="mail-workspace"></div>
+            </section>
+          </div>
+
+          <section class="panel assistant-panel bottom-assistant">
+            <div class="panel-head">
+              <h2>AI 问答</h2>
+            </div>
+            <label>
+              问题
+              <input id="question" placeholder="今天有多少红人联系我？">
+            </label>
+            <div class="actions">
+              <button id="askBtn">询问</button>
+            </div>
+            <pre id="answer" class="answer"></pre>
+          </section>
+        </section>
+
+        <section id="ordersPage" class="module-page">
+          <section class="panel placeholder-panel">
+            <h1>订单管理</h1>
+            <p>预留模块。后续可接入订单同步、履约状态和售后动作。</p>
+          </section>
+        </section>
+
+        <section id="inventoryPage" class="module-page">
+          <section class="panel placeholder-panel">
+            <h1>库存仓库</h1>
+            <p>预留模块。当前商品页会先展示本地库存和库存预警字段。</p>
+          </section>
+        </section>
+
+        <section id="settingsPage" class="module-page">
+          <section class="panel placeholder-panel">
+            <h1>系统设置</h1>
+              <p>SP-API 凭证从本地 <code>.env</code> 读取，不会在页面展示密钥内容。</p>
+          </section>
+        </section>
+      </main>
+    </div>
 
     <template id="emptyTemplate">
       <div class="empty">还没有记录。重新加载 Chrome 插件并刷新 Amazon Advertising 目标页面后，会自动采集和导入。</div>
