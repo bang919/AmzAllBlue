@@ -1,9 +1,11 @@
 .env
+.DS_Store
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+data/fba-inventory-daily.json
 data/gmail-token.json
 data/ads-token.json
 data/ads-profile.json

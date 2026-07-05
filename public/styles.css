@@ -413,20 +413,337 @@ h2 {
 .fba-panel {
   margin: 0 28px 28px;
   padding: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .fba-toolbar {
   display: grid;
-  grid-template-columns: 150px 150px minmax(280px, 1fr) 160px;
+  grid-template-columns: 260px minmax(280px, 1fr) 160px auto;
   gap: 10px;
   padding: 14px 16px;
   border-bottom: 1px solid var(--line);
   background: #fbfcfd;
+  align-items: end;
 }
 
 .fba-toolbar label {
   margin: 0;
+}
+
+.secondary-button {
+  border: 1px solid var(--line);
+  background: #fff;
+  color: #374151;
+  height: 39px;
+  padding: 0 12px;
+  border-radius: 7px;
+  white-space: nowrap;
+}
+
+.fba-toolbar-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  align-items: end;
+}
+
+.date-picker-field input {
+  cursor: pointer;
+  background: #fff;
+}
+
+.date-range-field {
+  min-width: 260px;
+}
+
+.date-picker-popover {
+  position: fixed;
+  z-index: 200;
+  box-sizing: border-box;
+  width: 318px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 16px 36px rgba(15, 23, 42, 0.16);
+}
+
+.date-picker-head,
+.date-picker-week,
+.date-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(7, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.date-picker-head {
+  grid-template-columns: 32px 1fr 32px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.date-picker-title {
+  text-align: center;
+  font-weight: 700;
+}
+
+.date-picker-head button {
+  display: grid;
+  place-items: center;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: #1f2937;
+  cursor: pointer;
+}
+
+.date-picker-head button:hover {
+  border-color: #2563eb;
+  background: #eff6ff;
+  color: #1d4ed8;
+}
+
+.date-picker-day {
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+}
+
+.date-picker-week {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.date-picker-week span {
+  min-width: 0;
+}
+
+.date-picker-day {
+  position: relative;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.date-picker-day span,
+.date-picker-day::after {
+  pointer-events: none;
+}
+
+.date-picker-day.other-month {
+  color: #b6bdc8;
+}
+
+.date-picker-day.has-data {
+  font-weight: 800;
+}
+
+.date-picker-day.has-data::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  bottom: 4px;
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: #10b981;
+  transform: translateX(-50%);
+}
+
+.date-picker-day.selected {
+  border-color: #10b981;
+  background: #bbf7d0;
+  color: #065f46;
+  font-weight: 800;
+}
+
+.date-picker-day.selected.has-data {
+  border-color: #10b981;
+  background: #bbf7d0;
+}
+
+.date-picker-day.in-range {
+  background: #ecfdf5;
+  color: #065f46;
+}
+
+.date-picker-day:disabled {
+  color: #cbd5e1;
+  cursor: not-allowed;
+  background: transparent;
+}
+
+.date-picker-day:disabled::after {
+  display: none;
+}
+
+.date-picker-quick {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.date-picker-quick button {
+  min-width: 0;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #fff;
+  color: #334155;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.date-picker-quick button:hover {
+  border-color: #10b981;
+  background: #ecfdf5;
+  color: #065f46;
+}
+
+.date-picker-quick button:last-child {
+  grid-column: 1 / -1;
+}
+
+.date-picker-legend {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.date-range-swatch {
+  width: 14px;
+  height: 8px;
+  border-radius: 999px;
+  background: #bbf7d0;
+}
+
+.date-data-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #10b981;
+}
+
+.column-settings,
+.column-filters {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.column-settings {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-height: 430px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.column-settings .column-option {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: #fff;
+  color: #374151;
+  font-size: 13px;
+}
+
+.column-settings .column-option:last-child {
+  border-bottom: 0;
+}
+
+.column-settings .column-option:hover {
+  background: #f8fafc;
+}
+
+.column-settings .column-option input {
+  justify-self: start;
+  margin: 0;
+}
+
+.column-settings .column-option span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.settings-row {
+  display: grid;
+  grid-template-columns: minmax(130px, 1fr) 90px;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.filter-row {
+  display: grid;
+  grid-template-columns: 104px 1fr 1fr;
+  gap: 6px;
+  align-items: center;
+}
+
+.filter-row span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.filter-row input {
+  min-width: 0;
+}
+
+.fba-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.fba-modal-section {
+  display: grid;
+  gap: 10px;
+}
+
+.fba-modal-section + .fba-modal-section {
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.fba-filter-hint {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.fba-table th.sortable {
+  cursor: pointer;
+}
+
+.fba-table th.sortable:hover {
+  background: #eef2f7;
 }
 
 .fba-summary {
@@ -457,6 +774,14 @@ h2 {
   margin-top: 4px;
   color: var(--muted);
   font-size: 12px;
+}
+
+.fba-summary-card.compact-card strong {
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 16px;
 }
 
 .fba-summary-card.wide-card {
@@ -1201,6 +1526,10 @@ button:disabled {
   background: #fff;
   padding: 16px;
   box-shadow: 0 18px 48px rgba(23, 32, 38, 0.2);
+}
+
+.modal.fba-column-modal {
+  width: min(560px, 100%);
 }
 
 .modal-head {

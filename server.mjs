@@ -3,18 +3,26 @@ import { readFile, writeFile, appendFile, mkdir } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
+import { gunzipSync } from "node:zlib";
+import mysql from "mysql2/promise";
 
 const PORT = Number(process.env.PORT || 4317);
 const ROOT = resolve(".");
 const PUBLIC_DIR = join(ROOT, "public");
 const DATA_DIR = join(ROOT, "data");
 const DB_PATH = join(DATA_DIR, "db.json");
+const FBA_DAILY_PATH = join(DATA_DIR, "fba-inventory-daily.json");
 const NETWORK_DEBUG_PATH = join(DATA_DIR, "network-debug.jsonl");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
 const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
 const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
 const ENV_PATH = join(ROOT, ".env");
+const FBA_DATE_MARKER_SKU = "__DATE_MARKER__";
 const fbaInventoryCache = new Map();
+const salesReportRequests = new Map();
+let mysqlPool = null;
+let fbaDailySchemaReady = false;
+let mysqlDatabaseReady = false;
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -73,6 +81,383 @@ async function readDb() {
 async function writeDb(db) {
   await ensureDb();
   await writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+}
+
+function getMysqlConfig() {
+  return {
+    enabled: process.env.DB_ENABLED === "1" || process.env.DB_ENABLED === "true",
+    host: process.env.DB_HOST || "127.0.0.1",
+    port: Number(process.env.DB_PORT || 3306),
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASSWORD || "",
+    database: process.env.DB_NAME || "amz_all_blue"
+  };
+}
+
+function isMysqlEnabled() {
+  return getMysqlConfig().enabled;
+}
+
+function getMysqlPool() {
+  if (!isMysqlEnabled()) return null;
+  if (!mysqlPool) {
+    const config = getMysqlConfig();
+    mysqlPool = mysql.createPool({
+      host: config.host,
+      port: config.port,
+      user: config.user,
+      password: config.password,
+      database: config.database,
+      waitForConnections: true,
+      connectionLimit: Number(process.env.DB_CONNECTION_LIMIT || 5),
+      namedPlaceholders: true,
+      charset: "utf8mb4"
+    });
+  }
+  return mysqlPool;
+}
+
+async function ensureMysqlDatabase() {
+  if (!isMysqlEnabled() || mysqlDatabaseReady) return false;
+  const config = getMysqlConfig();
+  const connection = await mysql.createConnection({
+    host: config.host,
+    port: config.port,
+    user: config.user,
+    password: config.password
+  });
+  try {
+    await connection.query(`CREATE DATABASE IF NOT EXISTS \`${config.database}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+    mysqlDatabaseReady = true;
+    return true;
+  } finally {
+    await connection.end();
+  }
+}
+
+async function ensureFbaDailyMysqlSchema() {
+  if (!isMysqlEnabled() || fbaDailySchemaReady) return false;
+  await ensureMysqlDatabase();
+  const pool = getMysqlPool();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS fba_inventory_daily (
+      date DATE NOT NULL,
+      marketplace_id VARCHAR(32) NOT NULL,
+      seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+      asin VARCHAR(32) DEFAULT '',
+      fn_sku VARCHAR(64) DEFAULT '',
+      title TEXT,
+      brand VARCHAR(255) DEFAULT '',
+      image_url TEXT,
+      item_condition VARCHAR(64) DEFAULT '',
+      amazon_total_quantity INT NOT NULL DEFAULT 0,
+      total_goods_quantity INT NOT NULL DEFAULT 0,
+      fulfillable_quantity INT NOT NULL DEFAULT 0,
+      reserved_quantity INT NOT NULL DEFAULT 0,
+      unfulfillable_quantity INT NOT NULL DEFAULT 0,
+      inbound_working_quantity INT NOT NULL DEFAULT 0,
+      inbound_shipped_quantity INT NOT NULL DEFAULT 0,
+      inbound_receiving_quantity INT NOT NULL DEFAULT 0,
+      researching_quantity INT NOT NULL DEFAULT 0,
+      sales_units INT NOT NULL DEFAULT 0,
+      sales_orders INT NOT NULL DEFAULT 0,
+      is_sufficient TINYINT(1) NULL,
+      inventory_fetched_at DATETIME NULL,
+      sales_fetched_at DATETIME NULL,
+      frozen_at DATETIME NULL,
+      last_updated_time VARCHAR(64) DEFAULT '',
+      raw_inventory_json JSON NULL,
+      raw_sales_json JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (marketplace_id, seller_sku, date),
+      KEY idx_fba_inventory_daily_date (date),
+      KEY idx_fba_inventory_daily_asin (asin)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS fba_sku_metadata (
+      marketplace_id VARCHAR(32) NOT NULL,
+      seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+      asin VARCHAR(32) DEFAULT '',
+      fn_sku VARCHAR(64) DEFAULT '',
+      title TEXT,
+      brand VARCHAR(255) DEFAULT '',
+      image_url TEXT,
+      item_condition VARCHAR(64) DEFAULT '',
+      source VARCHAR(32) DEFAULT '',
+      last_seen_at DATETIME NULL,
+      raw_json JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (marketplace_id, seller_sku),
+      KEY idx_fba_sku_metadata_asin (asin)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query("ALTER TABLE fba_inventory_daily MODIFY seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL").catch(() => {});
+  await pool.query("ALTER TABLE fba_sku_metadata MODIFY seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL").catch(() => {});
+  fbaDailySchemaReady = true;
+  return true;
+}
+
+function toMysqlDateTime(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 19).replace("T", " ");
+}
+
+function parseMysqlJson(value) {
+  if (!value) return null;
+  if (typeof value === "object") return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function calculateTotalGoodsQuantity(row) {
+  const values = [
+    row.fulfillableQuantity,
+    row.reservedQuantity,
+    row.unfulfillableQuantity,
+    row.inboundWorkingQuantity,
+    row.inboundShippedQuantity,
+    row.inboundReceivingQuantity
+  ];
+  if (values.every(value => value === null || value === undefined || value === "")) return null;
+  return values.reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
+function inventorySnapshotSource(row) {
+  if (!row?.inventoryFetchedAt) return "";
+  return row.rawInventoryJson?.source || "inventory_summary";
+}
+
+function isRealtimeInventorySnapshot(row) {
+  const source = inventorySnapshotSource(row);
+  return Boolean(source && source !== "ledger_summary");
+}
+
+function formatMysqlDate(value) {
+  if (value instanceof Date) {
+    return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, "0")}-${String(value.getDate()).padStart(2, "0")}`;
+  }
+  return String(value || "").slice(0, 10);
+}
+
+function mysqlRowToFbaDaily(row) {
+  const normalized = {
+    date: formatMysqlDate(row.date),
+    marketplaceId: row.marketplace_id,
+    sellerSku: row.seller_sku,
+    asin: row.asin || "",
+    fnSku: row.fn_sku || "",
+    title: row.title || "",
+    brand: row.brand || "",
+    imageUrl: row.image_url || "",
+    condition: row.item_condition || "",
+    amazonTotalQuantity: Number(row.amazon_total_quantity || 0),
+    totalGoodsQuantity: Number(row.total_goods_quantity || 0),
+    fulfillableQuantity: Number(row.fulfillable_quantity || 0),
+    reservedQuantity: Number(row.reserved_quantity || 0),
+    unfulfillableQuantity: Number(row.unfulfillable_quantity || 0),
+    inboundWorkingQuantity: Number(row.inbound_working_quantity || 0),
+    inboundShippedQuantity: Number(row.inbound_shipped_quantity || 0),
+    inboundReceivingQuantity: Number(row.inbound_receiving_quantity || 0),
+    researchingQuantity: Number(row.researching_quantity || 0),
+    salesUnits: Number(row.sales_units || 0),
+    salesOrders: Number(row.sales_orders || 0),
+    isSufficient: row.is_sufficient === null || row.is_sufficient === undefined ? undefined : Boolean(row.is_sufficient),
+    inventoryFetchedAt: row.inventory_fetched_at ? new Date(row.inventory_fetched_at).toISOString() : "",
+    salesFetchedAt: row.sales_fetched_at ? new Date(row.sales_fetched_at).toISOString() : "",
+    frozenAt: row.frozen_at ? new Date(row.frozen_at).toISOString() : "",
+    lastUpdatedTime: row.last_updated_time || "",
+    rawInventoryJson: parseMysqlJson(row.raw_inventory_json),
+    rawSalesJson: parseMysqlJson(row.raw_sales_json)
+  };
+  const calculatedTotal = calculateTotalGoodsQuantity(normalized);
+  if (calculatedTotal !== null && (calculatedTotal > 0 || normalized.totalGoodsQuantity === 0)) {
+    normalized.totalGoodsQuantity = calculatedTotal;
+  }
+  return normalized;
+}
+
+function mysqlRowToFbaSkuMetadata(row) {
+  return {
+    marketplaceId: row.marketplace_id,
+    sellerSku: row.seller_sku,
+    asin: row.asin || "",
+    fnSku: row.fn_sku || "",
+    title: row.title || "",
+    brand: row.brand || "",
+    imageUrl: row.image_url || "",
+    condition: row.item_condition || "",
+    source: row.source || "",
+    lastSeenAt: row.last_seen_at ? new Date(row.last_seen_at).toISOString() : "",
+    rawJson: parseMysqlJson(row.raw_json)
+  };
+}
+
+async function readFbaSkuMetadataRows() {
+  if (!isMysqlEnabled()) return [];
+  await ensureFbaDailyMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM fba_sku_metadata");
+  return rows.map(mysqlRowToFbaSkuMetadata);
+}
+
+function rowHasFbaMetadata(row) {
+  return Boolean(row?.marketplaceId && row?.sellerSku && (row.asin || row.fnSku || row.title || row.imageUrl));
+}
+
+function mergeSkuDisplayMetadata(primary = {}, fallback = {}) {
+  const result = {};
+  for (const field of ["asin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
+    result[field] = primary[field] || fallback[field] || "";
+  }
+  return result;
+}
+
+async function upsertFbaSkuMetadata(rows, source = "inventory") {
+  const metadataRows = [...new Map(rows
+    .filter(row => row.sellerSku !== FBA_DATE_MARKER_SKU && rowHasFbaMetadata(row))
+    .map(row => [`${row.marketplaceId}|${row.sellerSku}`, row])
+  ).values()];
+  if (!metadataRows.length) return { inserted: 0, updated: 0 };
+  if (!isMysqlEnabled()) return { inserted: 0, updated: 0 };
+  await ensureFbaDailyMysqlSchema();
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO fba_sku_metadata (
+      marketplace_id, seller_sku, asin, fn_sku, title, brand, image_url, item_condition, source, last_seen_at, raw_json
+    ) VALUES ?
+    ON DUPLICATE KEY UPDATE
+      asin = IF(VALUES(asin) <> '', VALUES(asin), asin),
+      fn_sku = IF(VALUES(fn_sku) <> '', VALUES(fn_sku), fn_sku),
+      title = IF(VALUES(title) <> '', VALUES(title), title),
+      brand = IF(VALUES(brand) <> '', VALUES(brand), brand),
+      image_url = IF(VALUES(image_url) <> '', VALUES(image_url), image_url),
+      item_condition = IF(VALUES(item_condition) <> '', VALUES(item_condition), item_condition),
+      source = VALUES(source),
+      last_seen_at = VALUES(last_seen_at),
+      raw_json = IF(VALUES(raw_json) IS NOT NULL, VALUES(raw_json), raw_json)
+  `, [metadataRows.map(row => [
+    row.marketplaceId,
+    row.sellerSku,
+    row.asin || "",
+    row.fnSku || "",
+    row.title || "",
+    row.brand || "",
+    row.imageUrl || "",
+    row.condition || "",
+    source,
+    toMysqlDateTime(row.inventoryFetchedAt || row.lastSeenAt || new Date().toISOString()),
+    row.rawInventoryJson ? JSON.stringify(row.rawInventoryJson) : (row.rawJson ? JSON.stringify(row.rawJson) : null)
+  ])]);
+  return { inserted: metadataRows.length, updated: 0 };
+}
+
+async function readFbaDailyRowsFromMysql() {
+  await ensureFbaDailyMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM fba_inventory_daily");
+  return rows.map(mysqlRowToFbaDaily);
+}
+
+async function writeFbaDailyRowsToMysql(rows) {
+  await ensureFbaDailyMysqlSchema();
+  const pool = getMysqlPool();
+  const uniqueRows = [...new Map(rows.map(row => [makeFbaDailyKey(row), row])).values()];
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query("DELETE FROM fba_inventory_daily");
+    if (uniqueRows.length) {
+      await connection.query(`
+        INSERT INTO fba_inventory_daily (
+          date, marketplace_id, seller_sku, asin, fn_sku, title, brand, image_url, item_condition,
+          amazon_total_quantity, total_goods_quantity, fulfillable_quantity, reserved_quantity,
+          unfulfillable_quantity, inbound_working_quantity, inbound_shipped_quantity, inbound_receiving_quantity,
+          researching_quantity, sales_units, sales_orders, is_sufficient, inventory_fetched_at, sales_fetched_at,
+          frozen_at, last_updated_time, raw_inventory_json, raw_sales_json
+        ) VALUES ?
+      `, [uniqueRows.map(row => [
+        row.date,
+        row.marketplaceId,
+        row.sellerSku,
+        row.asin || "",
+        row.fnSku || "",
+        row.title || "",
+        row.brand || "",
+        row.imageUrl || "",
+        row.condition || "",
+        Number(row.amazonTotalQuantity || 0),
+        calculateTotalGoodsQuantity(row) ?? 0,
+        Number(row.fulfillableQuantity || 0),
+        Number(row.reservedQuantity || 0),
+        Number(row.unfulfillableQuantity || 0),
+        Number(row.inboundWorkingQuantity || 0),
+        Number(row.inboundShippedQuantity || 0),
+        Number(row.inboundReceivingQuantity || 0),
+        Number(row.researchingQuantity || 0),
+        Number(row.salesUnits || 0),
+        Number(row.salesOrders || 0),
+        row.isSufficient === undefined ? null : (row.isSufficient ? 1 : 0),
+        toMysqlDateTime(row.inventoryFetchedAt),
+        toMysqlDateTime(row.salesFetchedAt),
+        toMysqlDateTime(row.frozenAt),
+        row.lastUpdatedTime || "",
+        row.rawInventoryJson ? JSON.stringify(row.rawInventoryJson) : null,
+        row.rawSalesJson ? JSON.stringify(row.rawSalesJson) : null
+      ])]);
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function ensureFbaDailyStore() {
+  await mkdir(DATA_DIR, { recursive: true });
+  if (!existsSync(FBA_DAILY_PATH)) {
+    await writeFile(FBA_DAILY_PATH, JSON.stringify({ rows: [] }, null, 2), "utf8");
+  }
+}
+
+function makeFbaDailyKey(row) {
+  return [
+    String(row.marketplaceId || "").trim(),
+    String(row.sellerSku || "").trim(),
+    String(row.date || "").slice(0, 10)
+  ].join("|");
+}
+
+async function readFbaDailyRows() {
+  if (isMysqlEnabled()) {
+    return readFbaDailyRowsFromMysql();
+  }
+  await ensureFbaDailyStore();
+  const raw = await readFile(FBA_DAILY_PATH, "utf8");
+  const data = JSON.parse(raw || "{\"rows\":[]}");
+  return Array.isArray(data.rows) ? data.rows : [];
+}
+
+async function writeFbaDailyRows(rows) {
+  if (isMysqlEnabled()) {
+    return writeFbaDailyRowsToMysql(rows);
+  }
+  await ensureFbaDailyStore();
+  rows.sort((a, b) => {
+    const dateCompare = String(b.date || "").localeCompare(String(a.date || ""));
+    if (dateCompare) return dateCompare;
+    return String(a.sellerSku || "").localeCompare(String(b.sellerSku || ""));
+  });
+  await writeFile(FBA_DAILY_PATH, JSON.stringify({ rows }, null, 2), "utf8");
 }
 
 async function appendNetworkDebug(events) {
@@ -753,16 +1138,36 @@ async function requestSpApiAccessToken() {
     return { ok: false, configured: false, config, error: `缺少配置：${config.missing.join(", ")}` };
   }
 
-  const response = await fetch("https://api.amazon.com/auth/o2/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: config.refreshToken,
-      client_id: config.clientId,
-      client_secret: config.clientSecret
-    })
-  });
+  let response;
+  let lastFetchError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      response = await fetchAmazonWithTimeout("https://api.amazon.com/auth/o2/token", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: new URLSearchParams({
+          grant_type: "refresh_token",
+          refresh_token: config.refreshToken,
+          client_id: config.clientId,
+          client_secret: config.clientSecret
+        })
+      });
+      break;
+    } catch (error) {
+      lastFetchError = error;
+      if (attempt < 3) await wait(700 * attempt);
+    }
+  }
+  if (!response) {
+    const cause = lastFetchError?.cause || {};
+    const detail = [cause.code, cause.message || lastFetchError?.message].filter(Boolean).join(" ");
+    return {
+      ok: false,
+      configured: true,
+      config,
+      error: `LWA token 请求失败：${detail || "fetch failed"}`
+    };
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok || !data.access_token) {
     return {
@@ -836,14 +1241,74 @@ async function checkSpApiStatus() {
   };
 }
 
+const US_MARKETPLACE_TIME_ZONE = process.env.AMZ_US_MARKETPLACE_TIME_ZONE || "America/Los_Angeles";
+
+function getZonedParts(date, timeZone) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+  const values = {};
+  for (const part of parts) {
+    if (part.type !== "literal") values[part.type] = Number(part.value);
+  }
+  return values;
+}
+
+function zonedDateTimeToUtc(dateValue, hour, minute, second, timeZone = US_MARKETPLACE_TIME_ZONE) {
+  const [year, month, day] = String(dateValue).slice(0, 10).split("-").map(Number);
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute, second);
+  const zoned = getZonedParts(new Date(utcGuess), timeZone);
+  const zonedAsUtc = Date.UTC(zoned.year, zoned.month - 1, zoned.day, zoned.hour, zoned.minute, zoned.second);
+  return new Date(utcGuess - (zonedAsUtc - utcGuess));
+}
+
+function formatDateInTimeZone(date = new Date(), timeZone = US_MARKETPLACE_TIME_ZONE) {
+  const parts = getZonedParts(date, timeZone);
+  return `${String(parts.year).padStart(4, "0")}-${String(parts.month).padStart(2, "0")}-${String(parts.day).padStart(2, "0")}`;
+}
+
+function addDays(dateValue, amount) {
+  const [year, month, day] = String(dateValue).slice(0, 10).split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day + amount)).toISOString().slice(0, 10);
+}
+
+function dateRangeInclusive(startDate, endDate) {
+  const dates = [];
+  let current = startDate.slice(0, 10);
+  const end = endDate.slice(0, 10);
+  for (let guard = 0; current <= end && guard < 370; guard += 1) {
+    dates.push(current);
+    current = addDays(current, 1);
+  }
+  return dates;
+}
+
+function isFbaDailyFrozen(dateValue) {
+  const today = formatDateInTimeZone();
+  return daysBetweenInclusive(dateValue, today) - 1 > 7;
+}
+
 function toIsoDateStart(value) {
-  const input = value || new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
-  return `${input.slice(0, 10)}T00:00:00Z`;
+  const input = value || addDays(formatDateInTimeZone(), -29);
+  return zonedDateTimeToUtc(input, 0, 0, 0).toISOString();
 }
 
 function toIsoDateEnd(value) {
-  const input = value || new Date().toISOString().slice(0, 10);
-  return `${input.slice(0, 10)}T23:59:59Z`;
+  const input = value || formatDateInTimeZone();
+  return zonedDateTimeToUtc(input, 23, 59, 59).toISOString();
+}
+
+function toOrdersCreatedBefore(value) {
+  const endOfDay = zonedDateTimeToUtc(value || formatDateInTimeZone(), 23, 59, 59);
+  const latestAllowed = new Date(Date.now() - 180000);
+  return new Date(Math.min(endOfDay.getTime(), latestAllowed.getTime())).toISOString();
 }
 
 function daysBetweenInclusive(startDate, endDate) {
@@ -857,6 +1322,30 @@ function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function amazonFetchTimeoutMs() {
+  return Math.max(3000, Number(process.env.AMZ_SP_API_TIMEOUT_MS || 20000));
+}
+
+async function fetchAmazonWithTimeout(resource, init = {}) {
+  const controller = new AbortController();
+  const timeoutMs = amazonFetchTimeoutMs();
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`请求超时（${timeoutMs}ms）`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      fetch(resource, { ...init, signal: init.signal || controller.signal }),
+      timeout
+    ]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function spApiFetch(pathname, params = {}, options = {}) {
   const token = await requestSpApiAccessToken();
   if (!token.ok) throw new Error(token.error || "SP-API LWA token failed");
@@ -864,19 +1353,26 @@ async function spApiFetch(pathname, params = {}, options = {}) {
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   });
-  const response = await fetch(url, {
-    method: options.method || "GET",
-    headers: {
-      "accept": "application/json",
-      "content-type": "application/json",
-      "host": url.host,
-      "user-agent": "AmzAllBlue/0.1 (Language=JavaScript)",
-      "x-amz-access-token": token.accessToken,
-      "x-amz-date": new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""),
-      ...(options.headers || {})
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
+  let response;
+  try {
+    response = await fetchAmazonWithTimeout(url, {
+      method: options.method || "GET",
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "host": url.host,
+        "user-agent": "AmzAllBlue/0.1 (Language=JavaScript)",
+        "x-amz-access-token": token.accessToken,
+        "x-amz-date": new Date().toISOString().replace(/[:-]|\.\d{3}/g, ""),
+        ...(options.headers || {})
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined
+    });
+  } catch (error) {
+    const cause = error.cause || {};
+    const detail = [cause.code, cause.message || error.message].filter(Boolean).join(" ");
+    throw new Error(`${pathname} 请求失败：${detail || "fetch failed"}`);
+  }
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = data.errors?.[0]
@@ -1031,11 +1527,218 @@ async function mapWithConcurrency(items, limit, worker) {
   return results;
 }
 
+function parseFlatReport(text) {
+  const lines = String(text || "").replace(/^\uFEFF/, "").split(/\r?\n/).filter(Boolean);
+  if (!lines.length) return [];
+  const delimiter = lines[0].includes("\t") ? "\t" : ",";
+  const clean = value => String(value ?? "").replace(/^"|"$/g, "").trim();
+  const headers = lines[0].split(delimiter).map(header => clean(header).toLowerCase());
+  return lines.slice(1).map(line => {
+    const values = line.split(delimiter);
+    const row = {};
+    headers.forEach((header, index) => {
+      row[header] = clean(values[index] ?? "");
+    });
+    return row;
+  });
+}
+
+function firstReportValue(row, keys) {
+  for (const key of keys) {
+    const value = row[key];
+    if (value !== undefined && value !== null && value !== "") return value;
+  }
+  return "";
+}
+
+async function downloadReportDocument(documentId) {
+  const document = await spApiFetchWithRetry(`/reports/2021-06-30/documents/${encodeURIComponent(documentId)}`, {}, { retries: 2 });
+  const payload = document.payload || document;
+  if (!payload.url) throw new Error("订单报表文档缺少下载 URL");
+  let response;
+  let lastFetchError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      response = await fetchAmazonWithTimeout(payload.url, { headers: { "user-agent": "AmzAllBlue/0.1" } });
+      if (response.ok) break;
+      if (![429, 500, 502, 503, 504].includes(response.status)) break;
+    } catch (error) {
+      lastFetchError = error;
+    }
+    if (attempt < 3) await wait(700 * attempt);
+  }
+  if (!response) {
+    const cause = lastFetchError?.cause || {};
+    const detail = [cause.code, cause.message || lastFetchError?.message].filter(Boolean).join(" ");
+    throw new Error(`订单报表文档下载失败：${detail || "fetch failed"}`);
+  }
+  if (!response.ok) throw new Error(`订单报表文档下载失败：${response.status}`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (payload.compressionAlgorithm === "GZIP") {
+    return gunzipSync(buffer).toString("utf8");
+  }
+  return buffer.toString("utf8");
+}
+
+async function getOrCreateSalesReport(startDate, endDate) {
+  const config = getSpApiConfig();
+  const reportType = process.env.AMZ_ORDER_REPORT_TYPE || "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL";
+  const key = `${config.marketplaceId}|${reportType}|${startDate}|${endDate}`;
+  const existing = salesReportRequests.get(key);
+  if (existing?.reportId) return existing;
+  const created = await spApiFetchWithRetry("/reports/2021-06-30/reports", {}, {
+    method: "POST",
+    body: {
+      reportType,
+      marketplaceIds: [config.marketplaceId],
+      dataStartTime: toIsoDateStart(startDate),
+      dataEndTime: toOrdersCreatedBefore(endDate)
+    },
+    retries: 1
+  });
+  const payload = created.payload || created;
+  const reportId = payload.reportId || payload.ReportId;
+  if (!reportId) throw new Error("订单报表创建失败：缺少 reportId");
+  const item = { reportId, reportType, createdAt: Date.now() };
+  salesReportRequests.set(key, item);
+  return item;
+}
+
+async function waitForReportDocument(report, label) {
+  const waitMs = Math.max(5000, Number(process.env.AMZ_REPORT_WAIT_MS || process.env.AMZ_ORDER_REPORT_WAIT_MS || 90000));
+  const pollMs = Math.max(3000, Number(process.env.AMZ_REPORT_POLL_MS || process.env.AMZ_ORDER_REPORT_POLL_MS || 6000));
+  const deadline = Date.now() + waitMs;
+  let latestStatus = "";
+  let reportDocumentId = "";
+  while (Date.now() <= deadline) {
+    const statusData = await spApiFetchWithRetry(`/reports/2021-06-30/reports/${encodeURIComponent(report.reportId)}`, {}, { retries: 1 });
+    const payload = statusData.payload || statusData;
+    latestStatus = payload.processingStatus || payload.ProcessingStatus || "";
+    reportDocumentId = payload.reportDocumentId || payload.ReportDocumentId || "";
+    if (latestStatus === "DONE" && reportDocumentId) break;
+    if (["CANCELLED", "FATAL"].includes(latestStatus)) {
+      throw new Error(`${label}生成失败：${latestStatus}`);
+    }
+    await wait(pollMs);
+  }
+  if (!reportDocumentId) {
+    throw new Error(`${label}仍在生成（reportId: ${report.reportId}，状态：${latestStatus || "未知"}），稍后再点“查询”会继续复用这个报表。`);
+  }
+  return reportDocumentId;
+}
+
+async function fetchSalesBySkuFromReport(startDate, endDate) {
+  const report = await getOrCreateSalesReport(startDate, endDate);
+  const reportDocumentId = await waitForReportDocument(report, "订单报表");
+  const text = await downloadReportDocument(reportDocumentId);
+  const rows = parseFlatReport(text);
+  const bySku = new Map();
+  const orderIds = new Set();
+  for (const row of rows) {
+    const sku = firstReportValue(row, ["sku", "seller-sku", "merchant-sku"]);
+    if (!sku) continue;
+    const orderId = firstReportValue(row, ["amazon-order-id", "order-id"]);
+    const asin = firstReportValue(row, ["asin"]);
+    const quantity = Number(firstReportValue(row, ["quantity", "quantity-purchased", "qty"]) || 0);
+    const existing = bySku.get(sku) || { sku, asin, units: 0, orderIds: new Set() };
+    existing.units += Number.isFinite(quantity) ? quantity : 0;
+    if (asin && !existing.asin) existing.asin = asin;
+    if (orderId) {
+      existing.orderIds.add(orderId);
+      orderIds.add(orderId);
+    }
+    bySku.set(sku, existing);
+  }
+  return {
+    source: "reports",
+    reportId: report.reportId,
+    reportType: report.reportType,
+    orderCount: orderIds.size,
+    orderItemErrorCount: 0,
+    warnings: [],
+    bySku: new Map([...bySku.entries()].map(([sku, value]) => [sku, {
+      sku,
+      asin: value.asin,
+      units: value.units,
+      orders: value.orderIds.size
+    }]))
+  };
+}
+
+function reportRowMarketplaceDate(row, fallbackDate) {
+  const value = firstReportValue(row, [
+    "purchase-date",
+    "purchase date",
+    "payments-date",
+    "order-date",
+    "order date"
+  ]);
+  if (!value) return fallbackDate;
+  const parsed = new Date(value);
+  if (!Number.isNaN(parsed.getTime())) return formatDateInTimeZone(parsed);
+  const dateMatch = String(value).match(/^\d{4}-\d{2}-\d{2}/);
+  return dateMatch ? dateMatch[0] : fallbackDate;
+}
+
+async function fetchSalesByDateSkuFromReport(startDate, endDate) {
+  const report = await getOrCreateSalesReport(startDate, endDate);
+  const reportDocumentId = await waitForReportDocument(report, "订单报表");
+  const text = await downloadReportDocument(reportDocumentId);
+  const rows = parseFlatReport(text);
+  const dates = dateRangeInclusive(startDate, endDate);
+  const requestedDates = new Set(dates);
+  const byDate = new Map(dates.map(date => [date, {
+    source: "reports",
+    reportId: report.reportId,
+    reportType: report.reportType,
+    orderCount: 0,
+    orderItemErrorCount: 0,
+    warnings: [],
+    bySku: new Map(),
+    orderIds: new Set()
+  }]));
+
+  for (const row of rows) {
+    const date = reportRowMarketplaceDate(row, startDate);
+    if (!requestedDates.has(date)) continue;
+    const sku = firstReportValue(row, ["sku", "seller-sku", "merchant-sku"]);
+    if (!sku) continue;
+    const orderId = firstReportValue(row, ["amazon-order-id", "order-id"]);
+    const asin = firstReportValue(row, ["asin"]);
+    const quantity = Number(firstReportValue(row, ["quantity", "quantity-purchased", "qty"]) || 0);
+    const dateItem = byDate.get(date);
+    const existing = dateItem.bySku.get(sku) || { sku, asin, units: 0, orderIds: new Set() };
+    existing.units += Number.isFinite(quantity) ? quantity : 0;
+    if (asin && !existing.asin) existing.asin = asin;
+    if (orderId) {
+      existing.orderIds.add(orderId);
+      dateItem.orderIds.add(orderId);
+    }
+    dateItem.bySku.set(sku, existing);
+  }
+
+  for (const item of byDate.values()) {
+    item.orderCount = item.orderIds.size;
+    item.bySku = new Map([...item.bySku.entries()].map(([sku, value]) => [sku, {
+      sku,
+      asin: value.asin,
+      units: value.units,
+      orders: value.orderIds.size
+    }]));
+    delete item.orderIds;
+  }
+  return byDate;
+}
+
 async function fetchSalesBySku(startDate, endDate) {
+  if ((process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders") {
+    return fetchSalesBySkuFromReport(startDate, endDate);
+  }
   const config = getSpApiConfig();
   const bySku = new Map();
   const orders = [];
   const warnings = [];
+  const orderStatuses = process.env.AMZ_ORDER_STATUSES || "Pending,Unshipped,PartiallyShipped,Shipped";
   let nextToken = "";
   for (let page = 0; page < 20; page += 1) {
     const params = nextToken
@@ -1043,8 +1746,8 @@ async function fetchSalesBySku(startDate, endDate) {
       : {
         MarketplaceIds: config.marketplaceId,
         CreatedAfter: toIsoDateStart(startDate),
-        CreatedBefore: toIsoDateEnd(endDate),
-        OrderStatuses: "Shipped,Unshipped,PartiallyShipped"
+        CreatedBefore: toOrdersCreatedBefore(endDate),
+        OrderStatuses: orderStatuses
       };
     const data = await spApiFetchWithRetry("/orders/v0/orders", params);
     const payload = data.payload || data;
@@ -1090,6 +1793,7 @@ async function fetchSalesBySku(startDate, endDate) {
   return {
     orderCount: orders.length,
     orderItemErrorCount: warnings.length,
+    orderStatuses,
     warnings: warnings.slice(0, 10),
     bySku: new Map([...bySku.entries()].map(([sku, value]) => [sku, {
       sku,
@@ -1098,6 +1802,128 @@ async function fetchSalesBySku(startDate, endDate) {
       orders: value.orderIds.size
     }]))
   };
+}
+
+function toLedgerIsoDateStart(dateValue) {
+  return `${String(dateValue).slice(0, 10)}T00:00:00Z`;
+}
+
+function toLedgerIsoDateEnd(dateValue) {
+  return `${String(dateValue).slice(0, 10)}T23:59:59Z`;
+}
+
+async function getOrCreateLedgerReport(startDate, endDate) {
+  const config = getSpApiConfig();
+  const reportType = "GET_LEDGER_SUMMARY_VIEW_DATA";
+  const key = `${config.marketplaceId}|${reportType}|${startDate}|${endDate}|DAILY|COUNTRY`;
+  const existing = salesReportRequests.get(key);
+  if (existing?.reportId) return existing;
+  const created = await spApiFetchWithRetry("/reports/2021-06-30/reports", {}, {
+    method: "POST",
+    body: {
+      reportType,
+      marketplaceIds: [config.marketplaceId],
+      dataStartTime: toLedgerIsoDateStart(startDate),
+      dataEndTime: toLedgerIsoDateEnd(endDate),
+      reportOptions: {
+        aggregateByLocation: "COUNTRY",
+        aggregatedByTimePeriod: "DAILY"
+      }
+    },
+    retries: 1
+  });
+  const payload = created.payload || created;
+  const reportId = payload.reportId || payload.ReportId;
+  if (!reportId) throw new Error("库存账本报表创建失败：缺少 reportId");
+  const item = { reportId, reportType, createdAt: Date.now() };
+  salesReportRequests.set(key, item);
+  return item;
+}
+
+function normalizeLedgerDate(value) {
+  const text = String(value || "").trim();
+  const match = text.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (match) {
+    return `${match[3]}-${String(match[1]).padStart(2, "0")}-${String(match[2]).padStart(2, "0")}`;
+  }
+  return text.slice(0, 10);
+}
+
+function numberFromReport(value) {
+  return Number(String(value || "0").replace(/,/g, "")) || 0;
+}
+
+async function fetchLedgerInventoryRecords(startDate, endDate) {
+  const config = getSpApiConfig();
+  const report = await getOrCreateLedgerReport(startDate, endDate);
+  const reportDocumentId = await waitForReportDocument(report, "库存账本报表");
+  const text = await downloadReportDocument(reportDocumentId);
+  const rows = parseFlatReport(text);
+  const grouped = new Map();
+
+  for (const row of rows) {
+    const date = normalizeLedgerDate(firstReportValue(row, ["date"]));
+    const sellerSku = firstReportValue(row, ["msku", "sku", "seller-sku"]);
+    if (!date || !sellerSku) continue;
+    const key = `${date}|${sellerSku}`;
+    const item = grouped.get(key) || {
+      date,
+      marketplaceId: config.marketplaceId,
+      sellerSku,
+      asin: firstReportValue(row, ["asin"]),
+      fnSku: firstReportValue(row, ["fnsku"]),
+      title: firstReportValue(row, ["title", "product-name"]),
+      fulfillableQuantity: 0,
+      unfulfillableQuantity: 0,
+      rawRows: []
+    };
+    const disposition = firstReportValue(row, ["disposition"]).toUpperCase();
+    const ending = numberFromReport(firstReportValue(row, ["ending warehouse balance", "endingwarehousebalance"]));
+    if (disposition === "SELLABLE") {
+      item.fulfillableQuantity += ending;
+    } else {
+      item.unfulfillableQuantity += ending;
+    }
+    if (!item.asin) item.asin = firstReportValue(row, ["asin"]);
+    if (!item.fnSku) item.fnSku = firstReportValue(row, ["fnsku"]);
+    if (!item.title) item.title = firstReportValue(row, ["title", "product-name"]);
+    item.rawRows.push(row);
+    grouped.set(key, item);
+  }
+
+  return [...grouped.values()].map(item => {
+    const fulfillable = Number(item.fulfillableQuantity || 0);
+    const unfulfillable = Number(item.unfulfillableQuantity || 0);
+    const totalGoods = fulfillable + unfulfillable;
+    return {
+      date: item.date,
+      marketplaceId: item.marketplaceId,
+      sellerSku: item.sellerSku,
+      asin: item.asin || "",
+      fnSku: item.fnSku || "",
+      title: item.title || "",
+      brand: "",
+      imageUrl: "",
+      condition: "",
+      amazonTotalQuantity: totalGoods,
+      totalGoodsQuantity: totalGoods,
+      fulfillableQuantity: fulfillable,
+      reservedQuantity: 0,
+      unfulfillableQuantity: unfulfillable,
+      inboundWorkingQuantity: 0,
+      inboundShippedQuantity: 0,
+      inboundReceivingQuantity: 0,
+      researchingQuantity: 0,
+      inventoryFetchedAt: new Date().toISOString(),
+      lastUpdatedTime: "",
+      rawInventoryJson: {
+        source: "ledger_summary",
+        reportId: report.reportId,
+        reportDocumentId,
+        rows: item.rawRows
+      }
+    };
+  });
 }
 
 function normalizeInventoryRow(summary, sales, catalog, dayCount) {
@@ -1113,6 +1939,8 @@ function normalizeInventoryRow(summary, sales, catalog, dayCount) {
   const inboundReceiving = Number(details.inboundReceivingQuantity || 0);
   const reservedTotal = Number(reserved.totalReservedQuantity || 0);
   const total = Number(summary.totalQuantity || 0);
+  const unfulfillable = Number(details.unfulfillableQuantity || 0);
+  const totalGoods = fulfillable + reservedTotal + unfulfillable + inboundWorking + inboundShipped + inboundReceiving;
   const soldUnits = Number(sales?.units || 0);
   const dailySales = soldUnits / dayCount;
   const coverDays = dailySales > 0 ? Math.floor(fulfillable / dailySales) : null;
@@ -1124,14 +1952,15 @@ function normalizeInventoryRow(summary, sales, catalog, dayCount) {
     brand: catalogInfo.brand || "",
     imageUrl: catalogInfo.imageUrl || "",
     condition: summary.condition || "",
-    totalQuantity: total,
-    inTransitQuantity: inboundShipped + inboundReceiving,
+    amazonTotalQuantity: total,
+    totalQuantity: totalGoods,
+    totalGoodsQuantity: totalGoods,
     inboundWorkingQuantity: inboundWorking,
     inboundShippedQuantity: inboundShipped,
     inboundReceivingQuantity: inboundReceiving,
     fulfillableQuantity: fulfillable,
     reservedQuantity: reservedTotal,
-    unfulfillableQuantity: Number(details.unfulfillableQuantity || 0),
+    unfulfillableQuantity: unfulfillable,
     researchingQuantity: Number(researching.totalResearchingQuantity || 0),
     salesOrders: Number(sales?.orders || 0),
     salesUnits: soldUnits,
@@ -1142,56 +1971,471 @@ function normalizeInventoryRow(summary, sales, catalog, dayCount) {
   };
 }
 
-async function buildFbaInventoryView(startDate, endDate) {
+function buildInventoryDailyRecord(summary, catalog, date, config) {
+  const details = summary.inventoryDetails || {};
+  const reserved = details.reservedQuantity || {};
+  const researching = details.researchingQuantity || {};
+  const asin = summary.asin || "";
+  const sku = summary.sellerSku || summary.sellerSKU || "";
+  const catalogInfo = catalog.get(asin) || {};
+  const fulfillable = Number(details.fulfillableQuantity || 0);
+  const inboundWorking = Number(details.inboundWorkingQuantity || 0);
+  const inboundShipped = Number(details.inboundShippedQuantity || 0);
+  const inboundReceiving = Number(details.inboundReceivingQuantity || 0);
+  const reservedTotal = Number(reserved.totalReservedQuantity || 0);
+  const unfulfillable = Number(details.unfulfillableQuantity || 0);
+  const totalGoods = fulfillable + reservedTotal + unfulfillable + inboundWorking + inboundShipped + inboundReceiving;
+  return {
+    date,
+    marketplaceId: config.marketplaceId,
+    sellerSku: sku,
+    asin,
+    fnSku: summary.fnSku || summary.fnSKU || "",
+    title: catalogInfo.title || summary.productName || "",
+    brand: catalogInfo.brand || "",
+    imageUrl: catalogInfo.imageUrl || "",
+    condition: summary.condition || "",
+    amazonTotalQuantity: Number(summary.totalQuantity || 0),
+    totalGoodsQuantity: totalGoods,
+    fulfillableQuantity: fulfillable,
+    reservedQuantity: reservedTotal,
+    unfulfillableQuantity: unfulfillable,
+    inboundWorkingQuantity: inboundWorking,
+    inboundShippedQuantity: inboundShipped,
+    inboundReceivingQuantity: inboundReceiving,
+    researchingQuantity: Number(researching.totalResearchingQuantity || 0),
+    inventoryFetchedAt: new Date().toISOString(),
+    lastUpdatedTime: summary.lastUpdatedTime || "",
+    rawInventoryJson: summary
+  };
+}
+
+function buildSalesDailyRecord(sale, date, config) {
+  return {
+    date,
+    marketplaceId: config.marketplaceId,
+    sellerSku: sale.sku,
+    asin: sale.asin || "",
+    salesUnits: Number(sale.units || 0),
+    salesOrders: Number(sale.orders || 0),
+    salesFetchedAt: new Date().toISOString(),
+    rawSalesJson: {
+      sku: sale.sku,
+      asin: sale.asin || "",
+      units: Number(sale.units || 0),
+      orders: Number(sale.orders || 0)
+    }
+  };
+}
+
+function buildSalesDateMarkerRecord(date, config, sales) {
+  return {
+    date,
+    marketplaceId: config.marketplaceId,
+    sellerSku: FBA_DATE_MARKER_SKU,
+    asin: "",
+    salesUnits: 0,
+    salesOrders: 0,
+    salesFetchedAt: new Date().toISOString(),
+    rawSalesJson: {
+      date,
+      orderCount: sales.orderCount || 0,
+      orderItemErrorCount: sales.orderItemErrorCount || 0,
+      orderStatuses: sales.orderStatuses || "",
+      source: sales.source || "orders",
+      reportId: sales.reportId || "",
+      reportType: sales.reportType || "",
+      marker: true
+    }
+  };
+}
+
+function mergeFbaDailyRecord(existing, incoming, date) {
+  const frozenAt = isFbaDailyFrozen(date) ? (existing?.frozenAt || new Date().toISOString()) : "";
+  const cleanedIncoming = { ...incoming };
+  if (isRealtimeInventorySnapshot(existing) && incoming?.inventoryFetchedAt) {
+    for (const field of [
+      "amazonTotalQuantity",
+      "totalGoodsQuantity",
+      "fulfillableQuantity",
+      "reservedQuantity",
+      "unfulfillableQuantity",
+      "inboundWorkingQuantity",
+      "inboundShippedQuantity",
+      "inboundReceivingQuantity",
+      "researchingQuantity",
+      "inventoryFetchedAt",
+      "lastUpdatedTime",
+      "rawInventoryJson"
+    ]) {
+      delete cleanedIncoming[field];
+    }
+  }
+  for (const field of ["asin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
+    if (existing?.[field] && cleanedIncoming[field] === "") {
+      delete cleanedIncoming[field];
+    }
+  }
+  return {
+    ...(existing || {}),
+    ...cleanedIncoming,
+    date,
+    frozenAt
+  };
+}
+
+async function upsertFbaDailyRecords(records) {
+  const rows = await readFbaDailyRows();
+  const byKey = new Map(rows.map(row => [makeFbaDailyKey(row), row]));
+  let inserted = 0;
+  let updated = 0;
+  let skippedFrozen = 0;
+
+  for (const record of records) {
+    if (!record?.sellerSku || !record?.marketplaceId || !record?.date) continue;
+    const key = makeFbaDailyKey(record);
+    const existing = byKey.get(key);
+    if (existing?.frozenAt || (existing && isFbaDailyFrozen(record.date))) {
+      skippedFrozen += 1;
+      continue;
+    }
+    byKey.set(key, mergeFbaDailyRecord(existing, record, record.date));
+    if (existing) updated += 1;
+    else inserted += 1;
+  }
+
+  const nextRows = [...byKey.values()];
+  const rowMap = new Map(nextRows.map(row => [makeFbaDailyKey(row), row]));
+  for (const row of nextRows) {
+    const previous = rowMap.get(`${row.marketplaceId}|${row.sellerSku}|${addDays(row.date, -1)}`);
+    if (Number.isFinite(Number(row.salesUnits)) && previous && Number.isFinite(Number(previous.fulfillableQuantity))) {
+      row.isSufficient = Number(row.salesUnits || 0) < Number(previous.fulfillableQuantity || 0);
+    }
+    if (!row.frozenAt && isFbaDailyFrozen(row.date)) {
+      row.frozenAt = new Date().toISOString();
+    }
+  }
+
+  await writeFbaDailyRows(nextRows);
+  await upsertFbaSkuMetadata(nextRows.filter(row => row.inventoryFetchedAt), "inventory");
+  return { inserted, updated, skippedFrozen };
+}
+
+function fbaDatesWithSalesRecords(rows, marketplaceId) {
+  const today = formatDateInTimeZone();
+  const dates = new Set();
+  for (const row of rows) {
+    if (row.marketplaceId !== marketplaceId) continue;
+    if (!row.salesFetchedAt) continue;
+    const date = String(row.date || "").slice(0, 10);
+    if (date === today) continue;
+    dates.add(date);
+  }
+  return dates;
+}
+
+async function syncFbaDailyRange(startDate, endDate, options = {}) {
   const config = getSpApiConfig();
-  const safeStart = (startDate || new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10)).slice(0, 10);
-  const safeEnd = (endDate || new Date().toISOString().slice(0, 10)).slice(0, 10);
-  const dayCount = daysBetweenInclusive(safeStart, safeEnd);
-  let inventory = [];
-  let sales = { orderCount: 0, bySku: new Map() };
-  let catalog = new Map();
+  const today = formatDateInTimeZone();
+  const rangeDates = dateRangeInclusive(startDate, endDate);
+  const dates = options.dates || rangeDates;
+  const inventoryDates = options.inventoryDates || [];
+  const inventoryRecords = [];
   const warnings = [];
-  try {
-    inventory = await fetchFbaInventorySummaries();
-  } catch (error) {
-    throw new Error(`FBA Inventory 拉取失败：${error.message}`);
+  let inventorySynced = false;
+
+  if (rangeDates.includes(today)) {
+    try {
+      const inventory = await fetchFbaInventorySummaries();
+      const catalog = await fetchCatalogDetails(inventory.map(item => item.asin).filter(Boolean));
+      inventoryRecords.push(...inventory.map(summary => buildInventoryDailyRecord(summary, catalog, today, config)));
+      inventorySynced = true;
+    } catch (error) {
+      warnings.push(`当天 FBA 库存快照保存失败：${error.message}`);
+    }
   }
-  try {
-    sales = await fetchSalesBySku(safeStart, safeEnd);
-  } catch (error) {
-    warnings.push(`Orders 销量拉取失败：${error.message}`);
-    sales = { orderCount: 0, bySku: new Map(), orderItemErrorCount: 0, warnings: [] };
+
+  const historicalInventoryDates = inventoryDates.filter(date => date < today);
+  if (historicalInventoryDates.length) {
+    try {
+      const ledgerRecords = await fetchLedgerInventoryRecords(historicalInventoryDates[0], historicalInventoryDates[historicalInventoryDates.length - 1]);
+      const requestedSet = new Set(historicalInventoryDates);
+      inventoryRecords.push(...ledgerRecords.filter(record => requestedSet.has(record.date)));
+    } catch (error) {
+      warnings.push(`历史 FBA 库存账本拉取失败：${error.message}`);
+    }
   }
-  try {
-    catalog = await fetchCatalogDetails(inventory.map(item => item.asin).filter(Boolean));
-  } catch (error) {
-    warnings.push(`Catalog 图片和品名富集失败：${error.message}`);
-    catalog = new Map();
+
+  const salesRecords = [];
+  let orderCount = 0;
+  let orderItemErrorCount = 0;
+  let salesByDate = null;
+  if ((process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders" && dates.length) {
+    try {
+      salesByDate = await fetchSalesByDateSkuFromReport(dates[0], dates[dates.length - 1]);
+    } catch (error) {
+      warnings.push(`${dates[0]} 至 ${dates[dates.length - 1]} Orders 销量报表拉取失败：${error.message}`);
+    }
   }
-  warnings.push(...(sales.warnings || []));
-  const rows = inventory.map(summary => {
-    const sale = sales.bySku.get(summary.sellerSku || summary.sellerSKU || "") || null;
-    return normalizeInventoryRow(summary, sale, catalog, dayCount);
-  }).sort((a, b) => b.totalQuantity - a.totalQuantity);
+  for (const date of dates) {
+    try {
+      const sales = salesByDate?.get(date) || await fetchSalesBySku(date, date);
+      orderCount += sales.orderCount || 0;
+      orderItemErrorCount += sales.orderItemErrorCount || 0;
+      warnings.push(...(sales.warnings || []));
+      salesRecords.push(buildSalesDateMarkerRecord(date, config, sales));
+      for (const sale of sales.bySku.values()) {
+        salesRecords.push(buildSalesDailyRecord(sale, date, config));
+      }
+    } catch (error) {
+      warnings.push(`${date} Orders 销量拉取失败：${error.message}`);
+    }
+  }
+
+  const storage = await upsertFbaDailyRecords([...inventoryRecords, ...salesRecords]);
+  return {
+    dates,
+    inventorySynced,
+    orderCount,
+    orderItemErrorCount,
+    storage,
+    warnings
+  };
+}
+
+async function getFbaDailyDateStatus() {
+  const rows = await readFbaDailyRows();
+  const config = getSpApiConfig();
+  const today = formatDateInTimeZone();
+  const byDate = new Map();
+  for (const row of rows) {
+    if (row.marketplaceId !== config.marketplaceId) continue;
+    const date = String(row.date || "").slice(0, 10);
+    if (!date) continue;
+    if (date === today) continue;
+    const item = byDate.get(date) || {
+      date,
+      rowCount: 0,
+      inventoryCount: 0,
+      salesCount: 0,
+      frozenCount: 0
+    };
+    item.rowCount += 1;
+    if (row.inventoryFetchedAt) item.inventoryCount += 1;
+    if (row.salesFetchedAt) item.salesCount += 1;
+    if (row.frozenAt) item.frozenCount += 1;
+    byDate.set(date, item);
+  }
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
+}
+
+async function buildFbaInventoryView(startDate, endDate, options = {}) {
+  const config = getSpApiConfig();
+  const today = formatDateInTimeZone();
+  const safeStart = (startDate || addDays(formatDateInTimeZone(), -29)).slice(0, 10);
+  const safeEnd = (endDate || formatDateInTimeZone()).slice(0, 10);
+  const dayCount = daysBetweenInclusive(safeStart, safeEnd);
+  const warnings = [];
+  let sync = null;
+  let dailyRows = await readFbaDailyRows();
+  const requestedDates = dateRangeInclusive(safeStart, safeEnd);
+  if (options.mode === "sync") {
+    sync = await syncFbaDailyRange(safeStart, safeEnd, {
+      dates: requestedDates,
+      inventoryDates: requestedDates.filter(date => date < today)
+    });
+    warnings.push(...(sync.warnings || []));
+    dailyRows = await readFbaDailyRows();
+  } else if (options.mode === "query") {
+    const existingSalesDates = fbaDatesWithSalesRecords(dailyRows, config.marketplaceId);
+    const missingDates = requestedDates.filter(date => date === today || !existingSalesDates.has(date));
+    const existingInventoryDates = new Set(dailyRows
+      .filter(row => row.marketplaceId === config.marketplaceId && row.inventoryFetchedAt && row.sellerSku !== FBA_DATE_MARKER_SKU)
+      .map(row => row.date)
+    );
+    const missingHistoricalInventoryDates = requestedDates.filter(date => date < today && !existingInventoryDates.has(date));
+    const hasEndDateInventory = dailyRows.some(row =>
+      row.marketplaceId === config.marketplaceId &&
+      row.date === safeEnd &&
+      row.inventoryFetchedAt &&
+      row.sellerSku !== FBA_DATE_MARKER_SKU
+    );
+    const shouldFetchTodayInventory = requestedDates.includes(today);
+    if (missingDates.length || shouldFetchTodayInventory || missingHistoricalInventoryDates.length) {
+      sync = await syncFbaDailyRange(safeStart, safeEnd, {
+        dates: missingDates,
+        inventoryDates: missingHistoricalInventoryDates
+      });
+      warnings.push(...(sync.warnings || []));
+      dailyRows = await readFbaDailyRows();
+    }
+  }
+  const rangeRows = dailyRows.filter(row => row.date >= safeStart && row.date <= safeEnd && row.marketplaceId === config.marketplaceId);
+  const allInventoryRows = dailyRows.filter(row => row.marketplaceId === config.marketplaceId && row.inventoryFetchedAt && row.sellerSku !== FBA_DATE_MARKER_SKU);
+  const metadataRows = (await readFbaSkuMetadataRows()).filter(row => row.marketplaceId === config.marketplaceId);
+  let inventoryRows = allInventoryRows.filter(row => row.date === safeEnd);
+
+  if (!inventoryRows.length && safeEnd === today) {
+    try {
+      const inventory = await fetchFbaInventorySummaries();
+      const catalog = await fetchCatalogDetails(inventory.map(item => item.asin).filter(Boolean));
+      inventoryRows = inventory.map(summary => buildInventoryDailyRecord(summary, catalog, today, config));
+      await upsertFbaSkuMetadata(inventoryRows, "inventory");
+      warnings.push("当前展示使用实时 FBA 库存兜底；点击同步后会保存当天库存快照。");
+    } catch (error) {
+      throw new Error(`FBA Inventory 拉取失败：${error.message}`);
+    }
+  } else if (!inventoryRows.length) {
+    warnings.push(`结束日期 ${safeEnd} 没有本地 FBA 库存快照；库存字段显示为空，销量仍按所选日期范围统计。`);
+  }
+
+  const latestInventoryBySku = new Map();
+  for (const row of inventoryRows) {
+    if (row.sellerSku === FBA_DATE_MARKER_SKU) continue;
+    const existing = latestInventoryBySku.get(row.sellerSku);
+    if (!existing || String(row.date || "") > String(existing.date || "")) {
+      latestInventoryBySku.set(row.sellerSku, row);
+    }
+  }
+
+  const latestMetadataBySku = new Map();
+  for (const row of metadataRows) {
+    if (!row.sellerSku) continue;
+    latestMetadataBySku.set(row.sellerSku, row);
+  }
+  for (const row of allInventoryRows) {
+    if (row.sellerSku === FBA_DATE_MARKER_SKU) continue;
+    const existing = latestMetadataBySku.get(row.sellerSku);
+    if (!existing || !existing.lastSeenAt || String(row.date || "") > String(existing.date || existing.lastSeenAt || "")) {
+      latestMetadataBySku.set(row.sellerSku, row);
+    }
+  }
+
+  const salesBySku = new Map();
+  const inventoryBySkuDate = new Map();
+  for (const row of allInventoryRows) {
+    if (!row.sellerSku || !row.date) continue;
+    inventoryBySkuDate.set(`${row.sellerSku}|${row.date}`, row);
+  }
+  for (const row of rangeRows) {
+    if (row.sellerSku === FBA_DATE_MARKER_SKU) continue;
+    if (!row.sellerSku) continue;
+    const item = salesBySku.get(row.sellerSku) || {
+      units: 0,
+      orders: 0,
+      sufficientUnits: 0,
+      sufficientDays: 0
+    };
+    const units = Number(row.salesUnits || 0);
+    item.units += units;
+    item.orders += Number(row.salesOrders || 0);
+    const sameDayInventory = inventoryBySkuDate.get(`${row.sellerSku}|${row.date}`);
+    const previousInventory = inventoryBySkuDate.get(`${row.sellerSku}|${addDays(row.date, -1)}`);
+    const inventoryForSufficientCheck = sameDayInventory ? (previousInventory || sameDayInventory) : null;
+    if (inventoryForSufficientCheck && Number(sameDayInventory.fulfillableQuantity || 0) > 0 && units < Number(inventoryForSufficientCheck.fulfillableQuantity || 0)) {
+      item.sufficientUnits += units;
+      item.sufficientDays += 1;
+    }
+    salesBySku.set(row.sellerSku, item);
+  }
+
+  const rowSkus = new Set([...latestInventoryBySku.keys(), ...salesBySku.keys()]);
+  const rows = [...rowSkus].map(sku => {
+    const inventory = latestInventoryBySku.get(sku) || null;
+    const metadata = mergeSkuDisplayMetadata(latestMetadataBySku.get(sku), inventory);
+    const sale = salesBySku.get(sku) || { units: 0, orders: 0, sufficientUnits: 0, sufficientDays: 0 };
+    const dailySales = sale.sufficientDays > 0 ? sale.sufficientUnits / sale.sufficientDays : sale.units / dayCount;
+    const inventorySource = inventorySnapshotSource(inventory);
+    const isWarehouseOnlyInventory = inventorySource === "ledger_summary";
+    const fulfillableQuantity = inventory ? Number(inventory.fulfillableQuantity || 0) : 0;
+    const warehouseQuantity = inventory ? Number(inventory.fulfillableQuantity || 0) + Number(inventory.unfulfillableQuantity || 0) : 0;
+    const totalGoodsQuantity = inventory && !isWarehouseOnlyInventory ? calculateTotalGoodsQuantity(inventory) : null;
+    const sellableDays = dailySales > 0 && totalGoodsQuantity !== null ? Math.floor(Number(totalGoodsQuantity || 0) / dailySales) : null;
+    const stockoutDays = requestedDates.reduce((count, date) => {
+      const dayInventory = inventoryBySkuDate.get(`${sku}|${date}`);
+      return count + (!dayInventory || Number(dayInventory.fulfillableQuantity || 0) <= 0 ? 1 : 0);
+    }, 0);
+    return {
+      asin: metadata.asin || "",
+      sellerSku: sku,
+      fnSku: metadata.fnSku || "",
+      title: metadata.title || "",
+      brand: metadata.brand || "",
+      imageUrl: metadata.imageUrl || "",
+      condition: metadata.condition || "",
+      inventorySource,
+      inventoryCompleteness: isWarehouseOnlyInventory ? "warehouse_only" : (inventory ? "complete" : "missing"),
+      warehouseQuantity,
+      amazonTotalQuantity: inventory ? Number(inventory.amazonTotalQuantity || 0) : 0,
+      totalQuantity: totalGoodsQuantity,
+      totalGoodsQuantity,
+      fulfillableQuantity,
+      reservedQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.reservedQuantity || 0) : null,
+      unfulfillableQuantity: inventory ? Number(inventory.unfulfillableQuantity || 0) : 0,
+      inboundWorkingQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.inboundWorkingQuantity || 0) : null,
+      inboundShippedQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.inboundShippedQuantity || 0) : null,
+      inboundReceivingQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.inboundReceivingQuantity || 0) : null,
+      salesOrders: Number(sale.orders || 0),
+      salesUnits: Number(sale.units || 0),
+      sufficientSalesDays: Number(sale.sufficientDays || 0),
+      dailySales: Number(dailySales.toFixed(2)),
+      sellableDays,
+      stockoutDays,
+      stockLevel: sellableDays === null ? "unknown" : sellableDays < 14 ? "low" : sellableDays < 30 ? "medium" : "healthy",
+      lastUpdatedTime: "",
+      inventoryDate: inventory?.date || ""
+    };
+  }).sort((a, b) => Number(b.totalGoodsQuantity || 0) - Number(a.totalGoodsQuantity || 0));
 
   const totals = rows.reduce((acc, row) => {
-    acc.totalQuantity += row.totalQuantity;
-    acc.inTransitQuantity += row.inTransitQuantity;
-    acc.inboundWorkingQuantity += row.inboundWorkingQuantity;
-    acc.fulfillableQuantity += row.fulfillableQuantity;
-    acc.reservedQuantity += row.reservedQuantity;
+    acc.amazonTotalQuantity += Number(row.amazonTotalQuantity || 0);
+    acc.warehouseQuantity += Number(row.warehouseQuantity || 0);
+    if (row.totalGoodsQuantity !== null && row.totalGoodsQuantity !== undefined) {
+      acc.completeInventoryRows += 1;
+      acc.totalQuantity += Number(row.totalGoodsQuantity || 0);
+      acc.totalGoodsQuantity += Number(row.totalGoodsQuantity || 0);
+    }
+    if (row.inventoryCompleteness === "warehouse_only") acc.warehouseOnlyRows += 1;
+    if (row.inboundWorkingQuantity !== null && row.inboundWorkingQuantity !== undefined) acc.inboundWorkingQuantity += Number(row.inboundWorkingQuantity || 0);
+    if (row.inboundShippedQuantity !== null && row.inboundShippedQuantity !== undefined) acc.inboundShippedQuantity += Number(row.inboundShippedQuantity || 0);
+    if (row.inboundReceivingQuantity !== null && row.inboundReceivingQuantity !== undefined) acc.inboundReceivingQuantity += Number(row.inboundReceivingQuantity || 0);
+    acc.fulfillableQuantity += Number(row.fulfillableQuantity || 0);
+    if (row.reservedQuantity !== null && row.reservedQuantity !== undefined) acc.reservedQuantity += Number(row.reservedQuantity || 0);
+    acc.unfulfillableQuantity += Number(row.unfulfillableQuantity || 0);
     acc.salesOrders += row.salesOrders;
     acc.salesUnits += row.salesUnits;
     return acc;
   }, {
+    amazonTotalQuantity: 0,
+    warehouseQuantity: 0,
     totalQuantity: 0,
-    inTransitQuantity: 0,
+    totalGoodsQuantity: 0,
+    completeInventoryRows: 0,
+    warehouseOnlyRows: 0,
     inboundWorkingQuantity: 0,
+    inboundShippedQuantity: 0,
+    inboundReceivingQuantity: 0,
     fulfillableQuantity: 0,
+    unfulfillableQuantity: 0,
     reservedQuantity: 0,
     salesOrders: 0,
     salesUnits: 0
   });
+  totals.inventoryCompleteness = totals.warehouseOnlyRows > 0 ? "partial" : "complete";
+  if (totals.inventoryCompleteness !== "complete") {
+    totals.totalQuantity = null;
+    totals.totalGoodsQuantity = null;
+    totals.inboundWorkingQuantity = null;
+    totals.inboundShippedQuantity = null;
+    totals.inboundReceivingQuantity = null;
+    totals.reservedQuantity = null;
+  }
+  const salesMarkerSummary = rangeRows.reduce((acc, row) => {
+    if (row.sellerSku !== FBA_DATE_MARKER_SKU) return acc;
+    acc.orderCount += Number(row.rawSalesJson?.orderCount || 0);
+    acc.orderItemErrorCount += Number(row.rawSalesJson?.orderItemErrorCount || 0);
+    return acc;
+  }, { orderCount: 0, orderItemErrorCount: 0 });
 
   return {
     range: { startDate: safeStart, endDate: safeEnd, dayCount },
@@ -1203,9 +2447,11 @@ async function buildFbaInventoryView(startDate, endDate) {
     totals,
     warnings,
     sales: {
-      orderCount: sales.orderCount || 0,
-      orderItemErrorCount: sales.orderItemErrorCount || 0
+      orderCount: (sync?.orderCount ?? salesMarkerSummary.orderCount) || totals.salesOrders || 0,
+      orderItemErrorCount: (sync?.orderItemErrorCount ?? salesMarkerSummary.orderItemErrorCount) || 0,
+      sufficientSalesDays: rows.reduce((sum, row) => sum + Number(row.sufficientSalesDays || 0), 0)
     },
+    sync,
     rows
   };
 }
@@ -2323,16 +3569,22 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/fba/inventory") {
     const startDate = url.searchParams.get("startDate") || "";
     const endDate = url.searchParams.get("endDate") || "";
-    const refresh = url.searchParams.get("refresh") === "1";
-    const cacheKey = `${startDate}:${endDate}:${getSpApiConfig().marketplaceId}`;
+    const mode = url.searchParams.get("mode") || "";
+    const refresh = url.searchParams.get("refresh") === "1" || mode === "sync" || mode === "query";
+    const cacheKey = `${startDate}:${endDate}:${mode}:${getSpApiConfig().marketplaceId}`;
     const cacheTtlMs = Number(process.env.AMZ_FBA_CACHE_TTL_MS || 300000);
     const cached = fbaInventoryCache.get(cacheKey);
     if (!refresh && cached && Date.now() - cached.cachedAt < cacheTtlMs) {
       return sendJson(res, { ...cached.data, cached: true, cachedAt: cached.cachedAt });
     }
-    const result = await buildFbaInventoryView(startDate, endDate);
+    const result = await buildFbaInventoryView(startDate, endDate, { mode: mode || (refresh ? "sync" : "") });
     fbaInventoryCache.set(cacheKey, { cachedAt: Date.now(), data: result });
     return sendJson(res, result);
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/fba/inventory/dates") {
+    const dates = await getFbaDailyDateStatus();
+    return sendJson(res, { dates });
   }
 
   if (req.method === "POST" && url.pathname === "/api/products/sync-sandbox") {
@@ -2538,7 +3790,10 @@ async function serveStatic(req, res, url) {
 
   try {
     const data = await readFile(target);
-    res.writeHead(200, { "content-type": mimeTypes[extname(target)] || "application/octet-stream" });
+    res.writeHead(200, {
+      "content-type": mimeTypes[extname(target)] || "application/octet-stream",
+      "cache-control": "no-store, max-age=0"
+    });
     res.end(data);
   } catch {
     res.writeHead(404, { "content-type": "text/plain; charset=utf-8" });

@@ -88,21 +88,15 @@
               <h1>FBA库存</h1>
               <p>按 ASIN/MSKU 统计真实 FBA 库存、销量和库存充足天数</p>
             </div>
-            <div class="actions slim">
-              <button id="syncProductsBtn">同步库存</button>
-              <button id="refreshProductsBtn">刷新</button>
-            </div>
           </div>
 
           <section class="panel fba-panel">
             <div class="fba-toolbar">
-              <label>
-                开始日期
-                <input id="salesStartDate" type="date">
-              </label>
-              <label>
-                结束日期
-                <input id="salesEndDate" type="date">
+              <label class="date-picker-field date-range-field">
+                日期范围
+                <input id="salesDateRange" type="text" readonly>
+                <input id="salesStartDate" type="hidden">
+                <input id="salesEndDate" type="hidden">
               </label>
               <label>
                 搜索
@@ -118,27 +112,18 @@
                   <option value="unknown">无销量</option>
                 </select>
               </label>
+              <div class="fba-toolbar-actions">
+                <button id="fbaColumnSettingsBtn" class="secondary-button" type="button" title="选择表格显示哪些列，并设置默认排序。">显示列</button>
+                <button id="fbaFilterSettingsBtn" class="secondary-button" type="button" title="设置表格筛选条件，只影响当前页面显示，不请求 API。">筛选数据</button>
+                <button id="syncProductsBtn" type="button" title="强制按所选日期范围逐日请求 API 并写入数据库；超过 7 天且已冻结的记录不会自动覆盖。">同步数据</button>
+                <button id="queryProductsBtn" type="button" title="先查询数据库；如果所选日期范围有缺失日期，才请求缺失日期的 API 并写入数据库。">查询</button>
+              </div>
             </div>
+            <div id="fbaDatePicker" class="date-picker-popover" hidden></div>
             <div id="fbaSummary" class="fba-summary"></div>
             <div class="fba-table-wrap">
               <table class="fba-table">
-                <thead>
-                  <tr>
-                    <th>图片</th>
-                    <th>ASIN/MSKU</th>
-                    <th>FNSKU/SKU</th>
-                    <th>品名</th>
-                    <th>总库存</th>
-                    <th>在途</th>
-                    <th>可售</th>
-                    <th>入库中</th>
-                    <th>预留</th>
-                    <th>售卖订单</th>
-                    <th>售卖数量</th>
-                    <th>日销量</th>
-                    <th>充足天数</th>
-                  </tr>
-                </thead>
+                <thead id="fbaTableHead"></thead>
                 <tbody id="productList"></tbody>
                 <tfoot id="fbaTotals"></tfoot>
               </table>
