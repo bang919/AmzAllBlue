@@ -1282,6 +1282,9 @@ function quickDateRange(type) {
     const yesterday = shiftDateValue(today, -1);
     return { startDate: yesterday, endDate: yesterday };
   }
+  if (type === "last7") {
+    return { startDate: shiftDateValue(today, -6), endDate: today };
+  }
   if (type === "last30") {
     return { startDate: shiftDateValue(today, -29), endDate: today };
   }
@@ -1371,6 +1374,7 @@ function renderDatePicker() {
     <div class="date-picker-quick">
       <button type="button" data-date-quick="today">今天</button>
       <button type="button" data-date-quick="yesterday">昨天</button>
+      <button type="button" data-date-quick="last7">最近7天</button>
       <button type="button" data-date-quick="last30">最近30天</button>
       <button type="button" data-date-quick="last30Exclude2">最近30天（不含近2天）</button>
     </div>
