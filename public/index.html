@@ -119,7 +119,7 @@
               <div class="fba-toolbar-actions">
                 <button id="fbaColumnSettingsBtn" class="secondary-button" type="button" title="选择表格显示哪些列，并设置默认排序。">显示列</button>
                 <button id="fbaFilterSettingsBtn" class="secondary-button" type="button" title="设置表格筛选条件，只影响当前页面显示，不请求 API。">筛选数据</button>
-                <button id="syncProductsBtn" type="button" title="强制按所选日期范围逐日请求 API 并写入数据库；超过 7 天且已冻结的记录不会自动覆盖。">同步数据</button>
+                <button id="syncProductsBtn" type="button" title="强制按所选日期范围重新请求 API，并把成功返回的库存和销量覆盖写入数据库。">强制刷新数据</button>
                 <button id="queryProductsBtn" type="button" title="先查询数据库；如果所选日期范围有缺失日期，才请求缺失日期的 API 并写入数据库。">查询</button>
               </div>
             </div>
@@ -127,6 +127,7 @@
             <div id="fbaSummary" class="fba-summary"></div>
             <div class="fba-table-wrap">
               <table class="fba-table">
+                <colgroup id="fbaTableColumns"></colgroup>
                 <thead id="fbaTableHead"></thead>
                 <tbody id="productList"></tbody>
                 <tfoot id="fbaTotals"></tfoot>

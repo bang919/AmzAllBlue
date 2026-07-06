@@ -55,31 +55,65 @@ const MAIL_TEMPLATE_KEY = "amazonAggregator.mailTemplate.v1";
 const FBA_COLUMNS_KEY = "amazonAggregator.fbaColumns.v1";
 const FBA_SORT_KEY = "amazonAggregator.fbaSort.v1";
 const FBA_FILTERS_KEY = "amazonAggregator.fbaFilters.v1";
+const FBA_COLUMN_WIDTHS_KEY = "amazonAggregator.fbaColumnWidths.v1";
 const fbaDateStatus = new Map();
 let dateRangePickerOpen = false;
 let datePickerMonth = "";
 let fbaVisibleColumns = new Set();
 let fbaSort = { key: "totalGoodsQuantity", direction: "desc" };
 let fbaColumnFilters = {};
+let fbaColumnWidths = {};
+let fbaColumnResizeState = null;
 
 const fbaColumns = [
   { key: "image", label: "图片", type: "static", always: true, render: product => product.imageUrl ? `<img class="fba-thumb" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title || product.asin)}">` : `<div class="fba-thumb placeholder">无图</div>` },
   { key: "asinSku", label: "ASIN/MSKU", type: "text", always: true, value: product => `${product.asin || ""} ${product.sellerSku || ""}`, render: product => `<a href="https://www.amazon.com/dp/${escapeHtml(product.asin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.asin || "-")}</a><span>${escapeHtml(product.sellerSku || "-")}</span>` },
+  { key: "parentAsin", label: "父ASIN", type: "text", value: product => product.parentAsin || "", render: product => product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-" },
   { key: "fnSku", label: "FNSKU/SKU", type: "text", value: product => `${product.fnSku || ""} ${product.sellerSku || ""}`, render: product => `<strong>${escapeHtml(product.fnSku || "-")}</strong><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "title", label: "品名", type: "text", value: product => `${product.title || ""} ${product.brand || ""} ${product.condition || ""}`, render: product => `${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span>` },
-  { key: "totalGoodsQuantity", label: "总货量", type: "number", value: product => numberSortValue(getProductTotalGoods(product)), render: product => formatInventoryNumber(getProductTotalGoods(product)) },
+  { key: "factoryFbaTotalQuantity", label: "工厂+FBA\n总库存", type: "number", value: product => product.factoryFbaTotalQuantity, render: product => formatInventoryNumber(product.factoryFbaTotalQuantity) },
+  { key: "factoryQuantity", label: "工厂总库存", type: "number", value: product => product.factoryQuantity, render: product => formatInventoryNumber(product.factoryQuantity) },
+  { key: "totalGoodsQuantity", label: "FBA总库存", type: "number", value: product => getProductTotalGoods(product), render: product => formatInventoryNumber(getProductTotalGoods(product)) },
   { key: "fulfillableQuantity", label: "可售", type: "number", value: product => Number(product.fulfillableQuantity || 0), render: product => formatNumber(product.fulfillableQuantity) },
-  { key: "inboundWorkingQuantity", label: "入库计划", type: "number", value: product => numberSortValue(product.inboundWorkingQuantity), render: product => formatInventoryNumber(product.inboundWorkingQuantity) },
-  { key: "inboundShippedQuantity", label: "已发货", type: "number", value: product => numberSortValue(product.inboundShippedQuantity), render: product => formatInventoryNumber(product.inboundShippedQuantity) },
-  { key: "inboundReceivingQuantity", label: "接收中", type: "number", value: product => numberSortValue(product.inboundReceivingQuantity), render: product => formatInventoryNumber(product.inboundReceivingQuantity) },
-  { key: "reservedQuantity", label: "预留", type: "number", value: product => numberSortValue(product.reservedQuantity), render: product => formatInventoryNumber(product.reservedQuantity) },
+  { key: "inboundQuantity", label: "在路上", type: "number", value: product => getProductInboundQuantity(product), render: product => formatInventoryNumber(getProductInboundQuantity(product)) },
+  { key: "inboundWorkingQuantity", label: "入库计划\n（在路上）", type: "number", value: product => product.inboundWorkingQuantity, render: product => formatInventoryNumber(product.inboundWorkingQuantity) },
+  { key: "inboundShippedQuantity", label: "已发货\n（在路上）", type: "number", value: product => product.inboundShippedQuantity, render: product => formatInventoryNumber(product.inboundShippedQuantity) },
+  { key: "inboundReceivingQuantity", label: "接收中\n（在路上）", type: "number", value: product => product.inboundReceivingQuantity, render: product => formatInventoryNumber(product.inboundReceivingQuantity) },
+  { key: "reservedQuantity", label: "预留", type: "number", value: product => product.reservedQuantity, render: product => formatInventoryNumber(product.reservedQuantity) },
   { key: "unfulfillableQuantity", label: "不可售", type: "number", value: product => Number(product.unfulfillableQuantity || 0), render: product => formatNumber(product.unfulfillableQuantity) },
   { key: "salesOrders", label: "售卖订单", type: "number", value: product => Number(product.salesOrders || 0), render: product => formatNumber(product.salesOrders) },
   { key: "salesUnits", label: "售卖数量", type: "number", value: product => Number(product.salesUnits || 0), render: product => formatNumber(product.salesUnits) },
   { key: "dailySales", label: "日销量", type: "number", value: product => Number(product.dailySales || 0), render: product => formatNumber(product.dailySales, 2) },
   { key: "stockoutDays", label: "缺货天数", type: "number", value: product => Number(product.stockoutDays || 0), render: product => Number(product.stockoutDays || 0) > 0 ? `<span class="stock-pill stock-low">${formatNumber(product.stockoutDays)} 天</span>` : "0" },
-  { key: "sellableDays", label: "可售天数", type: "number", value: product => product.sellableDays === null ? -1 : Number(product.sellableDays || 0), render: product => product.totalGoodsQuantity === null ? "/" : (product.sellableDays === null ? "无销量" : `<span class="stock-pill stock-${escapeHtml(product.stockLevel)}">${formatNumber(product.sellableDays)} 天</span>`) }
+  { key: "sellableDays", label: "FBA\n可售天数", type: "number", value: product => product.sellableDays, render: product => getProductTotalGoods(product) === null ? "/" : (product.sellableDays === null ? "无销量" : `<span class="stock-pill stock-${escapeHtml(product.stockLevel)}">${formatNumber(product.sellableDays)} 天</span>`) },
+  { key: "factoryFbaSellableDays", label: "工厂+FBA\n可售天数", type: "number", value: product => product.factoryFbaSellableDays, render: product => product.factoryFbaTotalQuantity === null || product.factoryFbaTotalQuantity === undefined ? "/" : (product.factoryFbaSellableDays === null ? "无销量" : `<span class="stock-pill stock-${escapeHtml(product.factoryFbaStockLevel)}">${formatNumber(product.factoryFbaSellableDays)} 天</span>`) }
 ];
+
+function getDefaultFbaColumnWidth(column) {
+  if (column.key === "image") return 86;
+  if (column.key === "asinSku") return 156;
+  if (column.key === "parentAsin") return 126;
+  if (column.key === "fnSku") return 150;
+  if (column.key === "title") return 360;
+  if (column.type === "number") return 112;
+  return 130;
+}
+
+function getFbaColumnWidth(column) {
+  const value = Number(fbaColumnWidths[column.key]);
+  return Number.isFinite(value) && value > 0 ? Math.max(72, value) : getDefaultFbaColumnWidth(column);
+}
+
+function renderFbaColumnWidths(visibleColumns = getVisibleFbaColumns()) {
+  const colgroup = $("#fbaTableColumns");
+  const table = colgroup?.closest("table");
+  if (!colgroup || !table) return;
+  const widths = visibleColumns.map(column => getFbaColumnWidth(column));
+  colgroup.innerHTML = visibleColumns.map((column, index) =>
+    `<col data-fba-col="${escapeHtml(column.key)}" style="width:${widths[index]}px">`
+  ).join("");
+  table.style.width = `${widths.reduce((sum, width) => sum + width, 0)}px`;
+}
 
 function getProductTotalGoods(product) {
   if (product.totalGoodsQuantity === null || product.totalQuantity === null) return null;
@@ -89,7 +123,6 @@ function getProductTotalGoods(product) {
   const values = [
     product.fulfillableQuantity,
     product.reservedQuantity,
-    product.unfulfillableQuantity,
     product.inboundWorkingQuantity,
     product.inboundShippedQuantity,
     product.inboundReceivingQuantity
@@ -104,6 +137,19 @@ function getProductTotalGoods(product) {
   return null;
 }
 
+function getProductInboundQuantity(product) {
+  if (product.inboundQuantity !== null && product.inboundQuantity !== undefined && product.inboundQuantity !== "") {
+    return Number(product.inboundQuantity || 0);
+  }
+  const values = [
+    product.inboundWorkingQuantity,
+    product.inboundShippedQuantity,
+    product.inboundReceivingQuantity
+  ];
+  if (values.every(value => value === null || value === undefined || value === "")) return null;
+  return values.reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
 function loadFbaTablePreferences() {
   const defaultColumns = fbaColumns.map(column => column.key);
   try {
@@ -114,8 +160,13 @@ function loadFbaTablePreferences() {
   }
   fbaVisibleColumns.delete("coverDays");
   fbaVisibleColumns.delete("lastUpdatedTime");
+  fbaVisibleColumns.add("factoryFbaTotalQuantity");
+  fbaVisibleColumns.add("factoryQuantity");
+  fbaVisibleColumns.add("totalGoodsQuantity");
+  fbaVisibleColumns.add("inboundQuantity");
   fbaVisibleColumns.add("stockoutDays");
   fbaVisibleColumns.add("sellableDays");
+  fbaVisibleColumns.add("factoryFbaSellableDays");
   for (const column of fbaColumns) {
     if (column.always) fbaVisibleColumns.add(column.key);
   }
@@ -129,6 +180,11 @@ function loadFbaTablePreferences() {
   } catch {
     fbaColumnFilters = {};
   }
+  try {
+    fbaColumnWidths = JSON.parse(localStorage.getItem(FBA_COLUMN_WIDTHS_KEY) || "{}") || {};
+  } catch {
+    fbaColumnWidths = {};
+  }
 }
 
 loadFbaTablePreferences();
@@ -141,6 +197,14 @@ const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, char => ({
   "\"": "&quot;",
   "'": "&#039;"
 }[char]));
+
+function renderColumnLabel(label) {
+  return escapeHtml(label).replace(/\n/g, "<br>");
+}
+
+function renderFilterColumnLabel(label) {
+  return escapeHtml(String(label || "").replace(/\n/g, ""));
+}
 
 function setBusy(button, busy, text) {
   if (!button) return;
@@ -984,6 +1048,7 @@ function productMatches(product) {
   if (source && product.stockLevel !== source) return false;
   if (keyword && ![
     product.asin,
+    product.parentAsin,
     product.sellerSku,
     product.fnSku,
     product.title,
@@ -993,7 +1058,11 @@ function productMatches(product) {
   for (const column of fbaColumns) {
     const filter = fbaColumnFilters[column.key] || {};
     if (column.type === "number") {
-      const value = Number(column.value?.(product) ?? 0);
+      const hasMin = filter.min !== "" && filter.min !== undefined;
+      const hasMax = filter.max !== "" && filter.max !== undefined;
+      const rawValue = column.value?.(product);
+      if ((hasMin || hasMax) && (rawValue === null || rawValue === undefined || rawValue === "")) return false;
+      const value = Number(rawValue ?? 0);
       if (filter.min !== "" && filter.min !== undefined && value < Number(filter.min)) return false;
       if (filter.max !== "" && filter.max !== undefined && value > Number(filter.max)) return false;
     } else if (column.type === "text") {
@@ -1014,15 +1083,106 @@ function compareFbaProducts(a, b) {
   const av = column?.value ? column.value(a) : a[column?.key];
   const bv = column?.value ? column.value(b) : b[column?.key];
   if (column?.type === "number") {
-    return (Number(av || 0) - Number(bv || 0)) * direction;
+    return (numberSortValue(av) - numberSortValue(bv)) * direction;
   }
   return String(av || "").localeCompare(String(bv || "")) * direction;
+}
+
+function getNumericMetricValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function getTopFbaRowsByMetric(rows, metricGetter) {
+  let maxValue = null;
+  const winners = [];
+  for (const row of rows) {
+    const value = getNumericMetricValue(metricGetter(row));
+    if (value === null) continue;
+    if (maxValue === null || value > maxValue) {
+      maxValue = value;
+      winners.length = 0;
+      winners.push(row);
+    } else if (value === maxValue) {
+      winners.push(row);
+    }
+  }
+  return { hasMetric: maxValue !== null, winners };
+}
+
+function pickFbaRowsForAsinGroup(rows) {
+  if (rows.length <= 1) return rows;
+  const totalTop = getTopFbaRowsByMetric(rows, row => getProductTotalGoods(row));
+  if (totalTop.hasMetric) {
+    if (totalTop.winners.length === 1) return totalTop.winners;
+    const salesTop = getTopFbaRowsByMetric(totalTop.winners, row => row.dailySales);
+    return salesTop.hasMetric && salesTop.winners.length === 1 ? salesTop.winners : totalTop.winners;
+  }
+  const salesTop = getTopFbaRowsByMetric(rows, row => row.dailySales);
+  return salesTop.hasMetric && salesTop.winners.length === 1 ? salesTop.winners : rows;
+}
+
+function collapseFbaRowsByAsin(rows) {
+  const groups = new Map();
+  const output = [];
+  for (const row of rows) {
+    const asin = String(row.asin || "").trim().toUpperCase();
+    if (!asin) {
+      output.push(row);
+      continue;
+    }
+    if (!groups.has(asin)) groups.set(asin, []);
+    groups.get(asin).push(row);
+  }
+  for (const group of groups.values()) {
+    output.push(...pickFbaRowsForAsinGroup(group));
+  }
+  return output;
 }
 
 function saveFbaTablePreferences() {
   localStorage.setItem(FBA_COLUMNS_KEY, JSON.stringify([...fbaVisibleColumns]));
   localStorage.setItem(FBA_SORT_KEY, JSON.stringify(fbaSort));
   localStorage.setItem(FBA_FILTERS_KEY, JSON.stringify(fbaColumnFilters));
+  localStorage.setItem(FBA_COLUMN_WIDTHS_KEY, JSON.stringify(fbaColumnWidths));
+}
+
+function resizeFbaColumn(key, width) {
+  const nextWidth = Math.max(72, Math.min(640, Math.round(width)));
+  fbaColumnWidths[key] = nextWidth;
+  renderFbaColumnWidths();
+}
+
+function startFbaColumnResize(event) {
+  const handle = event.target?.closest?.("[data-fba-resize]");
+  if (!handle) return;
+  const key = handle.dataset.fbaResize;
+  const column = fbaColumns.find(item => item.key === key);
+  if (!column) return;
+  event.preventDefault();
+  event.stopPropagation();
+  fbaColumnResizeState = {
+    key,
+    startX: event.clientX,
+    startWidth: getFbaColumnWidth(column)
+  };
+  document.body.classList.add("fba-column-resizing");
+  window.addEventListener("pointermove", handleFbaColumnResizeMove);
+  window.addEventListener("pointerup", stopFbaColumnResize, { once: true });
+}
+
+function handleFbaColumnResizeMove(event) {
+  if (!fbaColumnResizeState) return;
+  resizeFbaColumn(fbaColumnResizeState.key, fbaColumnResizeState.startWidth + event.clientX - fbaColumnResizeState.startX);
+}
+
+function stopFbaColumnResize() {
+  if (!fbaColumnResizeState) return;
+  fbaColumnResizeState = null;
+  document.body.classList.remove("fba-column-resizing");
+  window.removeEventListener("pointermove", handleFbaColumnResizeMove);
+  saveFbaTablePreferences();
 }
 
 function getActiveFbaFilterCount() {
@@ -1121,7 +1281,7 @@ function openFbaFilterSettingsModal() {
       if (column.type === "number") {
         return `
           <div class="filter-row">
-            <span>${escapeHtml(column.label)}</span>
+            <span>${renderFilterColumnLabel(column.label)}</span>
             <input type="number" data-fba-filter="${escapeHtml(column.key)}" data-filter-part="min" placeholder="最小" value="${escapeHtml(filter.min ?? "")}">
             <input type="number" data-fba-filter="${escapeHtml(column.key)}" data-filter-part="max" placeholder="最大" value="${escapeHtml(filter.max ?? "")}">
           </div>
@@ -1129,7 +1289,7 @@ function openFbaFilterSettingsModal() {
       }
       return `
         <div class="filter-row">
-          <span>${escapeHtml(column.label)}</span>
+          <span>${renderFilterColumnLabel(column.label)}</span>
           <input type="text" data-fba-filter="${escapeHtml(column.key)}" data-filter-part="text" placeholder="包含" value="${escapeHtml(filter.text ?? "")}">
           <span></span>
         </div>
@@ -1138,14 +1298,17 @@ function openFbaFilterSettingsModal() {
 
   const modal = createModal("数据筛选", `
     <div class="modal-body">
-      <p class="fba-filter-hint">这里的筛选会和顶部搜索、库存水平一起生效。</p>
-      <div id="fbaColumnFilters" class="column-filters">${filterRows}</div>
+      <section class="fba-modal-section fba-filter-modal-section">
+        <p class="fba-filter-hint">这里的筛选会和顶部搜索、库存水平一起生效。</p>
+        <div id="fbaColumnFilters" class="column-filters">${filterRows}</div>
+      </section>
       <div class="fba-modal-actions">
         <button type="button" class="secondary-button" id="fbaClearFiltersBtn">清空筛选</button>
         <button type="button" data-close-modal>完成</button>
       </div>
     </div>
   `);
+  modal.querySelector(".modal").classList.add("fba-column-modal", "fba-filter-modal");
 
   modal.querySelector("#fbaColumnFilters").addEventListener("input", event => {
     const key = event.target?.dataset?.fbaFilter;
@@ -1169,14 +1332,21 @@ function renderProducts() {
   const list = $("#productList");
   if (!list) return;
   const visibleColumns = getVisibleFbaColumns();
+  renderFbaColumnWidths(visibleColumns);
   const head = $("#fbaTableHead");
   if (head) {
-    head.innerHTML = `<tr>${visibleColumns.map(column => {
+    head.innerHTML = `<tr>${visibleColumns.map((column, index) => {
       const sortable = Boolean(column.value);
-      return `<th class="${sortable ? "sortable" : ""}" ${sortable ? `data-fba-sort="${escapeHtml(column.key)}"` : ""}>${escapeHtml(column.label)}${fbaSort.key === column.key ? ` ${fbaSort.direction === "asc" ? "↑" : "↓"}` : ""}</th>`;
+      const sortMark = fbaSort.key === column.key ? (fbaSort.direction === "asc" ? "↑" : "↓") : "";
+      return `
+        <th class="${sortable ? "sortable" : ""} fba-col-${escapeHtml(column.key)}" ${sortable ? `data-fba-sort="${escapeHtml(column.key)}"` : ""}>
+          <span class="fba-th-label"><span class="fba-th-text">${renderColumnLabel(column.label)}</span>${sortMark ? `<span class="fba-sort-mark">${escapeHtml(sortMark)}</span>` : ""}</span>
+          <span class="fba-col-resizer" data-fba-resize="${escapeHtml(column.key)}" data-fba-col-index="${index}" title="拖动调整列宽"></span>
+        </th>
+      `;
     }).join("")}</tr>`;
   }
-  const visible = products.filter(productMatches).sort(compareFbaProducts);
+  const visible = collapseFbaRowsByAsin(products.filter(productMatches)).sort(compareFbaProducts);
   const summary = $("#fbaSummary");
   if (summary && window.fbaInventoryMeta) {
     const { totals, range, config, warnings, sales } = window.fbaInventoryMeta;
@@ -1185,9 +1355,11 @@ function renderProducts() {
       : (totals?.inboundWorkingQuantity || 0) + (totals?.inboundShippedQuantity || 0) + (totals?.inboundReceivingQuantity || 0);
     summary.innerHTML = `
       <div class="fba-summary-card"><strong>${formatNumber(products.length)}</strong><span>SKU 数</span></div>
-      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.totalGoodsQuantity ?? totals?.totalQuantity)}</strong><span>总货量</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.factoryFbaTotalQuantity)}</strong><span>工厂+FBA<br>总库存</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.factoryQuantity)}</strong><span>工厂总库存</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.totalGoodsQuantity ?? totals?.totalQuantity)}</strong><span>FBA总库存</span></div>
       <div class="fba-summary-card"><strong>${formatNumber(totals?.fulfillableQuantity || 0)}</strong><span>可售</span></div>
-      <div class="fba-summary-card"><strong>${formatInventoryNumber(inboundTotal)}</strong><span>入库相关</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.inboundQuantity ?? inboundTotal)}</strong><span>在路上</span></div>
       <div class="fba-summary-card"><strong>${formatNumber(totals?.salesUnits || 0)}</strong><span>${escapeHtml(range?.dayCount || 0)} 天售卖数量</span></div>
       <div class="fba-summary-card"><strong>${formatNumber(sales?.orderCount || 0)}</strong><span>订单数</span></div>
       <div class="fba-summary-card compact-card"><strong>${escapeHtml(config?.marketplaceId || "-")}</strong><span>Marketplace</span></div>
@@ -1195,19 +1367,27 @@ function renderProducts() {
     `;
   }
   if (!visible.length) {
-    list.innerHTML = `<tr><td colspan="${visibleColumns.length}"><div class="empty">暂无 FBA 库存数据。点击“查询”或“同步数据”从 SP-API 拉取。</div></td></tr>`;
+    list.innerHTML = `<tr><td colspan="${visibleColumns.length}"><div class="empty">暂无 FBA 库存数据。点击“查询”或“强制刷新数据”从 SP-API 拉取。</div></td></tr>`;
     $("#fbaTotals").innerHTML = "";
     return;
   }
   list.innerHTML = visible.map(product => `
     <tr>
-      ${visibleColumns.map(column => `<td class="${column.key === "title" ? "fba-name" : ""}">${column.render(product)}</td>`).join("")}
+      ${visibleColumns.map(column => `<td class="fba-col-${escapeHtml(column.key)} ${column.key === "title" ? "fba-name" : ""}">${column.render(product)}</td>`).join("")}
     </tr>
   `).join("");
   const totals = visible.reduce((acc, row) => {
     const rowTotalGoods = getProductTotalGoods(row);
     if (rowTotalGoods === null || rowTotalGoods === undefined) acc.hasIncompleteTotalGoods = true;
     else acc.totalGoodsQuantity += rowTotalGoods;
+    if (row.factoryQuantity === null || row.factoryQuantity === undefined) acc.hasIncompleteFactory = true;
+    else if (row.asin && !acc.factoryAsins.has(row.asin)) {
+      acc.factoryAsins.add(row.asin);
+      acc.factoryQuantity += row.factoryQuantity || 0;
+    }
+    const rowInboundQuantity = getProductInboundQuantity(row);
+    if (rowInboundQuantity === null || rowInboundQuantity === undefined) acc.hasIncompleteInbound = true;
+    else acc.inboundQuantity += rowInboundQuantity || 0;
     acc.fulfillableQuantity += row.fulfillableQuantity || 0;
     if (row.inboundWorkingQuantity === null || row.inboundWorkingQuantity === undefined) acc.hasIncompleteInboundWorking = true;
     else acc.inboundWorkingQuantity += row.inboundWorkingQuantity || 0;
@@ -1224,6 +1404,8 @@ function renderProducts() {
     return acc;
   }, {
     totalGoodsQuantity: 0,
+    factoryQuantity: 0,
+    inboundQuantity: 0,
     fulfillableQuantity: 0,
     inboundWorkingQuantity: 0,
     inboundShippedQuantity: 0,
@@ -1233,18 +1415,27 @@ function renderProducts() {
     salesOrders: 0,
     salesUnits: 0,
     stockoutDays: 0,
+    factoryAsins: new Set(),
     hasIncompleteTotalGoods: false,
+    hasIncompleteFactory: false,
+    hasIncompleteInbound: false,
     hasIncompleteInboundWorking: false,
     hasIncompleteInboundShipped: false,
     hasIncompleteInboundReceiving: false,
     hasIncompleteReserved: false
   });
+  totals.factoryFbaTotalQuantity = totals.hasIncompleteTotalGoods || totals.hasIncompleteFactory
+    ? null
+    : totals.totalGoodsQuantity + totals.factoryQuantity;
   $("#fbaTotals").innerHTML = `
     <tr>
       ${visibleColumns.map((column, index) => {
         if (index === 0) return `<td>汇总</td>`;
+        if (column.key === "factoryFbaTotalQuantity") return `<td>${totals.factoryFbaTotalQuantity === null ? "/" : formatNumber(totals.factoryFbaTotalQuantity)}</td>`;
+        if (column.key === "factoryQuantity") return `<td>${totals.hasIncompleteFactory ? "/" : formatNumber(totals.factoryQuantity)}</td>`;
         if (column.key === "totalGoodsQuantity") return `<td>${totals.hasIncompleteTotalGoods ? "/" : formatNumber(totals.totalGoodsQuantity)}</td>`;
         if (column.key === "fulfillableQuantity") return `<td>${formatNumber(totals.fulfillableQuantity)}</td>`;
+        if (column.key === "inboundQuantity") return `<td>${totals.hasIncompleteInbound ? "/" : formatNumber(totals.inboundQuantity)}</td>`;
         if (column.key === "inboundWorkingQuantity") return `<td>${totals.hasIncompleteInboundWorking ? "/" : formatNumber(totals.inboundWorkingQuantity)}</td>`;
         if (column.key === "inboundShippedQuantity") return `<td>${totals.hasIncompleteInboundShipped ? "/" : formatNumber(totals.inboundShippedQuantity)}</td>`;
         if (column.key === "inboundReceivingQuantity") return `<td>${totals.hasIncompleteInboundReceiving ? "/" : formatNumber(totals.inboundReceivingQuantity)}</td>`;
@@ -1267,16 +1458,37 @@ function factoryProductMatches(product) {
   if (!keyword) return true;
   return [
     product.name,
+    product.parentAsin,
     product.asin,
     product.boxSpec,
     product.note
   ].join(" ").toLowerCase().includes(keyword);
 }
 
+function getFactoryProductGroupKey(product) {
+  return product?.parentAsin || product?.asin || product?.id || "";
+}
+
+function sortFactoryProductsForMatrix(items) {
+  const orderedProducts = [...factoryProducts].sort((a, b) =>
+    Number(a.order || 0) - Number(b.order || 0) || String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN")
+  );
+  const groupOrder = new Map();
+  for (const product of orderedProducts) {
+    const key = getFactoryProductGroupKey(product);
+    if (key && !groupOrder.has(key)) groupOrder.set(key, groupOrder.size);
+  }
+  return [...items].sort((a, b) => {
+    const groupCompare = Number(groupOrder.get(getFactoryProductGroupKey(a)) ?? 999999) - Number(groupOrder.get(getFactoryProductGroupKey(b)) ?? 999999);
+    if (groupCompare) return groupCompare;
+    return Number(a.order || 0) - Number(b.order || 0) || String(a.name || "").localeCompare(String(b.name || ""), "zh-Hans-CN");
+  });
+}
+
 function renderFactoryInventory() {
   const matrixBody = $("#factoryMatrixBody");
   if (!matrixBody) return;
-  const visibleProducts = factoryProducts.filter(factoryProductMatches);
+  const visibleProducts = sortFactoryProductsForMatrix(factoryProducts.filter(factoryProductMatches));
   const today = new Date().toISOString().slice(0, 10);
   const summary = $("#factorySummary");
   if (summary) {
@@ -1312,14 +1524,47 @@ function renderFactoryInventory() {
   const movementRows = [...groupedMovements.values()]
     .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(a.operation).localeCompare(String(b.operation), "zh-Hans-CN"));
 
+  const groupIndexByKey = new Map();
+  for (const product of visibleProducts) {
+    const key = getFactoryProductGroupKey(product);
+    if (!groupIndexByKey.has(key)) groupIndexByKey.set(key, groupIndexByKey.size);
+  }
+  const productGroupClass = product => Number(groupIndexByKey.get(getFactoryProductGroupKey(product)) || 0) % 2 === 0
+    ? "factory-group-even"
+    : "factory-group-odd";
   const productCells = (renderer, className = "", draggable = false) => visibleProducts.map((product, index) => `
-    <td class="factory-product-cell ${className} ${draggable ? "factory-draggable" : ""}" data-product-id="${escapeHtml(product.id)}" ${draggable ? "draggable=\"true\" title=\"拖动调整列顺序\"" : ""}>${renderer(product, index)}</td>
+    <td class="factory-product-cell ${productGroupClass(product)} ${className} ${draggable ? "factory-draggable" : ""}" data-product-id="${escapeHtml(product.id)}" ${draggable ? "draggable=\"true\" title=\"拖动调整列顺序\"" : ""}>${renderer(product, index)}</td>
   `).join("");
+  const parentGroupCells = () => {
+    const cells = [];
+    for (let index = 0; index < visibleProducts.length;) {
+      const product = visibleProducts[index];
+      const key = getFactoryProductGroupKey(product);
+      let span = 1;
+      while (index + span < visibleProducts.length) {
+        const next = visibleProducts[index + span];
+        if (getFactoryProductGroupKey(next) !== key) break;
+        span += 1;
+      }
+      cells.push(`
+        <td class="factory-product-cell ${productGroupClass(product)} factory-parent-cell factory-parent-draggable" colspan="${span}" draggable="true" data-parent-key="${escapeHtml(key)}" title="拖动调整父ASIN组顺序">
+          ${product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-"}
+        </td>
+      `);
+      index += span;
+    }
+    return cells.join("");
+  };
   const editableInput = (product, field, value, type = "text") => `
     <input class="factory-edit-input" data-factory-field="${escapeHtml(field)}" data-product-id="${escapeHtml(product.id)}" type="${type}" value="${escapeHtml(value ?? "")}">
   `;
 
   matrixBody.innerHTML = `
+    <tr class="factory-meta-row factory-parent-row">
+      <td class="factory-sticky-col factory-left-1"></td>
+      <td class="factory-sticky-col factory-left-2">父ASIN</td>
+      ${parentGroupCells()}
+    </tr>
     <tr class="factory-meta-row factory-image-row">
       <td class="factory-sticky-col factory-left-1"></td>
       <td class="factory-sticky-col factory-left-2"></td>
@@ -1369,7 +1614,7 @@ function renderFactoryInventory() {
         <input class="factory-draft-date" data-draft-date type="date" value="${escapeHtml(today)}">
       </td>
       ${visibleProducts.map(product => `
-        <td class="factory-product-cell factory-draft-qty-cell">
+        <td class="factory-product-cell ${productGroupClass(product)} factory-draft-qty-cell">
           <input class="factory-draft-qty" data-draft-product-id="${escapeHtml(product.id)}" type="number" step="1" placeholder="">
         </td>
       `).join("")}
@@ -1383,7 +1628,7 @@ function renderFactoryInventory() {
         <td class="factory-sticky-col factory-left-2">${escapeHtml(row.date || "-")}</td>
         ${visibleProducts.map((product, index) => {
           const value = Number(row.quantities.get(product.id) || 0);
-          return `<td class="factory-product-cell factory-col-${index % 5} ${value < 0 ? "quantity-negative" : value > 0 ? "quantity-positive" : ""}">${value ? `${value > 0 ? "+" : ""}${formatNumber(value)}` : ""}</td>`;
+          return `<td class="factory-product-cell ${productGroupClass(product)} factory-col-${index % 5} ${value < 0 ? "quantity-negative" : value > 0 ? "quantity-positive" : ""}">${value ? `${value > 0 ? "+" : ""}${formatNumber(value)}` : ""}</td>`;
         }).join("")}
       </tr>
     `).join("")}
@@ -1418,6 +1663,8 @@ async function saveFactoryProductField(input) {
 }
 
 let factoryDraggedProductId = "";
+let factoryDraggedParentKey = "";
+let factoryDragMode = "";
 
 async function saveFactoryProductOrder() {
   try {
@@ -1438,12 +1685,29 @@ async function saveFactoryProductOrder() {
 
 function moveFactoryProductColumn(targetProductId) {
   if (!factoryDraggedProductId || !targetProductId || factoryDraggedProductId === targetProductId) return;
-  const fromIndex = factoryProducts.findIndex(product => product.id === factoryDraggedProductId);
-  const toIndex = factoryProducts.findIndex(product => product.id === targetProductId);
+  const orderedProducts = sortFactoryProductsForMatrix(factoryProducts);
+  const fromIndex = orderedProducts.findIndex(product => product.id === factoryDraggedProductId);
+  const toIndex = orderedProducts.findIndex(product => product.id === targetProductId);
   if (fromIndex === -1 || toIndex === -1) return;
-  const next = [...factoryProducts];
+  if (getFactoryProductGroupKey(orderedProducts[fromIndex]) !== getFactoryProductGroupKey(orderedProducts[toIndex])) return;
+  const next = [...orderedProducts];
   const [moved] = next.splice(fromIndex, 1);
   next.splice(toIndex, 0, moved);
+  factoryProducts = next.map((product, index) => ({ ...product, order: index + 1 }));
+  renderFactoryInventory();
+  saveFactoryProductOrder();
+}
+
+function moveFactoryParentGroup(targetParentKey) {
+  if (!factoryDraggedParentKey || !targetParentKey || factoryDraggedParentKey === targetParentKey) return;
+  const orderedProducts = sortFactoryProductsForMatrix(factoryProducts);
+  const draggedGroup = orderedProducts.filter(product => getFactoryProductGroupKey(product) === factoryDraggedParentKey);
+  if (!draggedGroup.length) return;
+  const remaining = orderedProducts.filter(product => getFactoryProductGroupKey(product) !== factoryDraggedParentKey);
+  const targetIndex = remaining.findIndex(product => getFactoryProductGroupKey(product) === targetParentKey);
+  if (targetIndex === -1) return;
+  const next = [...remaining];
+  next.splice(targetIndex, 0, ...draggedGroup);
   factoryProducts = next.map((product, index) => ({ ...product, order: index + 1 }));
   renderFactoryInventory();
   saveFactoryProductOrder();
@@ -1721,12 +1985,17 @@ function renderDatePicker() {
     const value = date.toISOString().slice(0, 10);
     const inMonth = date.getUTCMonth() === month - 1;
     const dateStatus = fbaDateStatus.get(value);
-    const hasData = Boolean(dateStatus);
+    const hasCompleteData = Boolean(dateStatus?.complete);
+    const hasPartialData = Boolean(dateStatus && !dateStatus.complete);
     const inRange = isDateInSelectedRange(value);
     const endpoint = isDateEndpoint(value);
     const disabled = isDateDisabled(value);
-    const dataLabel = hasData ? `已有数据：${dateStatus.rowCount || 0} 条记录` : "";
-    return `<button type="button" class="date-picker-day ${inMonth ? "" : "other-month"} ${hasData ? "has-data" : ""} ${inRange ? "in-range" : ""} ${endpoint ? "selected" : ""}" data-date="${value}" title="${escapeHtml(disabled ? "未来日期不可选" : dataLabel)}" ${disabled ? "disabled" : ""}><span>${date.getUTCDate()}</span></button>`;
+    const dataLabel = hasCompleteData
+      ? `库存和销量都已成功：库存 ${dateStatus.inventoryCount || 0} 条，销量 ${dateStatus.salesCount || 0} 条`
+      : hasPartialData
+        ? `数据未完整：库存 ${dateStatus.inventoryCount || 0} 条，销量请求标记 ${dateStatus.salesMarkerCount || 0} 条`
+        : "";
+    return `<button type="button" class="date-picker-day ${inMonth ? "" : "other-month"} ${hasCompleteData ? "has-data" : ""} ${hasPartialData ? "partial-data" : ""} ${inRange ? "in-range" : ""} ${endpoint ? "selected" : ""}" data-date="${value}" title="${escapeHtml(disabled ? "未来日期不可选" : dataLabel)}" ${disabled ? "disabled" : ""}><span>${date.getUTCDate()}</span></button>`;
   }).join("");
   picker.innerHTML = `
     <div class="date-picker-head">
@@ -1743,7 +2012,7 @@ function renderDatePicker() {
       <button type="button" data-date-quick="last30">最近30天</button>
       <button type="button" data-date-quick="last30Exclude2">最近30天（不含近2天）</button>
     </div>
-    <div class="date-picker-legend"><span class="date-data-dot"></span> 有本地数据 <span class="date-range-swatch"></span> 已选范围</div>
+    <div class="date-picker-legend"><span class="date-data-dot"></span> 库存和销量都成功 <span class="date-range-swatch"></span> 已选范围</div>
   `;
 }
 
@@ -1840,14 +2109,21 @@ async function loadSandboxStatus() {
 
 async function syncSandboxProducts() {
   const button = $("#syncProductsBtn");
-  setBusy(button, true, "同步数据");
+  setBusy(button, true, "强制刷新数据");
   try {
-    await loadProducts({ mode: "sync" });
-    $("#sandboxStatus").textContent = `FBA库存已同步 ${products.length} 个 SKU`;
+    const data = await loadProducts({ mode: "sync" });
+    const warnings = data.warnings || [];
+    if (warnings.length) {
+      $("#sandboxStatus").textContent = `FBA库存强制刷新部分失败：${warnings.length} 条错误/提示`;
+      alert(`FBA库存强制刷新部分失败：\n${warnings.slice(0, 8).join("\n")}${warnings.length > 8 ? `\n另有 ${warnings.length - 8} 条` : ""}`);
+    } else {
+      $("#sandboxStatus").textContent = `FBA库存已强制刷新 ${products.length} 个 SKU`;
+    }
   } catch (error) {
-    $("#sandboxStatus").textContent = `FBA库存同步失败：${error.message}`;
+    $("#sandboxStatus").textContent = `FBA库存强制刷新失败：${error.message}`;
+    alert(error.message);
   } finally {
-    setBusy(button, false, "同步数据");
+    setBusy(button, false, "强制刷新数据");
   }
 }
 
@@ -2215,40 +2491,71 @@ $("#factoryMatrixBody").addEventListener("dragstart", event => {
     event.preventDefault();
     return;
   }
+  const parentCell = event.target?.closest?.(".factory-parent-draggable[data-parent-key]");
+  if (parentCell) {
+    factoryDragMode = "parent";
+    factoryDraggedParentKey = parentCell.dataset.parentKey || "";
+    factoryDraggedProductId = "";
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", factoryDraggedParentKey);
+    parentCell.classList.add("dragging");
+    return;
+  }
   const cell = event.target?.closest?.(".factory-draggable[data-product-id]");
   if (!cell) return;
+  factoryDragMode = "product";
   factoryDraggedProductId = cell.dataset.productId || "";
+  factoryDraggedParentKey = "";
   event.dataTransfer.effectAllowed = "move";
   event.dataTransfer.setData("text/plain", factoryDraggedProductId);
   cell.classList.add("dragging");
 });
 $("#factoryMatrixBody").addEventListener("dragend", event => {
-  event.target?.closest?.(".factory-draggable")?.classList.remove("dragging");
+  event.target?.closest?.(".factory-draggable, .factory-parent-draggable")?.classList.remove("dragging");
   document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
   factoryDraggedProductId = "";
+  factoryDraggedParentKey = "";
+  factoryDragMode = "";
 });
 $("#factoryMatrixBody").addEventListener("dragover", event => {
-  const cell = event.target?.closest?.(".factory-draggable[data-product-id]");
-  if (!cell || !factoryDraggedProductId) return;
+  let cell = null;
+  if (factoryDragMode === "parent") {
+    cell = event.target?.closest?.(".factory-parent-draggable[data-parent-key]");
+    if (!cell || !factoryDraggedParentKey || cell.dataset.parentKey === factoryDraggedParentKey) return;
+  } else {
+    cell = event.target?.closest?.(".factory-draggable[data-product-id]");
+    if (!cell || !factoryDraggedProductId) return;
+    const dragged = factoryProducts.find(product => product.id === factoryDraggedProductId);
+    const target = factoryProducts.find(product => product.id === cell.dataset.productId);
+    if (!dragged || !target || getFactoryProductGroupKey(dragged) !== getFactoryProductGroupKey(target)) return;
+  }
   event.preventDefault();
   event.dataTransfer.dropEffect = "move";
   document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
   cell.classList.add("factory-drag-over");
 });
 $("#factoryMatrixBody").addEventListener("drop", event => {
+  document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
+  if (factoryDragMode === "parent") {
+    const cell = event.target?.closest?.(".factory-parent-draggable[data-parent-key]");
+    if (!cell) return;
+    event.preventDefault();
+    moveFactoryParentGroup(cell.dataset.parentKey || "");
+    return;
+  }
   const cell = event.target?.closest?.(".factory-draggable[data-product-id]");
   if (!cell) return;
   event.preventDefault();
-  const targetProductId = cell.dataset.productId || "";
-  document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
-  moveFactoryProductColumn(targetProductId);
+  moveFactoryProductColumn(cell.dataset.productId || "");
 });
 $("#productSearch").addEventListener("input", renderProducts);
 $("#productSourceFilter").addEventListener("change", renderProducts);
 $("#salesDateRange").addEventListener("click", () => openDatePicker());
 $("#fbaColumnSettingsBtn").addEventListener("click", openFbaColumnSettingsModal);
 $("#fbaFilterSettingsBtn").addEventListener("click", openFbaFilterSettingsModal);
+$("#fbaTableHead").addEventListener("pointerdown", startFbaColumnResize);
 $("#fbaTableHead").addEventListener("click", event => {
+  if (event.target?.closest?.("[data-fba-resize]")) return;
   const key = event.target?.closest("[data-fba-sort]")?.dataset?.fbaSort;
   if (!key) return;
   if (fbaSort.key === key) {

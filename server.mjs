@@ -13,6 +13,7 @@ const DATA_DIR = join(ROOT, "data");
 const DB_PATH = join(DATA_DIR, "db.json");
 const FBA_DAILY_PATH = join(DATA_DIR, "fba-inventory-daily.json");
 const NETWORK_DEBUG_PATH = join(DATA_DIR, "network-debug.jsonl");
+const SP_API_REPORT_CACHE_PATH = join(DATA_DIR, "sp-api-report-cache.json");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
 const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
 const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
@@ -20,6 +21,8 @@ const ENV_PATH = join(ROOT, ".env");
 const FBA_DATE_MARKER_SKU = "__DATE_MARKER__";
 const fbaInventoryCache = new Map();
 const salesReportRequests = new Map();
+let spApiAccessTokenCache = null;
+let salesReportRequestsLoaded = false;
 let mysqlPool = null;
 let fbaDailySchemaReady = false;
 let mysqlDatabaseReady = false;
@@ -145,6 +148,7 @@ async function ensureFbaDailyMysqlSchema() {
       marketplace_id VARCHAR(32) NOT NULL,
       seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
       asin VARCHAR(32) DEFAULT '',
+      parent_asin VARCHAR(32) DEFAULT '',
       fn_sku VARCHAR(64) DEFAULT '',
       title TEXT,
       brand VARCHAR(255) DEFAULT '',
@@ -172,7 +176,8 @@ async function ensureFbaDailyMysqlSchema() {
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (marketplace_id, seller_sku, date),
       KEY idx_fba_inventory_daily_date (date),
-      KEY idx_fba_inventory_daily_asin (asin)
+      KEY idx_fba_inventory_daily_asin (asin),
+      KEY idx_fba_inventory_daily_parent_asin (parent_asin)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query(`
@@ -180,6 +185,7 @@ async function ensureFbaDailyMysqlSchema() {
       marketplace_id VARCHAR(32) NOT NULL,
       seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
       asin VARCHAR(32) DEFAULT '',
+      parent_asin VARCHAR(32) DEFAULT '',
       fn_sku VARCHAR(64) DEFAULT '',
       title TEXT,
       brand VARCHAR(255) DEFAULT '',
@@ -191,11 +197,16 @@ async function ensureFbaDailyMysqlSchema() {
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (marketplace_id, seller_sku),
-      KEY idx_fba_sku_metadata_asin (asin)
+      KEY idx_fba_sku_metadata_asin (asin),
+      KEY idx_fba_sku_metadata_parent_asin (parent_asin)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query("ALTER TABLE fba_inventory_daily MODIFY seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL").catch(() => {});
   await pool.query("ALTER TABLE fba_sku_metadata MODIFY seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL").catch(() => {});
+  await pool.query("ALTER TABLE fba_inventory_daily ADD COLUMN parent_asin VARCHAR(32) DEFAULT '' AFTER asin").catch(() => {});
+  await pool.query("ALTER TABLE fba_sku_metadata ADD COLUMN parent_asin VARCHAR(32) DEFAULT '' AFTER asin").catch(() => {});
+  await pool.query("ALTER TABLE fba_inventory_daily ADD KEY idx_fba_inventory_daily_parent_asin (parent_asin)").catch(() => {});
+  await pool.query("ALTER TABLE fba_sku_metadata ADD KEY idx_fba_sku_metadata_parent_asin (parent_asin)").catch(() => {});
   fbaDailySchemaReady = true;
   return true;
 }
@@ -221,7 +232,16 @@ function calculateTotalGoodsQuantity(row) {
   const values = [
     row.fulfillableQuantity,
     row.reservedQuantity,
-    row.unfulfillableQuantity,
+    row.inboundWorkingQuantity,
+    row.inboundShippedQuantity,
+    row.inboundReceivingQuantity
+  ];
+  if (values.every(value => value === null || value === undefined || value === "")) return null;
+  return values.reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
+function calculateInboundQuantity(row) {
+  const values = [
     row.inboundWorkingQuantity,
     row.inboundShippedQuantity,
     row.inboundReceivingQuantity
@@ -253,6 +273,7 @@ function mysqlRowToFbaDaily(row) {
     marketplaceId: row.marketplace_id,
     sellerSku: row.seller_sku,
     asin: row.asin || "",
+    parentAsin: row.parent_asin || "",
     fnSku: row.fn_sku || "",
     title: row.title || "",
     brand: row.brand || "",
@@ -289,6 +310,7 @@ function mysqlRowToFbaSkuMetadata(row) {
     marketplaceId: row.marketplace_id,
     sellerSku: row.seller_sku,
     asin: row.asin || "",
+    parentAsin: row.parent_asin || "",
     fnSku: row.fn_sku || "",
     title: row.title || "",
     brand: row.brand || "",
@@ -309,12 +331,12 @@ async function readFbaSkuMetadataRows() {
 }
 
 function rowHasFbaMetadata(row) {
-  return Boolean(row?.marketplaceId && row?.sellerSku && (row.asin || row.fnSku || row.title || row.imageUrl));
+  return Boolean(row?.marketplaceId && row?.sellerSku && (row.asin || row.parentAsin || row.fnSku || row.title || row.imageUrl));
 }
 
 function mergeSkuDisplayMetadata(primary = {}, fallback = {}) {
   const result = {};
-  for (const field of ["asin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
+  for (const field of ["asin", "parentAsin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
     result[field] = primary[field] || fallback[field] || "";
   }
   return result;
@@ -329,33 +351,38 @@ async function upsertFbaSkuMetadata(rows, source = "inventory") {
   if (!isMysqlEnabled()) return { inserted: 0, updated: 0 };
   await ensureFbaDailyMysqlSchema();
   const pool = getMysqlPool();
-  await pool.query(`
-    INSERT INTO fba_sku_metadata (
-      marketplace_id, seller_sku, asin, fn_sku, title, brand, image_url, item_condition, source, last_seen_at, raw_json
-    ) VALUES ?
-    ON DUPLICATE KEY UPDATE
-      asin = IF(VALUES(asin) <> '', VALUES(asin), asin),
-      fn_sku = IF(VALUES(fn_sku) <> '', VALUES(fn_sku), fn_sku),
-      title = IF(VALUES(title) <> '', VALUES(title), title),
-      brand = IF(VALUES(brand) <> '', VALUES(brand), brand),
-      image_url = IF(VALUES(image_url) <> '', VALUES(image_url), image_url),
-      item_condition = IF(VALUES(item_condition) <> '', VALUES(item_condition), item_condition),
-      source = VALUES(source),
-      last_seen_at = VALUES(last_seen_at),
-      raw_json = IF(VALUES(raw_json) IS NOT NULL, VALUES(raw_json), raw_json)
-  `, [metadataRows.map(row => [
-    row.marketplaceId,
-    row.sellerSku,
-    row.asin || "",
-    row.fnSku || "",
-    row.title || "",
-    row.brand || "",
-    row.imageUrl || "",
-    row.condition || "",
-    source,
-    toMysqlDateTime(row.inventoryFetchedAt || row.lastSeenAt || new Date().toISOString()),
-    row.rawInventoryJson ? JSON.stringify(row.rawInventoryJson) : (row.rawJson ? JSON.stringify(row.rawJson) : null)
-  ])]);
+  const batchSize = Math.max(1, Number(process.env.DB_BULK_INSERT_BATCH_SIZE || 100));
+  for (const batch of chunkArray(metadataRows, batchSize)) {
+    await pool.query(`
+      INSERT INTO fba_sku_metadata (
+        marketplace_id, seller_sku, asin, parent_asin, fn_sku, title, brand, image_url, item_condition, source, last_seen_at, raw_json
+      ) VALUES ?
+      ON DUPLICATE KEY UPDATE
+        asin = IF(VALUES(asin) <> '', VALUES(asin), asin),
+        parent_asin = IF(VALUES(parent_asin) <> '', VALUES(parent_asin), parent_asin),
+        fn_sku = IF(VALUES(fn_sku) <> '', VALUES(fn_sku), fn_sku),
+        title = IF(VALUES(title) <> '', VALUES(title), title),
+        brand = IF(VALUES(brand) <> '', VALUES(brand), brand),
+        image_url = IF(VALUES(image_url) <> '', VALUES(image_url), image_url),
+        item_condition = IF(VALUES(item_condition) <> '', VALUES(item_condition), item_condition),
+        source = VALUES(source),
+        last_seen_at = VALUES(last_seen_at),
+        raw_json = IF(VALUES(raw_json) IS NOT NULL, VALUES(raw_json), raw_json)
+    `, [batch.map(row => [
+      row.marketplaceId,
+      row.sellerSku,
+      row.asin || "",
+      row.parentAsin || "",
+      row.fnSku || "",
+      row.title || "",
+      row.brand || "",
+      row.imageUrl || "",
+      row.condition || "",
+      source,
+      toMysqlDateTime(row.inventoryFetchedAt || row.lastSeenAt || new Date().toISOString()),
+      row.rawInventoryJson ? JSON.stringify(row.rawInventoryJson) : (row.rawJson ? JSON.stringify(row.rawJson) : null)
+    ])]);
+  }
   return { inserted: metadataRows.length, updated: 0 };
 }
 
@@ -374,20 +401,22 @@ async function writeFbaDailyRowsToMysql(rows) {
   try {
     await connection.beginTransaction();
     await connection.query("DELETE FROM fba_inventory_daily");
-    if (uniqueRows.length) {
+    const batchSize = Math.max(1, Number(process.env.DB_BULK_INSERT_BATCH_SIZE || 100));
+    for (const batch of chunkArray(uniqueRows, batchSize)) {
       await connection.query(`
         INSERT INTO fba_inventory_daily (
-          date, marketplace_id, seller_sku, asin, fn_sku, title, brand, image_url, item_condition,
+          date, marketplace_id, seller_sku, asin, parent_asin, fn_sku, title, brand, image_url, item_condition,
           amazon_total_quantity, total_goods_quantity, fulfillable_quantity, reserved_quantity,
           unfulfillable_quantity, inbound_working_quantity, inbound_shipped_quantity, inbound_receiving_quantity,
           researching_quantity, sales_units, sales_orders, is_sufficient, inventory_fetched_at, sales_fetched_at,
           frozen_at, last_updated_time, raw_inventory_json, raw_sales_json
         ) VALUES ?
-      `, [uniqueRows.map(row => [
+      `, [batch.map(row => [
         row.date,
         row.marketplaceId,
         row.sellerSku,
         row.asin || "",
+        row.parentAsin || "",
         row.fnSku || "",
         row.title || "",
         row.brand || "",
@@ -415,7 +444,7 @@ async function writeFbaDailyRowsToMysql(rows) {
     }
     await connection.commit();
   } catch (error) {
-    await connection.rollback();
+    await connection.rollback().catch(() => {});
     throw error;
   } finally {
     connection.release();
@@ -493,6 +522,44 @@ async function readNetworkDebug() {
   }
 
   return events;
+}
+
+async function ensureSalesReportRequestsLoaded() {
+  if (salesReportRequestsLoaded) return;
+  salesReportRequestsLoaded = true;
+  await ensureDb();
+  if (!existsSync(SP_API_REPORT_CACHE_PATH)) return;
+  const raw = await readFile(SP_API_REPORT_CACHE_PATH, "utf8").catch(() => "");
+  if (!raw.trim()) return;
+  const rows = JSON.parse(raw);
+  if (!Array.isArray(rows)) return;
+  for (const row of rows) {
+    if (!row?.key || !row?.reportId) continue;
+    salesReportRequests.set(row.key, {
+      reportId: row.reportId,
+      reportType: row.reportType || "",
+      createdAt: Number(row.createdAt || 0) || Date.now()
+    });
+  }
+}
+
+async function writeSalesReportRequestsCache() {
+  await ensureDb();
+  const today = formatDateInTimeZone();
+  const rows = [...salesReportRequests.entries()]
+    .filter(([, item]) => item?.reportId && isReportFromToday(item, today))
+    .map(([key, item]) => ({
+      key,
+      reportId: item.reportId,
+      reportType: item.reportType || "",
+      createdAt: item.createdAt || Date.now()
+    }));
+  await writeFile(SP_API_REPORT_CACHE_PATH, `${JSON.stringify(rows, null, 2)}\n`, "utf8");
+}
+
+async function rememberSalesReportRequest(key, item) {
+  salesReportRequests.set(key, item);
+  await writeSalesReportRequestsCache().catch(() => {});
 }
 
 function parseChatThreads(events) {
@@ -687,6 +754,14 @@ function getFirstMatch(text, regex) {
 
 function unique(values) {
   return [...new Set(values.filter(Boolean).map(value => value.trim()))];
+}
+
+function chunkArray(values, size) {
+  const chunks = [];
+  for (let index = 0; index < values.length; index += size) {
+    chunks.push(values.slice(index, index + size));
+  }
+  return chunks;
 }
 
 function cleanUrl(url) {
@@ -925,6 +1000,7 @@ function normalizeProduct(input) {
   return {
     id: input.id || asin || randomUUID(),
     asin,
+    parentAsin: String(input.parentAsin || input.parent_asin || "").trim().toUpperCase(),
     sku: String(input.sku || "").trim(),
     title: String(input.title || input.itemName || "").trim(),
     brand: String(input.brand || "").trim(),
@@ -947,6 +1023,7 @@ function normalizeFactoryProduct(input) {
     id: String(input.id || asin || name || randomUUID()).trim(),
     name,
     asin,
+    parentAsin: String(input.parentAsin || input.parent_asin || "").trim().toUpperCase(),
     boxSpec: String(input.boxSpec || "").trim(),
     unitCost: input.unitCost === "" || input.unitCost === undefined ? "" : Number(input.unitCost || 0),
     currentQuantity: Number(input.currentQuantity || 0),
@@ -1031,6 +1108,7 @@ async function buildFbaProductCatalog(db) {
     const existing = byAsin.get(asin) || {};
     byAsin.set(asin, {
       asin,
+      parentAsin: existing.parentAsin || item.parentAsin || item.parent_asin || "",
       sellerSku: existing.sellerSku || item.sellerSku || item.sku || "",
       fnSku: existing.fnSku || item.fnSku || "",
       title: existing.title || item.title || item.itemName || "",
@@ -1142,6 +1220,7 @@ async function buildFactoryInventoryView(db, options = {}) {
     return {
       ...product,
       imageUrl: fbaProduct.imageUrl || "",
+      parentAsin: fbaProduct.parentAsin || product.parentAsin || "",
       sellerSku: fbaProduct.sellerSku || "",
       fnSku: fbaProduct.fnSku || "",
       title: fbaProduct.title || product.name || "",
@@ -1170,6 +1249,18 @@ async function buildFactoryInventoryView(db, options = {}) {
   }, { productCount: 0, currentQuantity: 0, inventoryValue: 0, lowStockCount: 0, outOfStockCount: 0 });
   totals.inventoryValue = Number(totals.inventoryValue.toFixed(2));
   return { products: rows, movements: movementRows, totals };
+}
+
+function buildFactoryQuantityByAsin(db) {
+  const quantities = new Map();
+  const products = Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [];
+  for (const item of products) {
+    const product = normalizeFactoryProduct(item);
+    const asin = String(product.asin || "").trim().toUpperCase();
+    if (!asin) continue;
+    quantities.set(asin, Number(quantities.get(asin) || 0) + Number(product.currentQuantity || 0));
+  }
+  return quantities;
 }
 
 function requestAsins(item) {
@@ -1369,6 +1460,22 @@ async function requestSpApiAccessToken() {
   if (config.missing.length) {
     return { ok: false, configured: false, config, error: `缺少配置：${config.missing.join(", ")}` };
   }
+  const cacheKey = [
+    config.clientId,
+    config.refreshToken,
+    config.endpoint,
+    config.marketplaceId
+  ].join("|");
+  if (spApiAccessTokenCache?.cacheKey === cacheKey && spApiAccessTokenCache.expiresAt > Date.now() + 60000) {
+    return {
+      ok: true,
+      configured: true,
+      config,
+      accessToken: spApiAccessTokenCache.accessToken,
+      tokenType: spApiAccessTokenCache.tokenType,
+      expiresIn: Math.max(0, Math.floor((spApiAccessTokenCache.expiresAt - Date.now()) / 1000))
+    };
+  }
 
   let response;
   let lastFetchError;
@@ -1410,6 +1517,12 @@ async function requestSpApiAccessToken() {
       error: data.error_description || data.error || `LWA token request failed: ${response.status}`
     };
   }
+  spApiAccessTokenCache = {
+    cacheKey,
+    accessToken: data.access_token,
+    tokenType: data.token_type || "bearer",
+    expiresAt: Date.now() + Math.max(0, Number(data.expires_in || 0) * 1000)
+  };
   return {
     ok: true,
     configured: true,
@@ -1677,6 +1790,38 @@ function findCatalogImageLink(value) {
   return "";
 }
 
+function normalizeAsin(value) {
+  return String(value || "").trim().toUpperCase();
+}
+
+function extractParentAsinFromCatalogItem(item) {
+  const selfAsin = normalizeAsin(item?.asin);
+  const seen = new Set();
+  const walk = value => {
+    if (!value || typeof value !== "object" || seen.has(value)) return "";
+    seen.add(value);
+    for (const key of ["parentAsin", "parentASIN", "parent_asin"]) {
+      const asin = normalizeAsin(value[key]);
+      if (asin && asin !== selfAsin) return asin;
+    }
+    for (const key of ["parentAsins", "parentASINs", "parent_asins"]) {
+      const values = Array.isArray(value[key]) ? value[key] : [value[key]];
+      for (const candidate of values) {
+        const asin = normalizeAsin(candidate?.asin || candidate);
+        if (asin && asin !== selfAsin) return asin;
+      }
+    }
+    for (const child of Object.values(value)) {
+      if (child && typeof child === "object") {
+        const asin = walk(child);
+        if (asin) return asin;
+      }
+    }
+    return "";
+  };
+  return walk(item?.relationships) || "";
+}
+
 async function fetchCatalogDetails(asins) {
   const config = getSpApiConfig();
   const enrichLimit = Number(process.env.AMZ_CATALOG_ENRICH_LIMIT || 300);
@@ -1691,11 +1836,12 @@ async function fetchCatalogDetails(asins) {
         marketplaceIds: config.marketplaceId,
         identifiers: identifiers.join(","),
         identifiersType: "ASIN",
-        includedData: "images,summaries"
+        includedData: "images,summaries,relationships"
       });
       for (const item of data.items || []) {
         const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
         byAsin.set(item.asin, {
+          parentAsin: extractParentAsinFromCatalogItem(item),
           title: summary?.itemName || "",
           brand: summary?.brand || "",
           imageUrl: findCatalogImageLink(item.images)
@@ -1708,12 +1854,13 @@ async function fetchCatalogDetails(asins) {
             marketplaceIds: config.marketplaceId,
             identifiers: asin,
             identifiersType: "ASIN",
-            includedData: "images,summaries"
+            includedData: "images,summaries,relationships"
           }, { retries: 1, retryDelayMs: 1600 });
           const item = (data.items || [])[0];
           if (!item) continue;
           const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
           byAsin.set(item.asin, {
+            parentAsin: extractParentAsinFromCatalogItem(item),
             title: summary?.itemName || "",
             brand: summary?.brand || "",
             imageUrl: findCatalogImageLink(item.images)
@@ -1812,12 +1959,13 @@ async function downloadReportDocument(documentId) {
   return buffer.toString("utf8");
 }
 
-async function getOrCreateSalesReport(startDate, endDate) {
+async function getOrCreateSalesReport(startDate, endDate, options = {}) {
+  await ensureSalesReportRequestsLoaded();
   const config = getSpApiConfig();
   const reportType = process.env.AMZ_ORDER_REPORT_TYPE || "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL";
   const key = `${config.marketplaceId}|${reportType}|${startDate}|${endDate}`;
   const existing = salesReportRequests.get(key);
-  if (existing?.reportId) return existing;
+  if (existing?.reportId && (!options.forceNewReport || (options.reuseSameDayReport && isReportFromToday(existing)))) return existing;
   const created = await spApiFetchWithRetry("/reports/2021-06-30/reports", {}, {
     method: "POST",
     body: {
@@ -1826,19 +1974,20 @@ async function getOrCreateSalesReport(startDate, endDate) {
       dataStartTime: toIsoDateStart(startDate),
       dataEndTime: toOrdersCreatedBefore(endDate)
     },
-    retries: 1
+    retries: 2,
+    retryDelayMs: 30000
   });
   const payload = created.payload || created;
   const reportId = payload.reportId || payload.ReportId;
   if (!reportId) throw new Error("订单报表创建失败：缺少 reportId");
   const item = { reportId, reportType, createdAt: Date.now() };
-  salesReportRequests.set(key, item);
+  await rememberSalesReportRequest(key, item);
   return item;
 }
 
 async function waitForReportDocument(report, label) {
   const waitMs = Math.max(5000, Number(process.env.AMZ_REPORT_WAIT_MS || process.env.AMZ_ORDER_REPORT_WAIT_MS || 90000));
-  const pollMs = Math.max(3000, Number(process.env.AMZ_REPORT_POLL_MS || process.env.AMZ_ORDER_REPORT_POLL_MS || 6000));
+  const pollMs = Math.max(15000, Number(process.env.AMZ_REPORT_POLL_MS || process.env.AMZ_ORDER_REPORT_POLL_MS || 15000));
   const deadline = Date.now() + waitMs;
   let latestStatus = "";
   let reportDocumentId = "";
@@ -1859,8 +2008,8 @@ async function waitForReportDocument(report, label) {
   return reportDocumentId;
 }
 
-async function fetchSalesBySkuFromReport(startDate, endDate) {
-  const report = await getOrCreateSalesReport(startDate, endDate);
+async function fetchSalesBySkuFromReport(startDate, endDate, options = {}) {
+  const report = await getOrCreateSalesReport(startDate, endDate, options);
   const reportDocumentId = await waitForReportDocument(report, "订单报表");
   const text = await downloadReportDocument(reportDocumentId);
   const rows = parseFlatReport(text);
@@ -1912,8 +2061,8 @@ function reportRowMarketplaceDate(row, fallbackDate) {
   return dateMatch ? dateMatch[0] : fallbackDate;
 }
 
-async function fetchSalesByDateSkuFromReport(startDate, endDate) {
-  const report = await getOrCreateSalesReport(startDate, endDate);
+async function fetchSalesByDateSkuFromReport(startDate, endDate, options = {}) {
+  const report = await getOrCreateSalesReport(startDate, endDate, options);
   const reportDocumentId = await waitForReportDocument(report, "订单报表");
   const text = await downloadReportDocument(reportDocumentId);
   const rows = parseFlatReport(text);
@@ -1962,9 +2111,9 @@ async function fetchSalesByDateSkuFromReport(startDate, endDate) {
   return byDate;
 }
 
-async function fetchSalesBySku(startDate, endDate) {
+async function fetchSalesBySku(startDate, endDate, options = {}) {
   if ((process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders") {
-    return fetchSalesBySkuFromReport(startDate, endDate);
+    return fetchSalesBySkuFromReport(startDate, endDate, options);
   }
   const config = getSpApiConfig();
   const bySku = new Map();
@@ -2044,12 +2193,18 @@ function toLedgerIsoDateEnd(dateValue) {
   return `${String(dateValue).slice(0, 10)}T23:59:59Z`;
 }
 
-async function getOrCreateLedgerReport(startDate, endDate) {
+function isReportFromToday(report) {
+  if (!report?.createdAt) return false;
+  return formatDateInTimeZone(new Date(report.createdAt)) === formatDateInTimeZone();
+}
+
+async function getOrCreateLedgerReport(startDate, endDate, options = {}) {
+  await ensureSalesReportRequestsLoaded();
   const config = getSpApiConfig();
   const reportType = "GET_LEDGER_SUMMARY_VIEW_DATA";
   const key = `${config.marketplaceId}|${reportType}|${startDate}|${endDate}|DAILY|COUNTRY`;
   const existing = salesReportRequests.get(key);
-  if (existing?.reportId) return existing;
+  if (existing?.reportId && (!options.forceNewReport || (options.reuseSameDayReport && isReportFromToday(existing)))) return existing;
   const created = await spApiFetchWithRetry("/reports/2021-06-30/reports", {}, {
     method: "POST",
     body: {
@@ -2062,13 +2217,14 @@ async function getOrCreateLedgerReport(startDate, endDate) {
         aggregatedByTimePeriod: "DAILY"
       }
     },
-    retries: 1
+    retries: 2,
+    retryDelayMs: 30000
   });
   const payload = created.payload || created;
   const reportId = payload.reportId || payload.ReportId;
   if (!reportId) throw new Error("库存账本报表创建失败：缺少 reportId");
   const item = { reportId, reportType, createdAt: Date.now() };
-  salesReportRequests.set(key, item);
+  await rememberSalesReportRequest(key, item);
   return item;
 }
 
@@ -2085,9 +2241,9 @@ function numberFromReport(value) {
   return Number(String(value || "0").replace(/,/g, "")) || 0;
 }
 
-async function fetchLedgerInventoryRecords(startDate, endDate) {
+async function fetchLedgerInventoryRecords(startDate, endDate, options = {}) {
   const config = getSpApiConfig();
-  const report = await getOrCreateLedgerReport(startDate, endDate);
+  const report = await getOrCreateLedgerReport(startDate, endDate, options);
   const reportDocumentId = await waitForReportDocument(report, "库存账本报表");
   const text = await downloadReportDocument(reportDocumentId);
   const rows = parseFlatReport(text);
@@ -2179,6 +2335,7 @@ function normalizeInventoryRow(summary, sales, catalog, dayCount) {
   return {
     asin,
     sellerSku: sku,
+    parentAsin: catalogInfo.parentAsin || "",
     fnSku: summary.fnSku || summary.fnSKU || "",
     title: catalogInfo.title || summary.productName || "",
     brand: catalogInfo.brand || "",
@@ -2222,6 +2379,7 @@ function buildInventoryDailyRecord(summary, catalog, date, config) {
     marketplaceId: config.marketplaceId,
     sellerSku: sku,
     asin,
+    parentAsin: catalogInfo.parentAsin || "",
     fnSku: summary.fnSku || summary.fnSKU || "",
     title: catalogInfo.title || summary.productName || "",
     brand: catalogInfo.brand || "",
@@ -2285,7 +2443,7 @@ function buildSalesDateMarkerRecord(date, config, sales) {
 function mergeFbaDailyRecord(existing, incoming, date) {
   const frozenAt = isFbaDailyFrozen(date) ? (existing?.frozenAt || new Date().toISOString()) : "";
   const cleanedIncoming = { ...incoming };
-  if (isRealtimeInventorySnapshot(existing) && incoming?.inventoryFetchedAt) {
+  if (isRealtimeInventorySnapshot(existing) && incoming?.inventoryFetchedAt && String(date || "").slice(0, 10) !== formatDateInTimeZone()) {
     for (const field of [
       "amazonTotalQuantity",
       "totalGoodsQuantity",
@@ -2303,7 +2461,7 @@ function mergeFbaDailyRecord(existing, incoming, date) {
       delete cleanedIncoming[field];
     }
   }
-  for (const field of ["asin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
+  for (const field of ["asin", "parentAsin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
     if (existing?.[field] && cleanedIncoming[field] === "") {
       delete cleanedIncoming[field];
     }
@@ -2316,9 +2474,10 @@ function mergeFbaDailyRecord(existing, incoming, date) {
   };
 }
 
-async function upsertFbaDailyRecords(records) {
+async function upsertFbaDailyRecords(records, options = {}) {
   const rows = await readFbaDailyRows();
   const byKey = new Map(rows.map(row => [makeFbaDailyKey(row), row]));
+  const allowFrozenInventoryUpdate = Boolean(options.allowFrozenInventoryUpdate);
   let inserted = 0;
   let updated = 0;
   let skippedFrozen = 0;
@@ -2327,7 +2486,8 @@ async function upsertFbaDailyRecords(records) {
     if (!record?.sellerSku || !record?.marketplaceId || !record?.date) continue;
     const key = makeFbaDailyKey(record);
     const existing = byKey.get(key);
-    if (existing?.frozenAt || (existing && isFbaDailyFrozen(record.date))) {
+    const isSalesUpdate = Boolean(record.salesFetchedAt);
+    if ((existing?.frozenAt || (existing && isFbaDailyFrozen(record.date))) && !isSalesUpdate && !allowFrozenInventoryUpdate) {
       skippedFrozen += 1;
       continue;
     }
@@ -2358,6 +2518,7 @@ function fbaDatesWithSalesRecords(rows, marketplaceId) {
   const dates = new Set();
   for (const row of rows) {
     if (row.marketplaceId !== marketplaceId) continue;
+    if (row.sellerSku !== FBA_DATE_MARKER_SKU) continue;
     if (!row.salesFetchedAt) continue;
     const date = String(row.date || "").slice(0, 10);
     if (date === today) continue;
@@ -2372,6 +2533,8 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
   const rangeDates = dateRangeInclusive(startDate, endDate);
   const dates = options.dates || rangeDates;
   const inventoryDates = options.inventoryDates || [];
+  const forceNewReport = Boolean(options.forceNewReport);
+  const reuseSameDayReport = Boolean(options.reuseSameDayReport);
   const inventoryRecords = [];
   const warnings = [];
   let inventorySynced = false;
@@ -2390,7 +2553,7 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
   const historicalInventoryDates = inventoryDates.filter(date => date < today);
   if (historicalInventoryDates.length) {
     try {
-      const ledgerRecords = await fetchLedgerInventoryRecords(historicalInventoryDates[0], historicalInventoryDates[historicalInventoryDates.length - 1]);
+      const ledgerRecords = await fetchLedgerInventoryRecords(historicalInventoryDates[0], historicalInventoryDates[historicalInventoryDates.length - 1], { forceNewReport, reuseSameDayReport });
       const requestedSet = new Set(historicalInventoryDates);
       inventoryRecords.push(...ledgerRecords.filter(record => requestedSet.has(record.date)));
     } catch (error) {
@@ -2402,16 +2565,20 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
   let orderCount = 0;
   let orderItemErrorCount = 0;
   let salesByDate = null;
-  if ((process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders" && dates.length) {
+  const useSalesReport = (process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders";
+  let salesReportFailed = false;
+  if (useSalesReport && dates.length) {
     try {
-      salesByDate = await fetchSalesByDateSkuFromReport(dates[0], dates[dates.length - 1]);
+      salesByDate = await fetchSalesByDateSkuFromReport(dates[0], dates[dates.length - 1], { forceNewReport, reuseSameDayReport });
     } catch (error) {
+      salesReportFailed = true;
       warnings.push(`${dates[0]} 至 ${dates[dates.length - 1]} Orders 销量报表拉取失败：${error.message}`);
     }
   }
   for (const date of dates) {
     try {
-      const sales = salesByDate?.get(date) || await fetchSalesBySku(date, date);
+      if (useSalesReport && salesReportFailed && forceNewReport) continue;
+      const sales = salesByDate?.get(date) || await fetchSalesBySku(date, date, { forceNewReport, reuseSameDayReport });
       orderCount += sales.orderCount || 0;
       orderItemErrorCount += sales.orderItemErrorCount || 0;
       warnings.push(...(sales.warnings || []));
@@ -2424,7 +2591,9 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
     }
   }
 
-  const storage = await upsertFbaDailyRecords([...inventoryRecords, ...salesRecords]);
+  const storage = await upsertFbaDailyRecords([...inventoryRecords, ...salesRecords], {
+    allowFrozenInventoryUpdate: Boolean(options.allowFrozenInventoryUpdate)
+  });
   return {
     dates,
     inventorySynced,
@@ -2450,12 +2619,16 @@ async function getFbaDailyDateStatus() {
       rowCount: 0,
       inventoryCount: 0,
       salesCount: 0,
+      salesMarkerCount: 0,
+      complete: false,
       frozenCount: 0
     };
     item.rowCount += 1;
     if (row.inventoryFetchedAt) item.inventoryCount += 1;
     if (row.salesFetchedAt) item.salesCount += 1;
+    if (row.sellerSku === FBA_DATE_MARKER_SKU && row.salesFetchedAt) item.salesMarkerCount += 1;
     if (row.frozenAt) item.frozenCount += 1;
+    item.complete = item.inventoryCount > 0 && item.salesMarkerCount > 0;
     byDate.set(date, item);
   }
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
@@ -2474,9 +2647,15 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   if (options.mode === "sync") {
     sync = await syncFbaDailyRange(safeStart, safeEnd, {
       dates: requestedDates,
-      inventoryDates: requestedDates.filter(date => date < today)
+      inventoryDates: requestedDates.filter(date => date < today),
+      allowFrozenInventoryUpdate: true,
+      forceNewReport: true,
+      reuseSameDayReport: true
     });
     warnings.push(...(sync.warnings || []));
+    if (Number(sync.storage?.skippedFrozen || 0) > 0) {
+      warnings.push(`强制刷新有 ${sync.storage.skippedFrozen} 条库存记录因为冻结状态未写入，请检查保存逻辑。`);
+    }
     dailyRows = await readFbaDailyRows();
   } else if (options.mode === "query") {
     const existingSalesDates = fbaDatesWithSalesRecords(dailyRows, config.marketplaceId);
@@ -2520,6 +2699,8 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   } else if (!inventoryRows.length) {
     warnings.push(`结束日期 ${safeEnd} 没有本地 FBA 库存快照；库存字段显示为空，销量仍按所选日期范围统计。`);
   }
+  const currentDateColumnsAvailable = inventoryRows.some(row => row.sellerSku !== FBA_DATE_MARKER_SKU);
+  const factoryQuantityByAsin = currentDateColumnsAvailable ? buildFactoryQuantityByAsin(await readDb()) : new Map();
 
   const latestInventoryBySku = new Map();
   for (const row of inventoryRows) {
@@ -2576,19 +2757,29 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     const inventory = latestInventoryBySku.get(sku) || null;
     const metadata = mergeSkuDisplayMetadata(latestMetadataBySku.get(sku), inventory);
     const sale = salesBySku.get(sku) || { units: 0, orders: 0, sufficientUnits: 0, sufficientDays: 0 };
-    const dailySales = sale.sufficientDays > 0 ? sale.sufficientUnits / sale.sufficientDays : sale.units / dayCount;
+    const dailySales = sale.units / dayCount;
     const inventorySource = inventorySnapshotSource(inventory);
     const isWarehouseOnlyInventory = inventorySource === "ledger_summary";
     const fulfillableQuantity = inventory ? Number(inventory.fulfillableQuantity || 0) : 0;
     const warehouseQuantity = inventory ? Number(inventory.fulfillableQuantity || 0) + Number(inventory.unfulfillableQuantity || 0) : 0;
-    const totalGoodsQuantity = inventory && !isWarehouseOnlyInventory ? calculateTotalGoodsQuantity(inventory) : null;
+    const totalGoodsQuantity = inventory ? calculateTotalGoodsQuantity(inventory) : null;
+    const inboundQuantity = inventory ? calculateInboundQuantity(inventory) : null;
+    const asin = String(metadata.asin || "").trim().toUpperCase();
+    const factoryQuantity = currentDateColumnsAvailable && asin ? Number(factoryQuantityByAsin.get(asin) || 0) : null;
+    const factoryFbaTotalQuantity = totalGoodsQuantity !== null && factoryQuantity !== null
+      ? Number(totalGoodsQuantity || 0) + Number(factoryQuantity || 0)
+      : null;
     const sellableDays = dailySales > 0 && totalGoodsQuantity !== null ? Math.floor(Number(totalGoodsQuantity || 0) / dailySales) : null;
+    const factoryFbaSellableDays = dailySales > 0 && factoryFbaTotalQuantity !== null
+      ? Math.floor(Number(factoryFbaTotalQuantity || 0) / dailySales)
+      : null;
     const stockoutDays = requestedDates.reduce((count, date) => {
       const dayInventory = inventoryBySkuDate.get(`${sku}|${date}`);
       return count + (!dayInventory || Number(dayInventory.fulfillableQuantity || 0) <= 0 ? 1 : 0);
     }, 0);
     return {
-      asin: metadata.asin || "",
+      asin,
+      parentAsin: metadata.parentAsin || "",
       sellerSku: sku,
       fnSku: metadata.fnSku || "",
       title: metadata.title || "",
@@ -2601,19 +2792,25 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
       amazonTotalQuantity: inventory ? Number(inventory.amazonTotalQuantity || 0) : 0,
       totalQuantity: totalGoodsQuantity,
       totalGoodsQuantity,
+      inboundQuantity,
+      factoryQuantity,
+      factoryFbaTotalQuantity,
       fulfillableQuantity,
-      reservedQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.reservedQuantity || 0) : null,
+      reservedQuantity: inventory ? Number(inventory.reservedQuantity || 0) : null,
       unfulfillableQuantity: inventory ? Number(inventory.unfulfillableQuantity || 0) : 0,
-      inboundWorkingQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.inboundWorkingQuantity || 0) : null,
-      inboundShippedQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.inboundShippedQuantity || 0) : null,
-      inboundReceivingQuantity: inventory && !isWarehouseOnlyInventory ? Number(inventory.inboundReceivingQuantity || 0) : null,
+      inboundWorkingQuantity: inventory ? Number(inventory.inboundWorkingQuantity || 0) : null,
+      inboundShippedQuantity: inventory ? Number(inventory.inboundShippedQuantity || 0) : null,
+      inboundReceivingQuantity: inventory ? Number(inventory.inboundReceivingQuantity || 0) : null,
       salesOrders: Number(sale.orders || 0),
       salesUnits: Number(sale.units || 0),
       sufficientSalesDays: Number(sale.sufficientDays || 0),
       dailySales: Number(dailySales.toFixed(2)),
       sellableDays,
+      factoryFbaSellableDays,
       stockoutDays,
       stockLevel: sellableDays === null ? "unknown" : sellableDays < 14 ? "low" : sellableDays < 30 ? "medium" : "healthy",
+      factoryFbaStockLevel: factoryFbaSellableDays === null ? "unknown" : factoryFbaSellableDays < 14 ? "low" : factoryFbaSellableDays < 30 ? "medium" : "healthy",
+      currentDateColumnsAvailable,
       lastUpdatedTime: "",
       inventoryDate: inventory?.date || ""
     };
@@ -2627,7 +2824,13 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
       acc.totalQuantity += Number(row.totalGoodsQuantity || 0);
       acc.totalGoodsQuantity += Number(row.totalGoodsQuantity || 0);
     }
+    if (row.inboundQuantity !== null && row.inboundQuantity !== undefined) acc.inboundQuantity += Number(row.inboundQuantity || 0);
+    if (row.factoryQuantity !== null && row.factoryQuantity !== undefined && row.asin && !acc.factoryAsins.has(row.asin)) {
+      acc.factoryAsins.add(row.asin);
+      acc.factoryQuantity += Number(row.factoryQuantity || 0);
+    }
     if (row.inventoryCompleteness === "warehouse_only") acc.warehouseOnlyRows += 1;
+    if (row.inventoryCompleteness === "missing") acc.missingInventoryRows += 1;
     if (row.inboundWorkingQuantity !== null && row.inboundWorkingQuantity !== undefined) acc.inboundWorkingQuantity += Number(row.inboundWorkingQuantity || 0);
     if (row.inboundShippedQuantity !== null && row.inboundShippedQuantity !== undefined) acc.inboundShippedQuantity += Number(row.inboundShippedQuantity || 0);
     if (row.inboundReceivingQuantity !== null && row.inboundReceivingQuantity !== undefined) acc.inboundReceivingQuantity += Number(row.inboundReceivingQuantity || 0);
@@ -2642,8 +2845,12 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     warehouseQuantity: 0,
     totalQuantity: 0,
     totalGoodsQuantity: 0,
+    inboundQuantity: 0,
+    factoryQuantity: 0,
     completeInventoryRows: 0,
+    factoryAsins: new Set(),
     warehouseOnlyRows: 0,
+    missingInventoryRows: 0,
     inboundWorkingQuantity: 0,
     inboundShippedQuantity: 0,
     inboundReceivingQuantity: 0,
@@ -2653,15 +2860,14 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     salesOrders: 0,
     salesUnits: 0
   });
-  totals.inventoryCompleteness = totals.warehouseOnlyRows > 0 ? "partial" : "complete";
-  if (totals.inventoryCompleteness !== "complete") {
-    totals.totalQuantity = null;
-    totals.totalGoodsQuantity = null;
-    totals.inboundWorkingQuantity = null;
-    totals.inboundShippedQuantity = null;
-    totals.inboundReceivingQuantity = null;
-    totals.reservedQuantity = null;
+  delete totals.factoryAsins;
+  if (!currentDateColumnsAvailable) {
+    totals.factoryQuantity = null;
   }
+  totals.factoryFbaTotalQuantity = totals.completeInventoryRows > 0 && totals.factoryQuantity !== null
+    ? totals.totalGoodsQuantity + totals.factoryQuantity
+    : null;
+  totals.inventoryCompleteness = totals.missingInventoryRows > 0 ? "missing" : (totals.warehouseOnlyRows > 0 ? "warehouse_only" : "complete");
   const salesMarkerSummary = rangeRows.reduce((acc, row) => {
     if (row.sellerSku !== FBA_DATE_MARKER_SKU) return acc;
     acc.orderCount += Number(row.rawSalesJson?.orderCount || 0);
@@ -2670,7 +2876,7 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   }, { orderCount: 0, orderItemErrorCount: 0 });
 
   return {
-    range: { startDate: safeStart, endDate: safeEnd, dayCount },
+    range: { startDate: safeStart, endDate: safeEnd, dayCount, currentDateColumnsAvailable },
     config: {
       marketplaceId: config.marketplaceId,
       sellerId: config.sellerId,
@@ -3997,7 +4203,7 @@ async function handleApi(req, res, url) {
     const endDate = url.searchParams.get("endDate") || "";
     const mode = url.searchParams.get("mode") || "";
     const refresh = url.searchParams.get("refresh") === "1" || mode === "sync" || mode === "query";
-    const cacheKey = `${startDate}:${endDate}:${mode}:${getSpApiConfig().marketplaceId}`;
+    const cacheKey = `fba-view-v2:${startDate}:${endDate}:${mode}:${getSpApiConfig().marketplaceId}`;
     const cacheTtlMs = Number(process.env.AMZ_FBA_CACHE_TTL_MS || 300000);
     const cached = fbaInventoryCache.get(cacheKey);
     if (!refresh && cached && Date.now() - cached.cachedAt < cacheTtlMs) {
