@@ -18,11 +18,11 @@
         </div>
         <nav class="side-nav">
           <button class="module-tab active" data-module="dashboard">仪表盘</button>
+          <button class="module-tab" data-module="inventory">工厂库存</button>
           <button class="module-tab" data-module="products">FBA库存</button>
           <button class="module-tab" data-module="ads">广告管理</button>
           <button class="module-tab" data-module="influencers">红人营销</button>
           <button class="module-tab" data-module="orders">订单管理</button>
-          <button class="module-tab" data-module="inventory">库存仓库</button>
           <button class="module-tab" data-module="settings">系统设置</button>
         </nav>
       </aside>
@@ -67,6 +67,10 @@
           </div>
 
           <div class="quick-grid">
+            <button class="quick-card" data-module-jump="inventory">
+              <strong>工厂库存</strong>
+              <span id="factoryQuickText">查看国内工厂库存</span>
+            </button>
             <button class="quick-card" data-module-jump="products">
               <strong>FBA库存</strong>
               <span id="productQuickText">查看库存和销量</span>
@@ -262,9 +266,40 @@
         </section>
 
         <section id="inventoryPage" class="module-page">
-          <section class="panel placeholder-panel">
-            <h1>库存仓库</h1>
-            <p>预留模块。当前商品页会先展示本地库存和库存预警字段。</p>
+          <div class="page-head">
+            <div>
+              <h1>工厂库存</h1>
+              <p>按 ASIN 横向查看工厂库存账，顶部固定商品信息，下面按日期记录补货和发货</p>
+            </div>
+            <div class="actions slim">
+              <button id="factoryAddAsinBtn" class="secondary-button">增加ASIN</button>
+              <button id="factoryMovementBtn">补货 / 发货</button>
+              <button id="factoryRefreshBtn" class="secondary-button">刷新</button>
+            </div>
+          </div>
+
+          <section class="panel fba-panel factory-panel">
+            <div class="fba-toolbar factory-toolbar">
+              <label>
+                搜索
+                <input id="factorySearch" placeholder="搜索品名、ASIN、箱规">
+              </label>
+              <label>
+                库存状态
+                <select id="factoryStockFilter">
+                  <option value="">全部状态</option>
+                  <option value="low">低库存</option>
+                  <option value="out">缺货</option>
+                  <option value="ok">正常</option>
+                </select>
+              </label>
+            </div>
+            <div id="factorySummary" class="fba-summary"></div>
+            <div class="factory-matrix-wrap">
+              <table class="factory-matrix-table">
+                <tbody id="factoryMatrixBody"></tbody>
+              </table>
+            </div>
           </section>
         </section>
 

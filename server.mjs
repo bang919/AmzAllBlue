@@ -940,6 +940,238 @@ function normalizeProduct(input) {
   };
 }
 
+function normalizeFactoryProduct(input) {
+  const asin = String(input.asin || "").trim().toUpperCase();
+  const name = String(input.name || input.title || "").trim();
+  return {
+    id: String(input.id || asin || name || randomUUID()).trim(),
+    name,
+    asin,
+    boxSpec: String(input.boxSpec || "").trim(),
+    unitCost: input.unitCost === "" || input.unitCost === undefined ? "" : Number(input.unitCost || 0),
+    currentQuantity: Number(input.currentQuantity || 0),
+    inventoryValue: input.inventoryValue === "" || input.inventoryValue === undefined ? "" : Number(input.inventoryValue || 0),
+    safetyStock: Number(input.safetyStock || 50),
+    note: String(input.note || "").trim(),
+    source: String(input.source || "manual").trim(),
+    order: Number(input.order || 0),
+    createdAt: input.createdAt || new Date().toISOString(),
+    updatedAt: input.updatedAt || new Date().toISOString()
+  };
+}
+
+function calculateFactoryInventoryValue(product) {
+  if (product.unitCost === "" || product.unitCost === null || product.unitCost === undefined) return "";
+  return Number((Number(product.currentQuantity || 0) * Number(product.unitCost || 0)).toFixed(2));
+}
+
+function updateFactoryProduct(input, patch) {
+  const next = { ...input };
+  if (Object.prototype.hasOwnProperty.call(patch, "asin")) {
+    next.asin = String(patch.asin || "").trim().toUpperCase();
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "unitCost")) {
+    next.unitCost = patch.unitCost === "" || patch.unitCost === null || patch.unitCost === undefined ? "" : Number(patch.unitCost || 0);
+    next.inventoryValue = calculateFactoryInventoryValue(next);
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "boxSpec")) {
+    next.boxSpec = String(patch.boxSpec || "").trim();
+  }
+  next.updatedAt = new Date().toISOString();
+  return normalizeFactoryProduct(next);
+}
+
+function normalizeFactoryMovement(input) {
+  return {
+    id: String(input.id || randomUUID()).trim(),
+    productId: String(input.productId || "").trim(),
+    date: String(input.date || new Date().toISOString().slice(0, 10)).slice(0, 10),
+    type: String(input.type || "adjustment").trim(),
+    quantity: Number(input.quantity || 0),
+    note: String(input.note || "").trim(),
+    operator: String(input.operator || "").trim(),
+    source: String(input.source || "manual").trim(),
+    createdAt: input.createdAt || new Date().toISOString()
+  };
+}
+
+function factoryMovementLabel(type) {
+  return {
+    inbound: "补货入库",
+    outbound: "发货出库",
+    adjustment: "库存调整",
+    import: "表格导入"
+  }[type] || type || "库存调整";
+}
+
+function inferFactoryMovementType(operation, quantity) {
+  const text = String(operation || "");
+  if (Number(quantity || 0) < 0 || /发货|出库|发出/i.test(text)) return "outbound";
+  if (/差|调整|盘点/i.test(text)) return "adjustment";
+  return "inbound";
+}
+
+function applyFactoryQuantity(product, delta) {
+  return normalizeFactoryProduct({
+    ...product,
+    currentQuantity: Number(product.currentQuantity || 0) + Number(delta || 0),
+    inventoryValue: calculateFactoryInventoryValue({
+      ...product,
+      currentQuantity: Number(product.currentQuantity || 0) + Number(delta || 0)
+    }),
+    updatedAt: new Date().toISOString()
+  });
+}
+
+async function buildFbaProductCatalog(db) {
+  const byAsin = new Map();
+  const remember = item => {
+    const asin = String(item?.asin || "").trim().toUpperCase();
+    if (!asin) return;
+    const existing = byAsin.get(asin) || {};
+    byAsin.set(asin, {
+      asin,
+      sellerSku: existing.sellerSku || item.sellerSku || item.sku || "",
+      fnSku: existing.fnSku || item.fnSku || "",
+      title: existing.title || item.title || item.itemName || "",
+      brand: existing.brand || item.brand || "",
+      imageUrl: existing.imageUrl || item.imageUrl || "",
+      marketplaceId: existing.marketplaceId || item.marketplaceId || "",
+      source: existing.source || item.source || "fba"
+    });
+  };
+
+  for (const product of buildProductsFromDb(db)) remember(product);
+
+  try {
+    const metadataRows = await readFbaSkuMetadataRows();
+    for (const row of metadataRows) remember(row);
+  } catch {
+    // Factory inventory should still work when FBA metadata storage is unavailable.
+  }
+
+  try {
+    const dailyRows = await readFbaDailyRows();
+    for (const row of dailyRows) {
+      if (row.sellerSku === FBA_DATE_MARKER_SKU) continue;
+      remember(row);
+    }
+  } catch {
+    // Ignore FBA daily storage failures for this independent module.
+  }
+
+  return byAsin;
+}
+
+async function ensureFactoryInventoryProductCatalog(db) {
+  const fbaCatalogByAsin = await buildFbaProductCatalog(db);
+  const store = db.factoryInventory || { products: [], movements: [] };
+  store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+  store.movements = Array.isArray(store.movements) ? store.movements.map(item => normalizeFactoryMovement(item)) : [];
+  let changed = false;
+  const byId = new Map(store.products.map(product => [product.id, product]));
+  for (const product of store.products) {
+    if (!product.asin) continue;
+    const fbaProduct = fbaCatalogByAsin.get(product.asin);
+    if (!fbaProduct) continue;
+    const nextSource = product.source.includes("fba") ? product.source : `${product.source}_fba_enriched`;
+    if (product.source !== nextSource) {
+      byId.set(product.id, normalizeFactoryProduct({
+        ...product,
+        source: nextSource,
+        updatedAt: new Date().toISOString()
+      }));
+      changed = true;
+    }
+  }
+  for (const fbaProduct of fbaCatalogByAsin.values()) {
+    const id = `factory-${fbaProduct.asin}`;
+    if (byId.has(id)) continue;
+    // Factory inventory should only show products that exist in the factory sheet.
+    // FBA catalog enriches matching ASINs with title/images, but does not create empty factory columns.
+  }
+  if (changed) {
+    store.products = [...byId.values()];
+    db.factoryInventory = store;
+  }
+  return { changed, fbaCatalogByAsin };
+}
+
+async function buildFactoryInventoryView(db, options = {}) {
+  const fbaCatalogByAsin = options.fbaCatalogByAsin || await buildFbaProductCatalog(db);
+  const storedProducts = (Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [])
+    .map(item => normalizeFactoryProduct(item));
+  const productsById = new Map();
+  const rememberProduct = product => {
+    const existing = productsById.get(product.id);
+    productsById.set(product.id, normalizeFactoryProduct({ ...(existing || {}), ...product }));
+  };
+
+  for (const item of storedProducts) {
+    const fbaProduct = fbaCatalogByAsin.get(item.asin) || null;
+    rememberProduct({
+      ...item,
+      name: item.name,
+      asin: item.asin,
+      source: fbaProduct && !item.source.includes("fba") ? `${item.source}_fba_enriched` : item.source
+    });
+  }
+
+  for (const fbaProduct of fbaCatalogByAsin.values()) {
+    const id = `factory-${fbaProduct.asin}`;
+    if (productsById.has(id)) continue;
+    // Do not add FBA-only products here; otherwise the matrix gets many empty columns.
+  }
+
+  const products = [...productsById.values()];
+  const movements = (Array.isArray(db.factoryInventory?.movements) ? db.factoryInventory.movements : [])
+    .map(item => normalizeFactoryMovement(item))
+    .filter(item => item.productId && item.quantity);
+  const productById = new Map(products.map(product => [product.id, product]));
+  const movementsByProduct = new Map();
+  for (const movement of movements) {
+    if (!movementsByProduct.has(movement.productId)) movementsByProduct.set(movement.productId, []);
+    movementsByProduct.get(movement.productId).push(movement);
+  }
+  const rows = products.map(product => {
+    const productMovements = (movementsByProduct.get(product.id) || [])
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.createdAt).localeCompare(String(a.createdAt)));
+    const fbaProduct = fbaCatalogByAsin.get(product.asin) || {};
+    const currentQuantity = Number(product.currentQuantity || 0);
+    const inventoryValue = calculateFactoryInventoryValue(product);
+    return {
+      ...product,
+      imageUrl: fbaProduct.imageUrl || "",
+      sellerSku: fbaProduct.sellerSku || "",
+      fnSku: fbaProduct.fnSku || "",
+      title: fbaProduct.title || product.name || "",
+      currentQuantity,
+      inventoryValue,
+      movementCount: productMovements.length,
+      lastMovementAt: productMovements[0]?.date || "",
+      stockLevel: currentQuantity <= 0 ? "out" : currentQuantity <= Number(product.safetyStock || 0) ? "low" : "ok"
+    };
+  }).sort((a, b) => Number(a.order || 0) - Number(b.order || 0) || String(a.name).localeCompare(String(b.name), "zh-Hans-CN"));
+  const movementRows = movements
+    .map(movement => ({
+      ...movement,
+      typeLabel: factoryMovementLabel(movement.type),
+      productName: productById.get(movement.productId)?.name || "",
+      asin: productById.get(movement.productId)?.asin || ""
+    }))
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.createdAt).localeCompare(String(a.createdAt)));
+  const totals = rows.reduce((acc, product) => {
+    acc.productCount += 1;
+    acc.currentQuantity += Number(product.currentQuantity || 0);
+    if (product.inventoryValue !== "") acc.inventoryValue += Number(product.inventoryValue || 0);
+    if (product.stockLevel === "low") acc.lowStockCount += 1;
+    if (product.stockLevel === "out") acc.outOfStockCount += 1;
+    return acc;
+  }, { productCount: 0, currentQuantity: 0, inventoryValue: 0, lowStockCount: 0, outOfStockCount: 0 });
+  totals.inventoryValue = Number(totals.inventoryValue.toFixed(2));
+  return { products: rows, movements: movementRows, totals };
+}
+
 function requestAsins(item) {
   return unique([
     item.asin,
@@ -3548,6 +3780,200 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/products") {
     const db = await readDb();
     return sendJson(res, { products: buildProductsFromDb(db) });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/factory-inventory") {
+    const db = await readDb();
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    if (catalog.changed) await writeDb(db);
+    return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factory-inventory/movements") {
+    const body = await parseBody(req);
+    const db = await readDb();
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    store.movements = Array.isArray(store.movements) ? store.movements.map(item => normalizeFactoryMovement(item)) : [];
+    const productIndex = store.products.findIndex(item => item.id === String(body.productId || ""));
+    if (productIndex === -1) return sendJson(res, { error: "Factory product not found" }, 404);
+    const rawQuantity = Number(body.quantity || 0);
+    if (!rawQuantity) return sendJson(res, { error: "Quantity must not be 0" }, 400);
+    const type = String(body.type || inferFactoryMovementType(body.note, rawQuantity));
+    const signedQuantity = type === "outbound" ? -Math.abs(rawQuantity) : type === "inbound" ? Math.abs(rawQuantity) : rawQuantity;
+    const movement = normalizeFactoryMovement({
+      productId: store.products[productIndex].id,
+      date: body.date,
+      type,
+      quantity: signedQuantity,
+      note: body.note,
+      operator: body.operator,
+      source: "manual"
+    });
+    store.movements.unshift(movement);
+    store.products[productIndex] = applyFactoryQuantity(store.products[productIndex], signedQuantity);
+    db.factoryInventory = store;
+    await writeDb(db);
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    if (catalog.changed) await writeDb(db);
+    return sendJson(res, { movement, ...(await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin })) }, 201);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factory-inventory/movement-rows") {
+    const body = await parseBody(req);
+    const operation = String(body.operation || "").trim();
+    const date = String(body.date || "").slice(0, 10);
+    const quantities = body.quantities && typeof body.quantities === "object" ? body.quantities : {};
+    if (!operation) return sendJson(res, { error: "Missing operation" }, 400);
+    if (!date) return sendJson(res, { error: "Missing date" }, 400);
+    const db = await readDb();
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    store.movements = Array.isArray(store.movements) ? store.movements.map(item => normalizeFactoryMovement(item)) : [];
+    const productById = new Map(store.products.map((product, index) => [product.id, { product, index }]));
+    const created = [];
+    for (const [productId, rawQuantity] of Object.entries(quantities)) {
+      const quantity = Number(rawQuantity || 0);
+      if (!quantity) continue;
+      const entry = productById.get(String(productId));
+      if (!entry) continue;
+      const movement = normalizeFactoryMovement({
+        productId,
+        date,
+        type: inferFactoryMovementType(operation, quantity),
+        quantity,
+        note: operation,
+        source: "manual"
+      });
+      created.push(movement);
+      store.movements.unshift(movement);
+      store.products[entry.index] = applyFactoryQuantity(entry.product, quantity);
+      productById.set(productId, { product: store.products[entry.index], index: entry.index });
+    }
+    if (!created.length) return sendJson(res, { error: "No quantity entered" }, 400);
+    db.factoryInventory = store;
+    await writeDb(db);
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    if (catalog.changed) await writeDb(db);
+    return sendJson(res, { created, ...(await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin })) }, 201);
+  }
+
+  if (req.method === "DELETE" && url.pathname === "/api/factory-inventory/movement-rows") {
+    const body = await parseBody(req);
+    const operation = String(body.operation || "").trim();
+    const date = String(body.date || "").slice(0, 10);
+    if (!operation || !date) return sendJson(res, { error: "Missing movement row identity" }, 400);
+    const db = await readDb();
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    store.movements = Array.isArray(store.movements) ? store.movements.map(item => normalizeFactoryMovement(item)) : [];
+    const productIndexById = new Map(store.products.map((product, index) => [product.id, index]));
+    const remaining = [];
+    let deleted = 0;
+    for (const movement of store.movements) {
+      const movementOperation = movement.note || movement.typeLabel || movement.type || "库存变动";
+      if (movement.date === date && movementOperation === operation) {
+        const index = productIndexById.get(movement.productId);
+        if (index !== undefined) store.products[index] = applyFactoryQuantity(store.products[index], -Number(movement.quantity || 0));
+        deleted += 1;
+      } else {
+        remaining.push(movement);
+      }
+    }
+    if (!deleted) return sendJson(res, { error: "Movement row not found" }, 404);
+    store.movements = remaining;
+    db.factoryInventory = store;
+    await writeDb(db);
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    if (catalog.changed) await writeDb(db);
+    return sendJson(res, { deleted, ...(await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin })) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factory-inventory/products") {
+    const body = await parseBody(req);
+    const asin = String(body.asin || "").trim().toUpperCase();
+    if (!asin) return sendJson(res, { error: "Missing ASIN" }, 400);
+    const db = await readDb();
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    const fbaProduct = catalog.fbaCatalogByAsin.get(asin);
+    if (!fbaProduct) return sendJson(res, { error: "ASIN not found in product database" }, 404);
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    if (store.products.some(product => product.asin === asin)) return sendJson(res, { error: "ASIN already exists in factory inventory" }, 409);
+    const nextOrder = Math.max(0, ...store.products.map(product => Number(product.order || 0))) + 1;
+    store.products.push(normalizeFactoryProduct({
+      id: `factory-${asin}`,
+      name: fbaProduct.title || `Amazon 商品 ${asin}`,
+      asin,
+      currentQuantity: 0,
+      unitCost: "",
+      inventoryValue: "",
+      boxSpec: "",
+      source: "fba_catalog_manual",
+      order: nextOrder
+    }));
+    db.factoryInventory = store;
+    await writeDb(db);
+    return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }), 201);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factory-inventory/products/reorder") {
+    const body = await parseBody(req);
+    const productIds = Array.isArray(body.productIds) ? body.productIds.map(id => String(id || "").trim()).filter(Boolean) : [];
+    if (!productIds.length) return sendJson(res, { error: "Missing productIds" }, 400);
+    const db = await readDb();
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    const orderById = new Map(productIds.map((id, index) => [id, index + 1]));
+    let nextOrder = productIds.length + 1;
+    store.products = store.products.map(product => normalizeFactoryProduct({
+      ...product,
+      order: orderById.get(product.id) || nextOrder++,
+      updatedAt: new Date().toISOString()
+    }));
+    db.factoryInventory = store;
+    await writeDb(db);
+    return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
+  }
+
+  const factoryProductMatch = url.pathname.match(/^\/api\/factory-inventory\/products\/([^/]+)$/);
+  if (req.method === "DELETE" && factoryProductMatch) {
+    const productId = decodeURIComponent(factoryProductMatch[1]);
+    const db = await readDb();
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    store.movements = Array.isArray(store.movements) ? store.movements.map(item => normalizeFactoryMovement(item)) : [];
+    const product = store.products.find(item => item.id === productId);
+    if (!product) return sendJson(res, { error: "Factory product not found" }, 404);
+    store.products = store.products
+      .filter(item => item.id !== productId)
+      .map((item, index) => normalizeFactoryProduct({ ...item, order: index + 1, updatedAt: new Date().toISOString() }));
+    const before = store.movements.length;
+    store.movements = store.movements.filter(movement => movement.productId !== productId);
+    db.factoryInventory = store;
+    await writeDb(db);
+    return sendJson(res, {
+      deletedProduct: product,
+      deletedMovements: before - store.movements.length,
+      ...(await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }))
+    });
+  }
+
+  if (req.method === "PUT" && factoryProductMatch) {
+    const productId = decodeURIComponent(factoryProductMatch[1]);
+    const body = await parseBody(req);
+    const db = await readDb();
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    const index = store.products.findIndex(item => item.id === productId);
+    if (index === -1) return sendJson(res, { error: "Factory product not found" }, 404);
+    store.products[index] = updateFactoryProduct(store.products[index], body);
+    db.factoryInventory = store;
+    await writeDb(db);
+    return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
   }
 
   if (req.method === "GET" && url.pathname === "/api/products/sandbox-status") {

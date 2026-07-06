@@ -40,12 +40,16 @@ const fields = [
 
 let requests = [];
 let products = [];
+let factoryProducts = [];
+let factoryMovements = [];
+let factoryTotals = {};
 let adsProfiles = [];
 let selectedId = "";
 let selectedProductAsin = "";
 let selectedAdsProfileId = "";
 let activeModule = "dashboard";
 let productsLoaded = false;
+let factoryLoaded = false;
 let adsLoaded = false;
 const MAIL_TEMPLATE_KEY = "amazonAggregator.mailTemplate.v1";
 const FBA_COLUMNS_KEY = "amazonAggregator.fbaColumns.v1";
@@ -194,6 +198,12 @@ function switchModule(module) {
     renderAdsProfiles();
     if (!adsLoaded) refreshAds().catch(error => {
       $("#adsStatus").textContent = `Amazon Ads 检查失败：${error.message}`;
+    });
+  }
+  if (module === "inventory") {
+    renderFactoryInventory();
+    if (!factoryLoaded) loadFactoryInventory().catch(error => {
+      $("#sandboxStatus").textContent = `工厂库存读取失败：${error.message}`;
     });
   }
   if (module === "dashboard") renderDashboard();
@@ -371,6 +381,8 @@ function renderDashboard() {
   `;
   const productQuick = $("#productQuickText");
   if (productQuick) productQuick.textContent = `查看 ${products.length} 个 FBA SKU`;
+  const factoryQuick = $("#factoryQuickText");
+  if (factoryQuick) factoryQuick.textContent = `查看 ${formatNumber(factoryTotals.currentQuantity || 0)} 件工厂库存`;
   const influencerQuick = $("#influencerQuickText");
   if (influencerQuick) influencerQuick.textContent = `管理 ${activeCreators} 条合作`;
   renderTrendChart();
@@ -1248,6 +1260,359 @@ function renderProducts() {
   renderDashboard();
 }
 
+function factoryProductMatches(product) {
+  const keyword = ($("#factorySearch")?.value || "").trim().toLowerCase();
+  const stockFilter = $("#factoryStockFilter")?.value || "";
+  if (stockFilter && product.stockLevel !== stockFilter) return false;
+  if (!keyword) return true;
+  return [
+    product.name,
+    product.asin,
+    product.boxSpec,
+    product.note
+  ].join(" ").toLowerCase().includes(keyword);
+}
+
+function renderFactoryInventory() {
+  const matrixBody = $("#factoryMatrixBody");
+  if (!matrixBody) return;
+  const visibleProducts = factoryProducts.filter(factoryProductMatches);
+  const today = new Date().toISOString().slice(0, 10);
+  const summary = $("#factorySummary");
+  if (summary) {
+    summary.innerHTML = `
+      <div class="fba-summary-card"><strong>${formatNumber(factoryTotals.productCount || 0)}</strong><span>商品数</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(factoryTotals.currentQuantity || 0)}</strong><span>工厂库存</span></div>
+      <div class="fba-summary-card"><strong>¥${formatNumber(factoryTotals.inventoryValue || 0, 2)}</strong><span>库存货值</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(factoryTotals.lowStockCount || 0)}</strong><span>低库存</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(factoryTotals.outOfStockCount || 0)}</strong><span>缺货</span></div>
+    `;
+  }
+  if (!visibleProducts.length) {
+    matrixBody.innerHTML = `<tr><td><div class="empty">暂无匹配的工厂库存商品。</div></td></tr>`;
+    return;
+  }
+
+  const visibleIds = new Set(visibleProducts.map(product => product.id));
+  const groupedMovements = new Map();
+  for (const movement of factoryMovements) {
+    if (!visibleIds.has(movement.productId)) continue;
+    const operation = movement.note || movement.typeLabel || movement.type || "库存变动";
+    const key = `${movement.date || ""}\n${operation}`;
+    const row = groupedMovements.get(key) || {
+      date: movement.date || "",
+      operation,
+      createdAt: movement.createdAt || "",
+      quantities: new Map()
+    };
+    row.quantities.set(movement.productId, Number(row.quantities.get(movement.productId) || 0) + Number(movement.quantity || 0));
+    if (String(movement.createdAt || "") > String(row.createdAt || "")) row.createdAt = movement.createdAt || "";
+    groupedMovements.set(key, row);
+  }
+  const movementRows = [...groupedMovements.values()]
+    .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(a.operation).localeCompare(String(b.operation), "zh-Hans-CN"));
+
+  const productCells = (renderer, className = "", draggable = false) => visibleProducts.map((product, index) => `
+    <td class="factory-product-cell ${className} ${draggable ? "factory-draggable" : ""}" data-product-id="${escapeHtml(product.id)}" ${draggable ? "draggable=\"true\" title=\"拖动调整列顺序\"" : ""}>${renderer(product, index)}</td>
+  `).join("");
+  const editableInput = (product, field, value, type = "text") => `
+    <input class="factory-edit-input" data-factory-field="${escapeHtml(field)}" data-product-id="${escapeHtml(product.id)}" type="${type}" value="${escapeHtml(value ?? "")}">
+  `;
+
+  matrixBody.innerHTML = `
+    <tr class="factory-meta-row factory-image-row">
+      <td class="factory-sticky-col factory-left-1"></td>
+      <td class="factory-sticky-col factory-left-2"></td>
+      ${productCells(product => `
+        <div class="factory-image-cell-inner">
+          <button type="button" class="factory-product-delete" data-delete-product-id="${escapeHtml(product.id)}" title="删除这个 ASIN">×</button>
+          ${product.imageUrl ? `<img class="factory-product-image" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.name || product.asin)}">` : `<div class="factory-image-placeholder">无图</div>`}
+        </div>
+      `, "factory-image-cell", true)}
+    </tr>
+    <tr class="factory-meta-row factory-title-row">
+      <td class="factory-sticky-col factory-left-1"></td>
+      <td class="factory-sticky-col factory-left-2"></td>
+      ${productCells(product => `<div class="factory-product-title" title="${escapeHtml(product.name || product.asin || "")}">${escapeHtml(product.name || product.asin || "-")}</div>`, "factory-title-cell", true)}
+    </tr>
+    <tr class="factory-meta-row factory-asin-row">
+      <td class="factory-sticky-col factory-left-1"></td>
+      <td class="factory-sticky-col factory-left-2">ASIN</td>
+      ${productCells(product => editableInput(product, "asin", product.asin))}
+    </tr>
+    <tr class="factory-meta-row factory-cost-row">
+      <td class="factory-sticky-col factory-left-1">单个成本</td>
+      <td class="factory-sticky-col factory-left-2">CNY</td>
+      ${productCells(product => editableInput(product, "unitCost", product.unitCost, "number"))}
+    </tr>
+    <tr class="factory-meta-row factory-box-row">
+      <td class="factory-sticky-col factory-left-1"></td>
+      <td class="factory-sticky-col factory-left-2">箱子规格</td>
+      ${productCells(product => editableInput(product, "boxSpec", product.boxSpec))}
+    </tr>
+    <tr class="factory-meta-row factory-stock-row">
+      <td class="factory-sticky-col factory-left-1">剩余库存</td>
+      <td class="factory-sticky-col factory-left-2">${formatNumber(visibleProducts.reduce((sum, product) => sum + Number(product.currentQuantity || 0), 0))}</td>
+      ${productCells(product => `<strong>${formatNumber(product.currentQuantity || 0)}</strong>`)}
+    </tr>
+    <tr class="factory-meta-row factory-value-row">
+      <td class="factory-sticky-col factory-left-1">货值</td>
+      <td class="factory-sticky-col factory-left-2">¥${formatNumber(visibleProducts.reduce((sum, product) => sum + Number(product.inventoryValue || 0), 0), 2)}</td>
+      ${productCells(product => product.inventoryValue === "" ? "-" : `<strong>${formatNumber(product.inventoryValue, 2)}</strong>`)}
+    </tr>
+    <tr class="factory-draft-row">
+      <td class="factory-sticky-col factory-left-1 factory-draft-action-cell">
+        <button type="button" class="factory-row-add" data-add-factory-row title="添加这一行">+</button>
+        <input class="factory-draft-operation" data-draft-operation value="操作" aria-label="操作">
+      </td>
+      <td class="factory-sticky-col factory-left-2">
+        <input class="factory-draft-date" data-draft-date type="date" value="${escapeHtml(today)}">
+      </td>
+      ${visibleProducts.map(product => `
+        <td class="factory-product-cell factory-draft-qty-cell">
+          <input class="factory-draft-qty" data-draft-product-id="${escapeHtml(product.id)}" type="number" step="1" placeholder="">
+        </td>
+      `).join("")}
+    </tr>
+    ${movementRows.map(row => `
+      <tr class="factory-ledger-row">
+        <td class="factory-sticky-col factory-left-1 factory-row-action-cell">
+          <button type="button" class="factory-row-delete" data-delete-row-operation="${escapeHtml(row.operation)}" data-delete-row-date="${escapeHtml(row.date || "")}" title="删除这一行">-</button>
+          <span>${escapeHtml(row.operation)}</span>
+        </td>
+        <td class="factory-sticky-col factory-left-2">${escapeHtml(row.date || "-")}</td>
+        ${visibleProducts.map((product, index) => {
+          const value = Number(row.quantities.get(product.id) || 0);
+          return `<td class="factory-product-cell factory-col-${index % 5} ${value < 0 ? "quantity-negative" : value > 0 ? "quantity-positive" : ""}">${value ? `${value > 0 ? "+" : ""}${formatNumber(value)}` : ""}</td>`;
+        }).join("")}
+      </tr>
+    `).join("")}
+  `;
+}
+
+async function saveFactoryProductField(input) {
+  const productId = input?.dataset?.productId;
+  const field = input?.dataset?.factoryField;
+  if (!productId || !field) return;
+  const product = factoryProducts.find(item => item.id === productId);
+  if (!product) return;
+  const current = String(product[field] ?? "");
+  const nextValue = field === "unitCost" && input.value !== "" ? Number(input.value || 0) : input.value.trim();
+  if (String(nextValue) === current) return;
+  input.disabled = true;
+  try {
+    const data = await api(`/api/factory-inventory/products/${encodeURIComponent(productId)}`, {
+      method: "PUT",
+      body: { [field]: nextValue }
+    });
+    factoryProducts = data.products || [];
+    factoryMovements = data.movements || [];
+    factoryTotals = data.totals || {};
+    renderFactoryInventory();
+    renderDashboard();
+    $("#sandboxStatus").textContent = "工厂库存商品信息已保存";
+  } catch (error) {
+    alert(error.message);
+    input.disabled = false;
+  }
+}
+
+let factoryDraggedProductId = "";
+
+async function saveFactoryProductOrder() {
+  try {
+    const data = await api("/api/factory-inventory/products/reorder", {
+      method: "POST",
+      body: { productIds: factoryProducts.map(product => product.id) }
+    });
+    factoryProducts = data.products || [];
+    factoryMovements = data.movements || [];
+    factoryTotals = data.totals || {};
+    renderFactoryInventory();
+    $("#sandboxStatus").textContent = "工厂库存列顺序已保存";
+  } catch (error) {
+    alert(error.message);
+    await loadFactoryInventory().catch(() => {});
+  }
+}
+
+function moveFactoryProductColumn(targetProductId) {
+  if (!factoryDraggedProductId || !targetProductId || factoryDraggedProductId === targetProductId) return;
+  const fromIndex = factoryProducts.findIndex(product => product.id === factoryDraggedProductId);
+  const toIndex = factoryProducts.findIndex(product => product.id === targetProductId);
+  if (fromIndex === -1 || toIndex === -1) return;
+  const next = [...factoryProducts];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  factoryProducts = next.map((product, index) => ({ ...product, order: index + 1 }));
+  renderFactoryInventory();
+  saveFactoryProductOrder();
+}
+
+async function loadFactoryInventory() {
+  const data = await api("/api/factory-inventory");
+  factoryProducts = data.products || [];
+  factoryMovements = data.movements || [];
+  factoryTotals = data.totals || {};
+  factoryLoaded = true;
+  renderFactoryInventory();
+  renderDashboard();
+  return data;
+}
+
+function applyFactoryInventoryData(data) {
+  factoryProducts = data.products || [];
+  factoryMovements = data.movements || [];
+  factoryTotals = data.totals || {};
+  factoryLoaded = true;
+  renderFactoryInventory();
+  renderDashboard();
+}
+
+async function addFactoryAsin() {
+  const asin = prompt("请输入要增加到工厂库存的 ASIN");
+  const normalizedAsin = String(asin || "").trim().toUpperCase();
+  if (!normalizedAsin) return;
+  const data = await api("/api/factory-inventory/products", {
+    method: "POST",
+    body: { asin: normalizedAsin }
+  });
+  applyFactoryInventoryData(data);
+  $("#sandboxStatus").textContent = `已增加 ASIN ${normalizedAsin}`;
+}
+
+async function deleteFactoryProduct(productId) {
+  const product = factoryProducts.find(item => item.id === productId);
+  if (!product) return;
+  const label = product.asin || product.name || "这个 ASIN";
+  if (!confirm(`确定删除 ${label} 吗？这个 ASIN 的工厂库存流水也会一起删除。`)) return;
+  const data = await api(`/api/factory-inventory/products/${encodeURIComponent(productId)}`, {
+    method: "DELETE"
+  });
+  applyFactoryInventoryData(data);
+  $("#sandboxStatus").textContent = `已删除 ${label}`;
+}
+
+async function addFactoryDraftRow() {
+  const operationInput = $("[data-draft-operation]");
+  const dateInput = $("[data-draft-date]");
+  const operation = String(operationInput?.value || "").trim();
+  const date = String(dateInput?.value || "").trim();
+  const quantities = {};
+  document.querySelectorAll("[data-draft-product-id]").forEach(input => {
+    const value = Number(input.value || 0);
+    if (value) quantities[input.dataset.draftProductId] = value;
+  });
+  if (!operation) {
+    alert("请先填写操作，例如：补货、发货、进货 001。");
+    operationInput?.focus();
+    return;
+  }
+  if (!date) {
+    alert("请先选择日期。");
+    dateInput?.focus();
+    return;
+  }
+  if (!Object.keys(quantities).length) {
+    alert("请至少填写一个 ASIN 的数量。补货填正数，发货填负数。");
+    return;
+  }
+  const data = await api("/api/factory-inventory/movement-rows", {
+    method: "POST",
+    body: { operation, date, quantities }
+  });
+  applyFactoryInventoryData(data);
+  $("#sandboxStatus").textContent = `已添加 ${date} ${operation}`;
+}
+
+async function deleteFactoryMovementRow(operation, date) {
+  const label = `${date || "-"} ${operation || "库存变动"}`;
+  if (!confirm(`确定删除 ${label} 这一行吗？库存数量会自动回退。`)) return;
+  const data = await api("/api/factory-inventory/movement-rows", {
+    method: "DELETE",
+    body: { operation, date }
+  });
+  applyFactoryInventoryData(data);
+  $("#sandboxStatus").textContent = `已删除 ${label}`;
+}
+
+async function openFactoryMovementModal() {
+  if (!factoryLoaded) {
+    try {
+      await loadFactoryInventory();
+    } catch (error) {
+      alert(`工厂库存读取失败：${error.message}`);
+      return;
+    }
+  }
+  if (!factoryProducts.length) {
+    alert("暂无工厂库存商品。请先同步 FBA 库存商品，或确认 CSV 数据已经导入。");
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const options = factoryProducts
+    .map(product => `<option value="${escapeHtml(product.id)}">${escapeHtml(product.name)}${product.asin ? ` / ${escapeHtml(product.asin)}` : ""}</option>`)
+    .join("");
+  const modal = createModal("补货 / 发货", `
+    <div class="modal-body">
+      <label>
+        商品
+        <select id="factoryMovementProduct">${options}</select>
+      </label>
+      <label>
+        类型
+        <select id="factoryMovementType">
+          <option value="inbound">补货入库</option>
+          <option value="outbound">发货出库</option>
+          <option value="adjustment">库存调整</option>
+        </select>
+      </label>
+      <label>
+        日期
+        <input id="factoryMovementDate" type="date" value="${today}">
+      </label>
+      <label>
+        数量
+        <input id="factoryMovementQuantity" type="number" step="1" placeholder="正数；调整可填负数">
+      </label>
+      <label>
+        备注
+        <textarea id="factoryMovementNote" placeholder="例如：发往 FBA、工厂补货、盘点校准"></textarea>
+      </label>
+      <div class="fba-modal-actions">
+        <button type="button" class="secondary-button" data-close-modal>取消</button>
+        <button type="button" id="factoryMovementSaveBtn">保存</button>
+      </div>
+    </div>
+  `);
+  modal.querySelector("#factoryMovementSaveBtn").addEventListener("click", async () => {
+    const button = modal.querySelector("#factoryMovementSaveBtn");
+    setBusy(button, true, "保存");
+    try {
+      const data = await api("/api/factory-inventory/movements", {
+        method: "POST",
+        body: {
+          productId: modal.querySelector("#factoryMovementProduct").value,
+          type: modal.querySelector("#factoryMovementType").value,
+          date: modal.querySelector("#factoryMovementDate").value,
+          quantity: Number(modal.querySelector("#factoryMovementQuantity").value || 0),
+          note: modal.querySelector("#factoryMovementNote").value
+        }
+      });
+      factoryProducts = data.products || [];
+      factoryMovements = data.movements || [];
+      factoryTotals = data.totals || {};
+      renderFactoryInventory();
+      $("#sandboxStatus").textContent = "工厂库存已更新";
+      closeModal(modal);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setBusy(button, false, "保存");
+    }
+  });
+}
+
 function shiftMonth(monthValue, amount) {
   const [year, month] = String(monthValue).split("-").map(Number);
   return new Date(Date.UTC(year, month - 1 + amount, 1)).toISOString().slice(0, 7);
@@ -1719,6 +2084,9 @@ async function refreshWorkspace({ syncMail = true } = {}) {
   await loadSandboxStatus();
   await loadGmailStatus();
   await loadRequests();
+  await loadFactoryInventory().catch(error => {
+    $("#sandboxStatus").textContent = `工厂库存读取失败：${error.message}`;
+  });
   if (syncMail) {
     await syncGmailStatuses();
     await renderMailPanel();
@@ -1802,6 +2170,79 @@ $("#queryProductsBtn").addEventListener("click", () => queryProducts().catch(err
 $("#syncProductsBtn").addEventListener("click", () => syncSandboxProducts().catch(error => alert(error.message)));
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
+$("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(error => alert(error.message)));
+$("#factoryMovementBtn").addEventListener("click", () => openFactoryMovementModal().catch(error => alert(error.message)));
+$("#factoryRefreshBtn").addEventListener("click", () => loadFactoryInventory().catch(error => alert(error.message)));
+$("#factorySearch").addEventListener("input", renderFactoryInventory);
+$("#factoryStockFilter").addEventListener("change", renderFactoryInventory);
+$("#factoryMatrixBody").addEventListener("click", event => {
+  const deleteProductButton = event.target?.closest?.("[data-delete-product-id]");
+  if (deleteProductButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    deleteFactoryProduct(deleteProductButton.dataset.deleteProductId).catch(error => alert(error.message));
+    return;
+  }
+  const addRowButton = event.target?.closest?.("[data-add-factory-row]");
+  if (addRowButton) {
+    event.preventDefault();
+    addFactoryDraftRow().catch(error => alert(error.message));
+    return;
+  }
+  const deleteRowButton = event.target?.closest?.("[data-delete-row-operation]");
+  if (deleteRowButton) {
+    event.preventDefault();
+    deleteFactoryMovementRow(deleteRowButton.dataset.deleteRowOperation, deleteRowButton.dataset.deleteRowDate).catch(error => alert(error.message));
+  }
+});
+$("#factoryMatrixBody").addEventListener("change", event => {
+  const input = event.target?.closest?.("[data-factory-field]");
+  if (input) saveFactoryProductField(input);
+});
+$("#factoryMatrixBody").addEventListener("keydown", event => {
+  if (event.key === "Enter" && event.target?.closest?.(".factory-draft-row")) {
+    event.preventDefault();
+    addFactoryDraftRow().catch(error => alert(error.message));
+    return;
+  }
+  const input = event.target?.closest?.("[data-factory-field]");
+  if (!input || event.key !== "Enter") return;
+  event.preventDefault();
+  input.blur();
+});
+$("#factoryMatrixBody").addEventListener("dragstart", event => {
+  if (event.target?.closest?.("button, input")) {
+    event.preventDefault();
+    return;
+  }
+  const cell = event.target?.closest?.(".factory-draggable[data-product-id]");
+  if (!cell) return;
+  factoryDraggedProductId = cell.dataset.productId || "";
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", factoryDraggedProductId);
+  cell.classList.add("dragging");
+});
+$("#factoryMatrixBody").addEventListener("dragend", event => {
+  event.target?.closest?.(".factory-draggable")?.classList.remove("dragging");
+  document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
+  factoryDraggedProductId = "";
+});
+$("#factoryMatrixBody").addEventListener("dragover", event => {
+  const cell = event.target?.closest?.(".factory-draggable[data-product-id]");
+  if (!cell || !factoryDraggedProductId) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
+  cell.classList.add("factory-drag-over");
+});
+$("#factoryMatrixBody").addEventListener("drop", event => {
+  const cell = event.target?.closest?.(".factory-draggable[data-product-id]");
+  if (!cell) return;
+  event.preventDefault();
+  const targetProductId = cell.dataset.productId || "";
+  document.querySelectorAll(".factory-drag-over").forEach(node => node.classList.remove("factory-drag-over"));
+  moveFactoryProductColumn(targetProductId);
+});
 $("#productSearch").addEventListener("input", renderProducts);
 $("#productSourceFilter").addEventListener("change", renderProducts);
 $("#salesDateRange").addEventListener("click", () => openDatePicker());
@@ -1880,6 +2321,9 @@ $("#globalSearch").addEventListener("input", () => {
     document.querySelectorAll(".ads-profile-card").forEach(card => {
       card.hidden = needle && !card.textContent.toLowerCase().includes(needle);
     });
+  } else if (activeModule === "inventory") {
+    $("#factorySearch").value = value;
+    renderFactoryInventory();
   }
 });
 document.querySelectorAll(".module-tab").forEach(tab => {
