@@ -154,6 +154,23 @@ function getFbaColumnWidth(column) {
   return Number.isFinite(value) && value > 0 ? Math.max(72, value) : getDefaultFbaColumnWidth(column);
 }
 
+function normalizeFbaProductRows(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter(row => row && typeof row === "object")
+    .map(row => ({
+      ...row,
+      asin: row.asin || "",
+      parentAsin: row.parentAsin || "",
+      sellerSku: row.sellerSku || "",
+      fnSku: row.fnSku || "",
+      title: row.title || "",
+      brand: row.brand || "",
+      factoryName: row.factoryName || "",
+      stockLevel: row.stockLevel || "unknown",
+      factoryFbaStockLevel: row.factoryFbaStockLevel || "unknown"
+    }));
+}
+
 function renderFbaColumnWidths(visibleColumns = getVisibleFbaColumns()) {
   const colgroup = $("#fbaTableColumns");
   const table = colgroup?.closest("table");
@@ -1319,6 +1336,7 @@ function renderMailMessages(messages) {
 }
 
 function productMatches(product) {
+  if (!product || typeof product !== "object") return false;
   const keyword = ($("#productSearch")?.value || $("#globalSearch")?.value || "").trim().toLowerCase();
   const source = $("#productSourceFilter")?.value || "";
   if (source && product.stockLevel !== source) return false;
@@ -2653,7 +2671,7 @@ async function loadProducts({ mode = "" } = {}) {
   const params = new URLSearchParams({ startDate, endDate });
   if (mode) params.set("mode", mode);
   const data = await api(`/api/fba/inventory?${params.toString()}`);
-  products = data.rows || [];
+  products = normalizeFbaProductRows(data.rows);
   productsLoaded = true;
   window.fbaInventoryMeta = {
     totals: data.totals || {},

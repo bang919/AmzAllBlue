@@ -337,9 +337,11 @@ function rowHasFbaMetadata(row) {
 }
 
 function mergeSkuDisplayMetadata(primary = {}, fallback = {}) {
+  const primarySource = primary && typeof primary === "object" ? primary : {};
+  const fallbackSource = fallback && typeof fallback === "object" ? fallback : {};
   const result = {};
   for (const field of ["asin", "parentAsin", "fnSku", "title", "brand", "imageUrl", "condition"]) {
-    result[field] = primary[field] || fallback[field] || "";
+    result[field] = primarySource[field] || fallbackSource[field] || "";
   }
   return result;
 }
@@ -1084,23 +1086,24 @@ function normalizeProduct(input) {
 }
 
 function normalizeFactoryProduct(input) {
-  const asin = String(input.asin || "").trim().toUpperCase();
-  const name = String(input.name || input.title || "").trim();
+  const source = input && typeof input === "object" ? input : {};
+  const asin = String(source.asin || "").trim().toUpperCase();
+  const name = String(source.name || source.title || "").trim();
   return {
-    id: String(input.id || asin || name || randomUUID()).trim(),
+    id: String(source.id || asin || name || randomUUID()).trim(),
     name,
     asin,
-    parentAsin: String(input.parentAsin || input.parent_asin || "").trim().toUpperCase(),
-    boxSpec: String(input.boxSpec || "").trim(),
-    unitCost: input.unitCost === "" || input.unitCost === undefined ? "" : Number(input.unitCost || 0),
-    currentQuantity: Number(input.currentQuantity || 0),
-    inventoryValue: input.inventoryValue === "" || input.inventoryValue === undefined ? "" : Number(input.inventoryValue || 0),
-    safetyStock: Number(input.safetyStock || 50),
-    note: String(input.note || "").trim(),
-    source: String(input.source || "manual").trim(),
-    order: Number(input.order || 0),
-    createdAt: input.createdAt || new Date().toISOString(),
-    updatedAt: input.updatedAt || new Date().toISOString()
+    parentAsin: String(source.parentAsin || source.parent_asin || "").trim().toUpperCase(),
+    boxSpec: String(source.boxSpec || "").trim(),
+    unitCost: source.unitCost === "" || source.unitCost === undefined ? "" : Number(source.unitCost || 0),
+    currentQuantity: Number(source.currentQuantity || 0),
+    inventoryValue: source.inventoryValue === "" || source.inventoryValue === undefined ? "" : Number(source.inventoryValue || 0),
+    safetyStock: Number(source.safetyStock || 50),
+    note: String(source.note || "").trim(),
+    source: String(source.source || "manual").trim(),
+    order: Number(source.order || 0),
+    createdAt: source.createdAt || new Date().toISOString(),
+    updatedAt: source.updatedAt || new Date().toISOString()
   };
 }
 
@@ -1126,16 +1129,17 @@ function updateFactoryProduct(input, patch) {
 }
 
 function normalizeFactoryMovement(input) {
+  const source = input && typeof input === "object" ? input : {};
   return {
-    id: String(input.id || randomUUID()).trim(),
-    productId: String(input.productId || "").trim(),
-    date: String(input.date || new Date().toISOString().slice(0, 10)).slice(0, 10),
-    type: String(input.type || "adjustment").trim(),
-    quantity: Number(input.quantity || 0),
-    note: String(input.note || "").trim(),
-    operator: String(input.operator || "").trim(),
-    source: String(input.source || "manual").trim(),
-    createdAt: input.createdAt || new Date().toISOString()
+    id: String(source.id || randomUUID()).trim(),
+    productId: String(source.productId || "").trim(),
+    date: String(source.date || new Date().toISOString().slice(0, 10)).slice(0, 10),
+    type: String(source.type || "adjustment").trim(),
+    quantity: Number(source.quantity || 0),
+    note: String(source.note || "").trim(),
+    operator: String(source.operator || "").trim(),
+    source: String(source.source || "manual").trim(),
+    createdAt: source.createdAt || new Date().toISOString()
   };
 }
 
