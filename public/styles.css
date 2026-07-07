@@ -1248,6 +1248,18 @@ h2 {
   text-align: center;
 }
 
+.fba-plan-quantity-input {
+  width: 68px;
+  height: 28px;
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+  text-align: center;
+}
+
 .fba-plan-formula {
   display: flex;
   align-items: center;
@@ -1272,7 +1284,9 @@ h2 {
 }
 
 .fba-col-replenishmentShippingQty .fba-plan-mini-input,
-.fba-col-replenishmentReplenishQty .fba-plan-mini-input {
+.fba-col-replenishmentReplenishQty .fba-plan-mini-input,
+.fba-col-replenishmentShippingQty .fba-plan-quantity-input,
+.fba-col-replenishmentReplenishQty .fba-plan-quantity-input {
   flex: 0 0 auto;
   margin: 0;
 }

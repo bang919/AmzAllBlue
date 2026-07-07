@@ -163,6 +163,15 @@ function renderFbaColumnWidths(visibleColumns = getVisibleFbaColumns()) {
     `<col data-fba-col="${escapeHtml(column.key)}" style="width:${widths[index]}px">`
   ).join("");
   table.style.width = `${widths.reduce((sum, width) => sum + width, 0)}px`;
+  const stickyKeys = new Set(fbaReplenishmentOpen
+    ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "asinSku", "fnSku"]
+    : ["image", "asinSku", "fnSku"]);
+  let stickyLeft = 0;
+  visibleColumns.forEach((column, index) => {
+    if (!stickyKeys.has(column.key)) return;
+    table.style.setProperty(`--fba-left-${column.key}`, `${stickyLeft}px`);
+    stickyLeft += widths[index];
+  });
 }
 
 function getProductTotalGoods(product) {
@@ -242,6 +251,12 @@ function roundUpToBox(quantity, boxQuantity) {
   return Math.ceil(Math.max(0, Number(quantity || 0)) / box) * box;
 }
 
+function formatPlanInputValue(value, digits = 2) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number)) return "";
+  return String(Number(number.toFixed(digits)));
+}
+
 function getDefaultFbaReplenishmentGrade(product) {
   const totalQuantity = product.factoryFbaTotalQuantity;
   const dailySales = Number(product.dailySales || 0);
@@ -289,10 +304,16 @@ function calculateFbaReplenishmentPlan(product) {
   const shippingRaw = Math.max(0, target.shippingDays - effectiveFbaCoverageDays) * dailySales;
   const calculatedShippingQuantity = Math.min(roundUpToBox(shippingRaw, boxQuantity), factoryQuantity);
   const calculatedShippingBoxes = boxQuantity > 0 ? Math.ceil(Number(calculatedShippingQuantity || 0) / boxQuantity) : 0;
-  const shippingBoxes = Number.isFinite(Number(override.shippingBoxes)) && Number(override.shippingBoxes) >= 0
-    ? Number(override.shippingBoxes)
-    : calculatedShippingBoxes;
-  const shippingQuantity = Math.min(shippingBoxes * boxQuantity, factoryQuantity);
+  const hasShippingQuantityOverride = Number.isFinite(Number(override.shippingQuantity)) && Number(override.shippingQuantity) >= 0;
+  const shippingQuantityOverride = hasShippingQuantityOverride ? Number(override.shippingQuantity) : null;
+  const shippingBoxes = hasShippingQuantityOverride && boxQuantity > 0
+    ? shippingQuantityOverride / boxQuantity
+    : (Number.isFinite(Number(override.shippingBoxes)) && Number(override.shippingBoxes) >= 0
+      ? Number(override.shippingBoxes)
+      : calculatedShippingBoxes);
+  const shippingQuantity = hasShippingQuantityOverride
+    ? Math.min(shippingQuantityOverride, factoryQuantity)
+    : Math.min(shippingBoxes * boxQuantity, factoryQuantity);
   const factoryAfterShipping = Math.max(0, factoryQuantity - Number(shippingQuantity || 0));
   const totalCoverageQuantity = Number(fbaTotal || 0) + factoryAfterShipping;
   const totalCoverageDays = dailySales > 0 ? totalCoverageQuantity / dailySales : 0;
@@ -300,10 +321,16 @@ function calculateFbaReplenishmentPlan(product) {
   const replenishmentRaw = Math.max(0, target.replenishmentDays - effectiveTotalCoverageDays) * dailySales;
   const calculatedReplenishmentQuantity = roundUpToBox(replenishmentRaw, boxQuantity);
   const calculatedReplenishmentBoxes = boxQuantity > 0 ? Math.ceil(Number(calculatedReplenishmentQuantity || 0) / boxQuantity) : 0;
-  const replenishmentBoxes = Number.isFinite(Number(override.replenishmentBoxes)) && Number(override.replenishmentBoxes) >= 0
-    ? Number(override.replenishmentBoxes)
-    : calculatedReplenishmentBoxes;
-  const replenishmentQuantity = replenishmentBoxes * boxQuantity;
+  const hasReplenishmentQuantityOverride = Number.isFinite(Number(override.replenishmentQuantity)) && Number(override.replenishmentQuantity) >= 0;
+  const replenishmentQuantityOverride = hasReplenishmentQuantityOverride ? Number(override.replenishmentQuantity) : null;
+  const replenishmentBoxes = hasReplenishmentQuantityOverride && boxQuantity > 0
+    ? replenishmentQuantityOverride / boxQuantity
+    : (Number.isFinite(Number(override.replenishmentBoxes)) && Number(override.replenishmentBoxes) >= 0
+      ? Number(override.replenishmentBoxes)
+      : calculatedReplenishmentBoxes);
+  const replenishmentQuantity = hasReplenishmentQuantityOverride
+    ? replenishmentQuantityOverride
+    : replenishmentBoxes * boxQuantity;
   return {
     grade,
     target,
@@ -359,7 +386,8 @@ function renderFbaPlanQuantityCell(product, type) {
   const isShipping = type === "shipping";
   const boxes = isShipping ? plan.shippingBoxes : plan.replenishmentBoxes;
   const quantity = isShipping ? plan.shippingQuantity : plan.replenishmentQuantity;
-  const field = isShipping ? "shippingBoxes" : "replenishmentBoxes";
+  const boxesField = isShipping ? "shippingBoxes" : "replenishmentBoxes";
+  const quantityField = isShipping ? "shippingQuantity" : "replenishmentQuantity";
   const factoryQuantity = Number(product.factoryQuantity ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
   const factoryBoxesAfterReplenishment = plan.boxQuantity > 0
     ? (factoryQuantity + Number(plan.replenishmentQuantity || 0)) / plan.boxQuantity
@@ -370,8 +398,9 @@ function renderFbaPlanQuantityCell(product, type) {
   return `
     <div class="fba-plan-cell ${warning ? "has-warning" : ""}">
       <div class="fba-plan-formula">
-        <input class="fba-plan-mini-input ${warning ? "fba-plan-input-warning" : ""}" data-fba-plan-field="${field}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="1" min="0" value="${escapeHtml(boxes)}">
-        <span>箱 x ${formatNumber(plan.boxQuantity)} = ${formatNumber(quantity)}</span>
+        <input class="fba-plan-mini-input ${warning ? "fba-plan-input-warning" : ""}" data-fba-plan-field="${boxesField}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="0.01" min="0" value="${escapeHtml(formatPlanInputValue(boxes, 2))}">
+        <span>箱 x ${formatNumber(plan.boxQuantity)} =</span>
+        <input class="fba-plan-quantity-input" data-fba-plan-field="${quantityField}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="1" min="0" value="${escapeHtml(formatPlanInputValue(quantity, 0))}">
       </div>
       ${warning ? `<div class="fba-plan-warning">${escapeHtml(warning)}</div>` : ""}
     </div>
@@ -1622,7 +1651,7 @@ function renderProducts() {
   let stickyLeft = 0;
   for (const column of visibleColumns) {
     if (stickyKeys.has(column.key)) {
-      stickyOffsets.push(stickyLeft);
+      stickyOffsets.push(column.key);
       stickyLeft += getFbaColumnWidth(column);
     } else {
       stickyOffsets.push(null);
@@ -1630,7 +1659,7 @@ function renderProducts() {
   }
   const cellAttrs = (column, index, tag = "td") => {
     const isSticky = stickyOffsets[index] !== null;
-    const style = isSticky ? ` style="left:${stickyOffsets[index]}px"` : "";
+    const style = isSticky ? ` style="left:var(--fba-left-${escapeHtml(stickyOffsets[index])}, 0px)"` : "";
     const className = `${isSticky ? "fba-sticky-col " : ""}fba-col-${escapeHtml(column.key)}`;
     return { className, style };
   };
@@ -2020,6 +2049,26 @@ async function saveFbaPlanField(input) {
       product.factoryProductId = factoryProductId;
       product.factoryBoxSpec = String(value || 1);
     }
+    renderProducts();
+    return;
+  }
+  if (field === "shippingBoxes") {
+    updateFbaReplenishmentOverride(product, { shippingBoxes: value, shippingQuantity: undefined });
+    renderProducts();
+    return;
+  }
+  if (field === "replenishmentBoxes") {
+    updateFbaReplenishmentOverride(product, { replenishmentBoxes: value, replenishmentQuantity: undefined });
+    renderProducts();
+    return;
+  }
+  if (field === "shippingQuantity") {
+    updateFbaReplenishmentOverride(product, { shippingQuantity: value, shippingBoxes: undefined });
+    renderProducts();
+    return;
+  }
+  if (field === "replenishmentQuantity") {
+    updateFbaReplenishmentOverride(product, { replenishmentQuantity: value, replenishmentBoxes: undefined });
     renderProducts();
     return;
   }
