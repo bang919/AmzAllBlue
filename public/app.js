@@ -56,6 +56,8 @@ const FBA_COLUMNS_KEY = "amazonAggregator.fbaColumns.v1";
 const FBA_SORT_KEY = "amazonAggregator.fbaSort.v1";
 const FBA_FILTERS_KEY = "amazonAggregator.fbaFilters.v1";
 const FBA_COLUMN_WIDTHS_KEY = "amazonAggregator.fbaColumnWidths.v1";
+const FBA_REPLENISHMENT_OVERRIDES_KEY = "amazonAggregator.fbaReplenishment.overrides.v1";
+const FBA_REPLENISHMENT_MULTIPLIER_KEY = "amazonAggregator.fbaReplenishment.multiplier.v1";
 const fbaDateStatus = new Map();
 let dateRangePickerOpen = false;
 let datePickerMonth = "";
@@ -64,13 +66,56 @@ let fbaSort = { key: "totalGoodsQuantity", direction: "desc" };
 let fbaColumnFilters = {};
 let fbaColumnWidths = {};
 let fbaColumnResizeState = null;
+let fbaReplenishmentOpen = false;
+let fbaReplenishmentMultiplier = Number(localStorage.getItem(FBA_REPLENISHMENT_MULTIPLIER_KEY) || 1.2);
+if (!Number.isFinite(fbaReplenishmentMultiplier) || fbaReplenishmentMultiplier <= 0) fbaReplenishmentMultiplier = 1.2;
+let fbaReplenishmentOverrides = {};
+try {
+  fbaReplenishmentOverrides = JSON.parse(localStorage.getItem(FBA_REPLENISHMENT_OVERRIDES_KEY) || "{}") || {};
+} catch {
+  fbaReplenishmentOverrides = {};
+}
+
+const fbaReplenishmentTargets = {
+  normal: { label: "普通", shippingDays: 70, replenishmentDays: 90 },
+  promoted: { label: "主推", shippingDays: 100, replenishmentDays: 120 },
+  featured: { label: "特推", shippingDays: 115, replenishmentDays: 135 },
+  abandoned: { label: "放弃", abandoned: true }
+};
+
+const fbaDefaultGradeByAsin = {
+  B0B37GZ7MM: "featured",
+  B0B5MS2LJ9: "featured",
+  B0B6SHZ4CV: "featured",
+  B0C3BHF49B: "featured",
+  B0CMPF28T2: "featured",
+  B0B6RV2HD9: "promoted",
+  B0B75LSCFR: "promoted",
+  B0B75M5VCN: "promoted",
+  B0BHNVRLBP: "promoted",
+  B0CDVH9YS6: "promoted",
+  B0CDVHSF26: "promoted",
+  B0CMPCDX16: "promoted",
+  B0CMPFJ3JW: "promoted",
+  B0DFZ1FDGD: "promoted",
+  B0GS6Y7LDG: "featured"
+};
+
+const fbaReplenishmentColumns = [
+  { key: "replenishmentGrade", label: "商品等级", type: "static", render: product => renderFbaGradeCell(product) },
+  { key: "replenishmentDailySales", label: "日销量", type: "number", render: product => renderFbaDailySalesCell(product) },
+  { key: "replenishmentBoxQty", label: "每箱数量", type: "number", render: product => renderFbaBoxQuantityCell(product) },
+  { key: "replenishmentShippingQty", label: "发货数", type: "number", render: product => renderFbaPlanQuantityCell(product, "shipping") },
+  { key: "replenishmentReplenishQty", label: "补货数", type: "number", render: product => renderFbaPlanQuantityCell(product, "replenishment") }
+];
 
 const fbaColumns = [
   { key: "image", label: "图片", type: "static", always: true, render: product => product.imageUrl ? `<img class="fba-thumb" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title || product.asin)}">` : `<div class="fba-thumb placeholder">无图</div>` },
   { key: "asinSku", label: "ASIN/MSKU", type: "text", always: true, value: product => `${product.asin || ""} ${product.sellerSku || ""}`, render: product => `<a href="https://www.amazon.com/dp/${escapeHtml(product.asin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.asin || "-")}</a><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "parentAsin", label: "父ASIN", type: "text", value: product => product.parentAsin || "", render: product => product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-" },
   { key: "fnSku", label: "FNSKU/SKU", type: "text", value: product => `${product.fnSku || ""} ${product.sellerSku || ""}`, render: product => `<strong>${escapeHtml(product.fnSku || "-")}</strong><span>${escapeHtml(product.sellerSku || "-")}</span>` },
-  { key: "title", label: "品名", type: "text", value: product => `${product.title || ""} ${product.brand || ""} ${product.condition || ""}`, render: product => `${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span>` },
+  { key: "title", label: "标题", type: "text", value: product => `${product.title || ""} ${product.brand || ""} ${product.condition || ""}`, render: product => `${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span>` },
+  { key: "factoryName", label: "内部名", type: "text", value: product => product.factoryName || getFactoryProductForFbaProduct(product)?.name || "", render: product => escapeHtml(product.factoryName || getFactoryProductForFbaProduct(product)?.name || "-") },
   { key: "factoryFbaTotalQuantity", label: "工厂+FBA\n总库存", type: "number", value: product => product.factoryFbaTotalQuantity, render: product => formatInventoryNumber(product.factoryFbaTotalQuantity) },
   { key: "factoryQuantity", label: "工厂总库存", type: "number", value: product => product.factoryQuantity, render: product => formatInventoryNumber(product.factoryQuantity) },
   { key: "totalGoodsQuantity", label: "FBA总库存", type: "number", value: product => getProductTotalGoods(product), render: product => formatInventoryNumber(getProductTotalGoods(product)) },
@@ -90,11 +135,16 @@ const fbaColumns = [
 ];
 
 function getDefaultFbaColumnWidth(column) {
+  if (column.key === "replenishmentGrade") return 156;
+  if (column.key === "replenishmentDailySales") return 210;
+  if (column.key === "replenishmentBoxQty") return 94;
+  if (column.key === "replenishmentShippingQty" || column.key === "replenishmentReplenishQty") return 170;
   if (column.key === "image") return 86;
   if (column.key === "asinSku") return 156;
   if (column.key === "parentAsin") return 126;
   if (column.key === "fnSku") return 150;
   if (column.key === "title") return 360;
+  if (column.key === "factoryName") return 180;
   if (column.type === "number") return 112;
   return 130;
 }
@@ -150,6 +200,184 @@ function getProductInboundQuantity(product) {
   return values.reduce((sum, value) => sum + Number(value || 0), 0);
 }
 
+function getFbaReplenishmentKey(product) {
+  return String(product.sellerSku || product.asin || "").trim();
+}
+
+function saveFbaReplenishmentSettings() {
+  localStorage.setItem(FBA_REPLENISHMENT_MULTIPLIER_KEY, String(fbaReplenishmentMultiplier));
+  localStorage.setItem(FBA_REPLENISHMENT_OVERRIDES_KEY, JSON.stringify(fbaReplenishmentOverrides));
+}
+
+function getFbaReplenishmentOverride(product) {
+  const key = getFbaReplenishmentKey(product);
+  return key ? (fbaReplenishmentOverrides[key] || {}) : {};
+}
+
+function getFactoryProductForFbaProduct(product) {
+  const asin = String(product?.asin || "").trim().toUpperCase();
+  if (!asin) return null;
+  return factoryProducts.find(item => String(item.asin || "").trim().toUpperCase() === asin) || null;
+}
+
+function updateFbaReplenishmentOverride(product, patch) {
+  const key = getFbaReplenishmentKey(product);
+  if (!key) return;
+  fbaReplenishmentOverrides[key] = { ...(fbaReplenishmentOverrides[key] || {}), ...patch };
+  saveFbaReplenishmentSettings();
+}
+
+function parseBoxQuantity(value) {
+  const text = String(value || "").trim();
+  const slashMatch = text.match(/\/\s*(\d+(?:\.\d+)?)\s*个/);
+  const unitMatches = [...text.matchAll(/(\d+(?:\.\d+)?)\s*个/g)];
+  const match = slashMatch || (unitMatches.length ? unitMatches[unitMatches.length - 1] : null) || text.match(/\d+(?:\.\d+)?/);
+  const parsed = match ? Number(match[1] || match[0]) : Number(value || 0);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function roundUpToBox(quantity, boxQuantity) {
+  const box = Number(boxQuantity || 0);
+  if (!box || box <= 0) return Math.ceil(Number(quantity || 0));
+  return Math.ceil(Math.max(0, Number(quantity || 0)) / box) * box;
+}
+
+function getDefaultFbaReplenishmentGrade(product) {
+  const totalQuantity = product.factoryFbaTotalQuantity;
+  const dailySales = Number(product.dailySales || 0);
+  if (totalQuantity !== null && totalQuantity !== undefined && Number(totalQuantity || 0) === 0 && dailySales === 0) {
+    return "abandoned";
+  }
+  return fbaDefaultGradeByAsin[String(product.asin || "").trim().toUpperCase()] || "normal";
+}
+
+function calculateFbaReplenishmentPlan(product) {
+  const override = getFbaReplenishmentOverride(product);
+  const defaultGrade = getDefaultFbaReplenishmentGrade(product);
+  const grade = fbaReplenishmentTargets[override.grade] ? override.grade : defaultGrade;
+  const target = fbaReplenishmentTargets[grade];
+  const baseDailySales = Number(product.replenishmentSales?.baseDailySales || product.dailySales || 0);
+  const multiplier = Number(fbaReplenishmentMultiplier || 1.2);
+  const calculatedDailySales = Number((baseDailySales * multiplier).toFixed(2));
+  const dailySales = Number.isFinite(Number(override.dailySales)) && Number(override.dailySales) >= 0
+    ? Number(override.dailySales)
+    : calculatedDailySales;
+  const boxQuantity = Number.isFinite(Number(override.boxQuantity)) && Number(override.boxQuantity) > 0
+    ? Number(override.boxQuantity)
+    : parseBoxQuantity(product.factoryBoxSpec || getFactoryProductForFbaProduct(product)?.boxSpec);
+  if (target?.abandoned) {
+    return {
+      grade,
+      target,
+      baseDailySales,
+      multiplier,
+      calculatedDailySales,
+      dailySales,
+      boxQuantity,
+      fbaCoverageDays: 0,
+      totalCoverageDays: 0,
+      shippingQuantity: 0,
+      shippingBoxes: 0,
+      replenishmentQuantity: 0,
+      replenishmentBoxes: 0
+    };
+  }
+  const fbaTotal = getProductTotalGoods(product);
+  const factoryQuantity = Number(product.factoryQuantity ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
+  const fbaCoverageDays = dailySales > 0 && fbaTotal !== null ? Number(fbaTotal || 0) / dailySales : 0;
+  const effectiveFbaCoverageDays = Math.max(fbaCoverageDays, 30);
+  const shippingRaw = Math.max(0, target.shippingDays - effectiveFbaCoverageDays) * dailySales;
+  const calculatedShippingQuantity = Math.min(roundUpToBox(shippingRaw, boxQuantity), factoryQuantity);
+  const calculatedShippingBoxes = boxQuantity > 0 ? Math.ceil(Number(calculatedShippingQuantity || 0) / boxQuantity) : 0;
+  const shippingBoxes = Number.isFinite(Number(override.shippingBoxes)) && Number(override.shippingBoxes) >= 0
+    ? Number(override.shippingBoxes)
+    : calculatedShippingBoxes;
+  const shippingQuantity = Math.min(shippingBoxes * boxQuantity, factoryQuantity);
+  const factoryAfterShipping = Math.max(0, factoryQuantity - Number(shippingQuantity || 0));
+  const totalCoverageQuantity = Number(fbaTotal || 0) + factoryAfterShipping;
+  const totalCoverageDays = dailySales > 0 ? totalCoverageQuantity / dailySales : 0;
+  const effectiveTotalCoverageDays = Math.max(totalCoverageDays, 60);
+  const replenishmentRaw = Math.max(0, target.replenishmentDays - effectiveTotalCoverageDays) * dailySales;
+  const calculatedReplenishmentQuantity = roundUpToBox(replenishmentRaw, boxQuantity);
+  const calculatedReplenishmentBoxes = boxQuantity > 0 ? Math.ceil(Number(calculatedReplenishmentQuantity || 0) / boxQuantity) : 0;
+  const replenishmentBoxes = Number.isFinite(Number(override.replenishmentBoxes)) && Number(override.replenishmentBoxes) >= 0
+    ? Number(override.replenishmentBoxes)
+    : calculatedReplenishmentBoxes;
+  const replenishmentQuantity = replenishmentBoxes * boxQuantity;
+  return {
+    grade,
+    target,
+    baseDailySales,
+    multiplier,
+    calculatedDailySales,
+    dailySales,
+    boxQuantity,
+    fbaCoverageDays,
+    totalCoverageDays,
+    shippingQuantity,
+    shippingBoxes,
+    replenishmentQuantity,
+    replenishmentBoxes
+  };
+}
+
+function renderFbaGradeCell(product) {
+  const plan = calculateFbaReplenishmentPlan(product);
+  const currentTarget = fbaReplenishmentTargets[plan.grade] || fbaReplenishmentTargets.normal;
+  return `
+    <div class="fba-grade-picker">
+      <button class="fba-grade-select fba-grade-select-${escapeHtml(plan.grade)}" type="button" data-fba-grade-toggle aria-haspopup="listbox" aria-expanded="false">
+        ${escapeHtml(currentTarget.label)}
+      </button>
+      <div class="fba-grade-menu" role="listbox">
+        ${Object.entries(fbaReplenishmentTargets).map(([key, target]) =>
+          `<button class="fba-grade-option fba-grade-option-${escapeHtml(key)} ${plan.grade === key ? "active" : ""}" type="button" role="option" aria-selected="${plan.grade === key ? "true" : "false"}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" data-fba-grade-option="${escapeHtml(key)}">${target.abandoned ? escapeHtml(target.label) : `${escapeHtml(target.label)} 发${formatNumber(target.shippingDays)}天 / 补${formatNumber(target.replenishmentDays)}天`}</button>`
+        ).join("")}
+      </div>
+    </div>
+  `;
+}
+
+function renderFbaDailySalesCell(product) {
+  const plan = calculateFbaReplenishmentPlan(product);
+  const sales = product.replenishmentSales || {};
+  return `
+    <div class="fba-plan-formula" title="7天 ${formatNumber(sales.sevenDailySales || 0, 2)}；30天 ${formatNumber(sales.thirtyDailySales || 0, 2)}；已排除断货日和最近2天">
+      <span>日均 ${formatNumber(plan.baseDailySales, 2)} x ${formatNumber(plan.multiplier, 2)} =</span>
+      <input class="fba-plan-mini-input" data-fba-plan-field="dailySales" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="0.01" min="0" value="${escapeHtml(plan.dailySales)}">
+    </div>
+  `;
+}
+
+function renderFbaBoxQuantityCell(product) {
+  const plan = calculateFbaReplenishmentPlan(product);
+  return `<input class="fba-plan-input" data-fba-plan-field="boxQuantity" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="1" min="1" value="${escapeHtml(plan.boxQuantity)}">`;
+}
+
+function renderFbaPlanQuantityCell(product, type) {
+  const plan = calculateFbaReplenishmentPlan(product);
+  const isShipping = type === "shipping";
+  const boxes = isShipping ? plan.shippingBoxes : plan.replenishmentBoxes;
+  const quantity = isShipping ? plan.shippingQuantity : plan.replenishmentQuantity;
+  const field = isShipping ? "shippingBoxes" : "replenishmentBoxes";
+  const factoryQuantity = Number(product.factoryQuantity ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
+  const factoryBoxesAfterReplenishment = plan.boxQuantity > 0
+    ? (factoryQuantity + Number(plan.replenishmentQuantity || 0)) / plan.boxQuantity
+    : 0;
+  const warning = isShipping
+    ? (boxes > 0 && boxes < 5 ? "发货不满5箱" : "")
+    : (factoryBoxesAfterReplenishment > 0 && factoryBoxesAfterReplenishment < 5 ? "补货后工厂库存不满5箱" : "");
+  return `
+    <div class="fba-plan-cell ${warning ? "has-warning" : ""}">
+      <div class="fba-plan-formula">
+        <input class="fba-plan-mini-input ${warning ? "fba-plan-input-warning" : ""}" data-fba-plan-field="${field}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="1" min="0" value="${escapeHtml(boxes)}">
+        <span>箱 x ${formatNumber(plan.boxQuantity)} = ${formatNumber(quantity)}</span>
+      </div>
+      ${warning ? `<div class="fba-plan-warning">${escapeHtml(warning)}</div>` : ""}
+    </div>
+  `;
+}
+
 function loadFbaTablePreferences() {
   const defaultColumns = fbaColumns.map(column => column.key);
   try {
@@ -162,6 +390,7 @@ function loadFbaTablePreferences() {
   fbaVisibleColumns.delete("lastUpdatedTime");
   fbaVisibleColumns.add("factoryFbaTotalQuantity");
   fbaVisibleColumns.add("factoryQuantity");
+  fbaVisibleColumns.add("factoryName");
   fbaVisibleColumns.add("totalGoodsQuantity");
   fbaVisibleColumns.add("inboundQuantity");
   fbaVisibleColumns.add("stockoutDays");
@@ -287,8 +516,9 @@ function productSourceLabel(source) {
 }
 
 function defaultDateRange() {
-  const end = new Date(Date.now() - 86400000);
+  const end = new Date(Date.now() - 2 * 86400000);
   const start = new Date(end);
+  start.setDate(start.getDate() - 29);
   return {
     startDate: start.toISOString().slice(0, 10),
     endDate: end.toISOString().slice(0, 10)
@@ -1046,12 +1276,20 @@ function productMatches(product) {
   const keyword = ($("#productSearch")?.value || $("#globalSearch")?.value || "").trim().toLowerCase();
   const source = $("#productSourceFilter")?.value || "";
   if (source && product.stockLevel !== source) return false;
+  const gradeFilter = fbaColumnFilters.replenishmentGrade || {};
+  const allGradeKeys = Object.keys(fbaReplenishmentTargets);
+  const selectedGradeKeys = Array.isArray(gradeFilter.values)
+    ? gradeFilter.values
+    : (gradeFilter.value ? [gradeFilter.value] : allGradeKeys);
+  if (selectedGradeKeys.length < allGradeKeys.length && !selectedGradeKeys.includes(calculateFbaReplenishmentPlan(product).grade)) return false;
   if (keyword && ![
     product.asin,
     product.parentAsin,
     product.sellerSku,
     product.fnSku,
     product.title,
+    product.factoryName,
+    getFactoryProductForFbaProduct(product)?.name,
     product.brand
   ].join(" ").toLowerCase().includes(keyword)) return false;
 
@@ -1074,7 +1312,15 @@ function productMatches(product) {
 }
 
 function getVisibleFbaColumns() {
-  return fbaColumns.filter(column => column.always || fbaVisibleColumns.has(column.key));
+  const selectedBaseColumns = fbaColumns.filter(column => column.always || fbaVisibleColumns.has(column.key));
+  const pinnedOrder = ["image", "asinSku", "fnSku"];
+  const baseColumns = [
+    ...pinnedOrder
+      .map(key => selectedBaseColumns.find(column => column.key === key))
+      .filter(Boolean),
+    ...selectedBaseColumns.filter(column => !pinnedOrder.includes(column.key))
+  ];
+  return fbaReplenishmentOpen ? [...fbaReplenishmentColumns, ...baseColumns] : baseColumns;
 }
 
 function compareFbaProducts(a, b) {
@@ -1158,7 +1404,7 @@ function startFbaColumnResize(event) {
   const handle = event.target?.closest?.("[data-fba-resize]");
   if (!handle) return;
   const key = handle.dataset.fbaResize;
-  const column = fbaColumns.find(item => item.key === key);
+  const column = [...fbaReplenishmentColumns, ...fbaColumns].find(item => item.key === key);
   if (!column) return;
   event.preventDefault();
   event.stopPropagation();
@@ -1188,6 +1434,9 @@ function stopFbaColumnResize() {
 function getActiveFbaFilterCount() {
   return Object.values(fbaColumnFilters).reduce((count, filter) => {
     if (!filter) return count;
+    if (Array.isArray(filter.values)) {
+      return count + (filter.values.length < Object.keys(fbaReplenishmentTargets).length ? 1 : 0);
+    }
     return count + (Object.values(filter).some(value => String(value ?? "").trim() !== "") ? 1 : 0);
   }, 0);
 }
@@ -1274,6 +1523,24 @@ function openFbaColumnSettingsModal() {
 }
 
 function openFbaFilterSettingsModal() {
+  const gradeFilter = fbaColumnFilters.replenishmentGrade || {};
+  const gradeKeys = Object.keys(fbaReplenishmentTargets);
+  const selectedGradeKeys = new Set(Array.isArray(gradeFilter.values)
+    ? gradeFilter.values
+    : (gradeFilter.value ? [gradeFilter.value] : gradeKeys));
+  const gradeFilterRow = `
+    <div class="filter-row fba-grade-filter-row">
+      <span>商品等级</span>
+      <div class="fba-grade-filter-options">
+        ${Object.entries(fbaReplenishmentTargets).map(([key, target]) => `
+          <label>
+            <input type="checkbox" data-fba-grade-filter value="${escapeHtml(key)}" ${selectedGradeKeys.has(key) ? "checked" : ""}>
+            <span>${escapeHtml(target.label)}</span>
+          </label>
+        `).join("")}
+      </div>
+    </div>
+  `;
   const filterRows = fbaColumns
     .filter(column => !column.always && column.type !== "static")
     .map(column => {
@@ -1300,7 +1567,7 @@ function openFbaFilterSettingsModal() {
     <div class="modal-body">
       <section class="fba-modal-section fba-filter-modal-section">
         <p class="fba-filter-hint">这里的筛选会和顶部搜索、库存水平一起生效。</p>
-        <div id="fbaColumnFilters" class="column-filters">${filterRows}</div>
+        <div id="fbaColumnFilters" class="column-filters">${gradeFilterRow}${filterRows}</div>
       </section>
       <div class="fba-modal-actions">
         <button type="button" class="secondary-button" id="fbaClearFiltersBtn">清空筛选</button>
@@ -1310,7 +1577,15 @@ function openFbaFilterSettingsModal() {
   `);
   modal.querySelector(".modal").classList.add("fba-column-modal", "fba-filter-modal");
 
-  modal.querySelector("#fbaColumnFilters").addEventListener("input", event => {
+  const updateFilter = event => {
+    if (event.target?.matches?.("[data-fba-grade-filter]")) {
+      const values = [...modal.querySelectorAll("[data-fba-grade-filter]:checked")].map(input => input.value);
+      fbaColumnFilters.replenishmentGrade = { values };
+      saveFbaTablePreferences();
+      updateFbaToolButtons();
+      renderProducts();
+      return;
+    }
     const key = event.target?.dataset?.fbaFilter;
     const part = event.target?.dataset?.filterPart;
     if (!key || !part) return;
@@ -1318,7 +1593,9 @@ function openFbaFilterSettingsModal() {
     saveFbaTablePreferences();
     updateFbaToolButtons();
     renderProducts();
-  });
+  };
+  modal.querySelector("#fbaColumnFilters").addEventListener("input", updateFilter);
+  modal.querySelector("#fbaColumnFilters").addEventListener("change", updateFilter);
   modal.querySelector("#fbaClearFiltersBtn").addEventListener("click", () => {
     fbaColumnFilters = {};
     saveFbaTablePreferences();
@@ -1331,16 +1608,47 @@ function openFbaFilterSettingsModal() {
 function renderProducts() {
   const list = $("#productList");
   if (!list) return;
+  const replenishmentButton = $("#fbaReplenishmentToggleBtn");
+  if (replenishmentButton) {
+    replenishmentButton.textContent = fbaReplenishmentOpen ? "关闭发补货" : "打开发补货";
+    replenishmentButton.classList.toggle("active", fbaReplenishmentOpen);
+  }
   const visibleColumns = getVisibleFbaColumns();
   renderFbaColumnWidths(visibleColumns);
+  const stickyKeys = new Set(fbaReplenishmentOpen
+    ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "asinSku", "fnSku"]
+    : ["image", "asinSku", "fnSku"]);
+  const stickyOffsets = [];
+  let stickyLeft = 0;
+  for (const column of visibleColumns) {
+    if (stickyKeys.has(column.key)) {
+      stickyOffsets.push(stickyLeft);
+      stickyLeft += getFbaColumnWidth(column);
+    } else {
+      stickyOffsets.push(null);
+    }
+  }
+  const cellAttrs = (column, index, tag = "td") => {
+    const isSticky = stickyOffsets[index] !== null;
+    const style = isSticky ? ` style="left:${stickyOffsets[index]}px"` : "";
+    const className = `${isSticky ? "fba-sticky-col " : ""}fba-col-${escapeHtml(column.key)}`;
+    return { className, style };
+  };
   const head = $("#fbaTableHead");
   if (head) {
     head.innerHTML = `<tr>${visibleColumns.map((column, index) => {
       const sortable = Boolean(column.value);
       const sortMark = fbaSort.key === column.key ? (fbaSort.direction === "asc" ? "↑" : "↓") : "";
+      const attrs = cellAttrs(column, index, "th");
+      const multiplierControl = column.key === "replenishmentDailySales"
+        ? `<label class="fba-plan-head-control">系数 <input class="fba-plan-mini-input" data-fba-global-multiplier type="number" step="0.05" min="0" value="${escapeHtml(fbaReplenishmentMultiplier)}"></label>`
+        : "";
       return `
-        <th class="${sortable ? "sortable" : ""} fba-col-${escapeHtml(column.key)}" ${sortable ? `data-fba-sort="${escapeHtml(column.key)}"` : ""}>
+        <th class="${sortable ? "sortable " : ""}${attrs.className}"${attrs.style} ${sortable ? `data-fba-sort="${escapeHtml(column.key)}"` : ""}>
           <span class="fba-th-label"><span class="fba-th-text">${renderColumnLabel(column.label)}</span>${sortMark ? `<span class="fba-sort-mark">${escapeHtml(sortMark)}</span>` : ""}</span>
+          ${multiplierControl}
+          ${column.key === "replenishmentShippingQty" ? `<button type="button" class="fba-plan-head-button" data-insert-fba-plan="shipping">插入发货计划</button>` : ""}
+          ${column.key === "replenishmentReplenishQty" ? `<button type="button" class="fba-plan-head-button" data-insert-fba-plan="replenishment">插入补货计划</button>` : ""}
           <span class="fba-col-resizer" data-fba-resize="${escapeHtml(column.key)}" data-fba-col-index="${index}" title="拖动调整列宽"></span>
         </th>
       `;
@@ -1373,7 +1681,10 @@ function renderProducts() {
   }
   list.innerHTML = visible.map(product => `
     <tr>
-      ${visibleColumns.map(column => `<td class="fba-col-${escapeHtml(column.key)} ${column.key === "title" ? "fba-name" : ""}">${column.render(product)}</td>`).join("")}
+      ${visibleColumns.map((column, index) => {
+        const attrs = cellAttrs(column, index);
+        return `<td class="${attrs.className} ${column.key === "title" ? "fba-name" : ""}"${attrs.style}>${column.render(product)}</td>`;
+      }).join("")}
     </tr>
   `).join("");
   const totals = visible.reduce((acc, row) => {
@@ -1401,6 +1712,11 @@ function renderProducts() {
     acc.salesOrders += row.salesOrders || 0;
     acc.salesUnits += row.salesUnits || 0;
     acc.stockoutDays += row.stockoutDays || 0;
+    const replenishmentPlan = calculateFbaReplenishmentPlan(row);
+    acc.replenishmentShippingBoxes += replenishmentPlan.shippingBoxes || 0;
+    acc.replenishmentShippingQuantity += replenishmentPlan.shippingQuantity || 0;
+    acc.replenishmentBoxes += replenishmentPlan.replenishmentBoxes || 0;
+    acc.replenishmentQuantity += replenishmentPlan.replenishmentQuantity || 0;
     return acc;
   }, {
     totalGoodsQuantity: 0,
@@ -1415,6 +1731,10 @@ function renderProducts() {
     salesOrders: 0,
     salesUnits: 0,
     stockoutDays: 0,
+    replenishmentShippingBoxes: 0,
+    replenishmentShippingQuantity: 0,
+    replenishmentBoxes: 0,
+    replenishmentQuantity: 0,
     factoryAsins: new Set(),
     hasIncompleteTotalGoods: false,
     hasIncompleteFactory: false,
@@ -1430,21 +1750,25 @@ function renderProducts() {
   $("#fbaTotals").innerHTML = `
     <tr>
       ${visibleColumns.map((column, index) => {
-        if (index === 0) return `<td>汇总</td>`;
-        if (column.key === "factoryFbaTotalQuantity") return `<td>${totals.factoryFbaTotalQuantity === null ? "/" : formatNumber(totals.factoryFbaTotalQuantity)}</td>`;
-        if (column.key === "factoryQuantity") return `<td>${totals.hasIncompleteFactory ? "/" : formatNumber(totals.factoryQuantity)}</td>`;
-        if (column.key === "totalGoodsQuantity") return `<td>${totals.hasIncompleteTotalGoods ? "/" : formatNumber(totals.totalGoodsQuantity)}</td>`;
-        if (column.key === "fulfillableQuantity") return `<td>${formatNumber(totals.fulfillableQuantity)}</td>`;
-        if (column.key === "inboundQuantity") return `<td>${totals.hasIncompleteInbound ? "/" : formatNumber(totals.inboundQuantity)}</td>`;
-        if (column.key === "inboundWorkingQuantity") return `<td>${totals.hasIncompleteInboundWorking ? "/" : formatNumber(totals.inboundWorkingQuantity)}</td>`;
-        if (column.key === "inboundShippedQuantity") return `<td>${totals.hasIncompleteInboundShipped ? "/" : formatNumber(totals.inboundShippedQuantity)}</td>`;
-        if (column.key === "inboundReceivingQuantity") return `<td>${totals.hasIncompleteInboundReceiving ? "/" : formatNumber(totals.inboundReceivingQuantity)}</td>`;
-        if (column.key === "reservedQuantity") return `<td>${totals.hasIncompleteReserved ? "/" : formatNumber(totals.reservedQuantity)}</td>`;
-        if (column.key === "unfulfillableQuantity") return `<td>${formatNumber(totals.unfulfillableQuantity)}</td>`;
-        if (column.key === "salesOrders") return `<td>${formatNumber(totals.salesOrders)}</td>`;
-        if (column.key === "salesUnits") return `<td>${formatNumber(totals.salesUnits)}</td>`;
-        if (column.key === "stockoutDays") return `<td>${formatNumber(totals.stockoutDays)}</td>`;
-        return "<td></td>";
+        const attrs = cellAttrs(column, index);
+        const open = `<td class="${attrs.className}"${attrs.style}>`;
+        if (index === 0) return `${open}汇总</td>`;
+        if (column.key === "factoryFbaTotalQuantity") return `${open}${totals.factoryFbaTotalQuantity === null ? "/" : formatNumber(totals.factoryFbaTotalQuantity)}</td>`;
+        if (column.key === "factoryQuantity") return `${open}${totals.hasIncompleteFactory ? "/" : formatNumber(totals.factoryQuantity)}</td>`;
+        if (column.key === "totalGoodsQuantity") return `${open}${totals.hasIncompleteTotalGoods ? "/" : formatNumber(totals.totalGoodsQuantity)}</td>`;
+        if (column.key === "fulfillableQuantity") return `${open}${formatNumber(totals.fulfillableQuantity)}</td>`;
+        if (column.key === "inboundQuantity") return `${open}${totals.hasIncompleteInbound ? "/" : formatNumber(totals.inboundQuantity)}</td>`;
+        if (column.key === "inboundWorkingQuantity") return `${open}${totals.hasIncompleteInboundWorking ? "/" : formatNumber(totals.inboundWorkingQuantity)}</td>`;
+        if (column.key === "inboundShippedQuantity") return `${open}${totals.hasIncompleteInboundShipped ? "/" : formatNumber(totals.inboundShippedQuantity)}</td>`;
+        if (column.key === "inboundReceivingQuantity") return `${open}${totals.hasIncompleteInboundReceiving ? "/" : formatNumber(totals.inboundReceivingQuantity)}</td>`;
+        if (column.key === "reservedQuantity") return `${open}${totals.hasIncompleteReserved ? "/" : formatNumber(totals.reservedQuantity)}</td>`;
+        if (column.key === "unfulfillableQuantity") return `${open}${formatNumber(totals.unfulfillableQuantity)}</td>`;
+        if (column.key === "salesOrders") return `${open}${formatNumber(totals.salesOrders)}</td>`;
+        if (column.key === "salesUnits") return `${open}${formatNumber(totals.salesUnits)}</td>`;
+        if (column.key === "stockoutDays") return `${open}${formatNumber(totals.stockoutDays)}</td>`;
+        if (column.key === "replenishmentShippingQty") return `${open}<span class="fba-plan-total">${formatNumber(totals.replenishmentShippingBoxes)}箱 / ${formatNumber(totals.replenishmentShippingQuantity)}件</span></td>`;
+        if (column.key === "replenishmentReplenishQty") return `${open}<span class="fba-plan-total">${formatNumber(totals.replenishmentBoxes)}箱 / ${formatNumber(totals.replenishmentQuantity)}件</span></td>`;
+        return `${open}</td>`;
       }).join("")}
     </tr>
   `;
@@ -1555,9 +1879,13 @@ function renderFactoryInventory() {
     }
     return cells.join("");
   };
-  const editableInput = (product, field, value, type = "text") => `
-    <input class="factory-edit-input" data-factory-field="${escapeHtml(field)}" data-product-id="${escapeHtml(product.id)}" type="${type}" value="${escapeHtml(value ?? "")}">
-  `;
+  const editableInput = (product, field, value, type = "text") => {
+    const isBoxSpec = field === "boxSpec";
+    const boxHint = "示例：50*37*40 cm3 / 36个";
+    return `
+      <input class="factory-edit-input" data-factory-field="${escapeHtml(field)}" data-product-id="${escapeHtml(product.id)}" type="${type}" value="${escapeHtml(value ?? "")}" ${isBoxSpec ? `placeholder="${boxHint}" title="请按格式填写：${boxHint}"` : ""}>
+    `;
+  };
 
   matrixBody.innerHTML = `
     <tr class="factory-meta-row factory-parent-row">
@@ -1577,7 +1905,7 @@ function renderFactoryInventory() {
     </tr>
     <tr class="factory-meta-row factory-title-row">
       <td class="factory-sticky-col factory-left-1"></td>
-      <td class="factory-sticky-col factory-left-2"></td>
+      <td class="factory-sticky-col factory-left-2">内部名</td>
       ${productCells(product => `<div class="factory-product-title" title="${escapeHtml(product.name || product.asin || "")}">${escapeHtml(product.name || product.asin || "-")}</div>`, "factory-title-cell", true)}
     </tr>
     <tr class="factory-meta-row factory-asin-row">
@@ -1660,6 +1988,77 @@ async function saveFactoryProductField(input) {
     alert(error.message);
     input.disabled = false;
   }
+}
+
+function findFbaProductByPlanKey(key) {
+  return products.find(product => getFbaReplenishmentKey(product) === key);
+}
+
+async function saveFbaPlanField(input) {
+  const key = input?.dataset?.fbaPlanKey || "";
+  const field = input?.dataset?.fbaPlanField || "";
+  const product = findFbaProductByPlanKey(key);
+  if (!product || !field) return;
+  if (field === "grade") {
+    updateFbaReplenishmentOverride(product, { grade: input.value });
+    renderProducts();
+    return;
+  }
+  const value = Number(input.value || 0);
+  if (!Number.isFinite(value) || value < 0) return;
+  if (field === "boxQuantity") {
+    updateFbaReplenishmentOverride(product, { boxQuantity: value || 1 });
+    const factoryProductId = product.factoryProductId || getFactoryProductForFbaProduct(product)?.id || "";
+    if (factoryProductId) {
+      const data = await api(`/api/factory-inventory/products/${encodeURIComponent(factoryProductId)}`, {
+        method: "PUT",
+        body: { boxSpec: String(value || 1) }
+      });
+      factoryProducts = data.products || factoryProducts;
+      factoryMovements = data.movements || factoryMovements;
+      factoryTotals = data.totals || factoryTotals;
+      product.factoryProductId = factoryProductId;
+      product.factoryBoxSpec = String(value || 1);
+    }
+    renderProducts();
+    return;
+  }
+  updateFbaReplenishmentOverride(product, { [field]: value });
+  renderProducts();
+}
+
+async function insertFbaPlanToFactory(type) {
+  if (!fbaReplenishmentOpen) return;
+  if (!factoryLoaded) {
+    await loadFactoryInventory();
+  }
+  const quantities = {};
+  let rowCount = 0;
+  let totalQuantity = 0;
+  for (const product of collapseFbaRowsByAsin(products.filter(productMatches))) {
+    const plan = calculateFbaReplenishmentPlan(product);
+    const quantity = type === "shipping" ? plan.shippingQuantity : plan.replenishmentQuantity;
+    const factoryProductId = product.factoryProductId || getFactoryProductForFbaProduct(product)?.id || "";
+    if (!quantity || quantity <= 0 || !factoryProductId) continue;
+    quantities[factoryProductId] = type === "shipping" ? -Math.abs(quantity) : Math.abs(quantity);
+    rowCount += 1;
+    totalQuantity += Number(quantity || 0);
+  }
+  if (!rowCount) {
+    alert("当前筛选结果没有可插入的发补货数量，或对应 ASIN 还没有工厂库存商品。");
+    return;
+  }
+  const today = marketplaceToday();
+  const operation = type === "shipping" ? "FBA发货计划" : "FBA补货计划";
+  const data = await api("/api/factory-inventory/movement-rows", {
+    method: "POST",
+    body: { operation, date: today, quantities }
+  });
+  factoryProducts = data.products || [];
+  factoryMovements = data.movements || [];
+  factoryTotals = data.totals || {};
+  factoryLoaded = true;
+  alert(`已加入工厂库存：${operation}，共 ${rowCount} 个 ASIN，${formatNumber(totalQuantity)} 件。请到工厂库存页面查看；发货计划、补货计划下载功能后续再做。`);
 }
 
 let factoryDraggedProductId = "";
@@ -2444,6 +2843,14 @@ $("#statusFilter").addEventListener("change", renderList);
 $("#dashboardRefreshBtn").addEventListener("click", () => refreshWorkspace().catch(error => alert(error.message)));
 $("#queryProductsBtn").addEventListener("click", () => queryProducts().catch(error => alert(error.message)));
 $("#syncProductsBtn").addEventListener("click", () => syncSandboxProducts().catch(error => alert(error.message)));
+$("#fbaReplenishmentToggleBtn").addEventListener("click", async () => {
+  fbaReplenishmentOpen = !fbaReplenishmentOpen;
+  saveFbaReplenishmentSettings();
+  if (fbaReplenishmentOpen && !factoryLoaded) {
+    await loadFactoryInventory().catch(() => {});
+  }
+  renderProducts();
+});
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
 $("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(error => alert(error.message)));
@@ -2555,6 +2962,13 @@ $("#fbaColumnSettingsBtn").addEventListener("click", openFbaColumnSettingsModal)
 $("#fbaFilterSettingsBtn").addEventListener("click", openFbaFilterSettingsModal);
 $("#fbaTableHead").addEventListener("pointerdown", startFbaColumnResize);
 $("#fbaTableHead").addEventListener("click", event => {
+  const insertButton = event.target?.closest?.("[data-insert-fba-plan]");
+  if (insertButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    insertFbaPlanToFactory(insertButton.dataset.insertFbaPlan).catch(error => alert(error.message));
+    return;
+  }
   if (event.target?.closest?.("[data-fba-resize]")) return;
   const key = event.target?.closest("[data-fba-sort]")?.dataset?.fbaSort;
   if (!key) return;
@@ -2566,6 +2980,68 @@ $("#fbaTableHead").addEventListener("click", event => {
   }
   saveFbaTablePreferences();
   renderProducts();
+});
+$("#fbaTableHead").addEventListener("change", event => {
+  const input = event.target?.closest?.("[data-fba-global-multiplier]");
+  if (!input) return;
+  const value = Number(input.value || 0);
+  if (!Number.isFinite(value) || value <= 0) return;
+  fbaReplenishmentMultiplier = value;
+  saveFbaReplenishmentSettings();
+  renderProducts();
+});
+$("#fbaTableHead").addEventListener("keydown", event => {
+  const input = event.target?.closest?.("[data-fba-global-multiplier]");
+  if (!input || event.key !== "Enter") return;
+  event.preventDefault();
+  input.blur();
+});
+$("#productList").addEventListener("change", event => {
+  const input = event.target?.closest?.("[data-fba-plan-field]");
+  if (!input) return;
+  saveFbaPlanField(input).catch(error => alert(error.message));
+});
+$("#productList").addEventListener("click", event => {
+  const toggle = event.target?.closest?.("[data-fba-grade-toggle]");
+  if (toggle) {
+    event.preventDefault();
+    event.stopPropagation();
+    const picker = toggle.closest(".fba-grade-picker");
+    const wasOpen = picker?.classList.contains("open");
+    document.querySelectorAll(".fba-grade-picker.open").forEach(item => {
+      item.classList.remove("open");
+      item.closest(".fba-col-replenishmentGrade")?.classList.remove("fba-grade-cell-open");
+      item.querySelector("[data-fba-grade-toggle]")?.setAttribute("aria-expanded", "false");
+    });
+    if (picker && !wasOpen) {
+      picker.classList.add("open");
+      picker.closest(".fba-col-replenishmentGrade")?.classList.add("fba-grade-cell-open");
+      toggle.setAttribute("aria-expanded", "true");
+    }
+    return;
+  }
+  const option = event.target?.closest?.("[data-fba-grade-option]");
+  if (!option) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const product = findFbaProductByPlanKey(option.dataset.fbaPlanKey || "");
+  const grade = option.dataset.fbaGradeOption || "";
+  if (!product || !fbaReplenishmentTargets[grade]) return;
+  updateFbaReplenishmentOverride(product, { grade });
+  renderProducts();
+});
+$("#productList").addEventListener("keydown", event => {
+  const input = event.target?.closest?.("[data-fba-plan-field]");
+  if (!input || event.key !== "Enter") return;
+  event.preventDefault();
+  input.blur();
+});
+document.addEventListener("click", () => {
+  document.querySelectorAll(".fba-grade-picker.open").forEach(item => {
+    item.classList.remove("open");
+    item.closest(".fba-col-replenishmentGrade")?.classList.remove("fba-grade-cell-open");
+    item.querySelector("[data-fba-grade-toggle]")?.setAttribute("aria-expanded", "false");
+  });
 });
 $("#fbaDatePicker").addEventListener("click", event => {
   event.stopPropagation();

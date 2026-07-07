@@ -18,8 +18,8 @@
         </div>
         <nav class="side-nav">
           <button class="module-tab active" data-module="dashboard">仪表盘</button>
-          <button class="module-tab" data-module="inventory">工厂库存</button>
           <button class="module-tab" data-module="products">FBA库存</button>
+          <button class="module-tab" data-module="inventory">工厂库存</button>
           <button class="module-tab" data-module="ads">广告管理</button>
           <button class="module-tab" data-module="influencers">红人营销</button>
           <button class="module-tab" data-module="orders">订单管理</button>
@@ -67,13 +67,13 @@
           </div>
 
           <div class="quick-grid">
-            <button class="quick-card" data-module-jump="inventory">
-              <strong>工厂库存</strong>
-              <span id="factoryQuickText">查看国内工厂库存</span>
-            </button>
             <button class="quick-card" data-module-jump="products">
               <strong>FBA库存</strong>
               <span id="productQuickText">查看库存和销量</span>
+            </button>
+            <button class="quick-card" data-module-jump="inventory">
+              <strong>工厂库存</strong>
+              <span id="factoryQuickText">查看国内工厂库存</span>
             </button>
             <button class="quick-card" data-module-jump="ads">
               <strong>广告管理</strong>
@@ -120,7 +120,10 @@
                 <button id="fbaColumnSettingsBtn" class="secondary-button" type="button" title="选择表格显示哪些列，并设置默认排序。">显示列</button>
                 <button id="fbaFilterSettingsBtn" class="secondary-button" type="button" title="设置表格筛选条件，只影响当前页面显示，不请求 API。">筛选数据</button>
                 <button id="syncProductsBtn" type="button" title="强制按所选日期范围重新请求 API，并把成功返回的库存和销量覆盖写入数据库。">强制刷新数据</button>
-                <button id="queryProductsBtn" type="button" title="先查询数据库；如果所选日期范围有缺失日期，才请求缺失日期的 API 并写入数据库。">查询</button>
+                <div class="fba-query-stack">
+                  <button id="fbaReplenishmentToggleBtn" class="primary" type="button" title="打开或关闭发补货建议列。">打开发补货</button>
+                  <button id="queryProductsBtn" type="button" title="先查询数据库；如果所选日期范围有缺失日期，才请求缺失日期的 API 并写入数据库。">查询</button>
+                </div>
               </div>
             </div>
             <div id="fbaDatePicker" class="date-picker-popover" hidden></div>

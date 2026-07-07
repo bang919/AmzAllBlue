@@ -1263,6 +1263,29 @@ function buildFactoryQuantityByAsin(db) {
   return quantities;
 }
 
+function buildFactoryInfoByAsin(db) {
+  const info = new Map();
+  const products = Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [];
+  for (const item of products) {
+    const product = normalizeFactoryProduct(item);
+    const asin = String(product.asin || "").trim().toUpperCase();
+    if (!asin) continue;
+    const existing = info.get(asin) || {
+      quantity: 0,
+      productId: "",
+      boxSpec: "",
+      name: ""
+    };
+    info.set(asin, {
+      quantity: Number(existing.quantity || 0) + Number(product.currentQuantity || 0),
+      productId: existing.productId || product.id,
+      boxSpec: existing.boxSpec || product.boxSpec || "",
+      name: existing.name || product.name || ""
+    });
+  }
+  return info;
+}
+
 function requestAsins(item) {
   return unique([
     item.asin,
@@ -2657,9 +2680,14 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   let sync = null;
   let dailyRows = await readFbaDailyRows();
   const requestedDates = dateRangeInclusive(safeStart, safeEnd);
+  const suggestionEndDate = addDays(today, -2);
+  const suggestion7Dates = dateRangeInclusive(addDays(suggestionEndDate, -6), suggestionEndDate);
+  const suggestion30Dates = dateRangeInclusive(addDays(suggestionEndDate, -29), suggestionEndDate);
+  const suggestionDates = [...new Set([...suggestion7Dates, ...suggestion30Dates])].sort();
   if (options.mode === "sync") {
-    sync = await syncFbaDailyRange(safeStart, safeEnd, {
-      dates: requestedDates,
+    const syncDates = [...new Set([...requestedDates, ...suggestionDates])].sort();
+    sync = await syncFbaDailyRange(syncDates[0], syncDates[syncDates.length - 1], {
+      dates: syncDates,
       inventoryDates: requestedDates.filter(date => date < today),
       allowFrozenInventoryUpdate: true,
       forceNewReport: true,
@@ -2672,7 +2700,9 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     dailyRows = await readFbaDailyRows();
   } else if (options.mode === "query") {
     const existingSalesDates = fbaDatesWithSalesRecords(dailyRows, config.marketplaceId);
-    const missingDates = requestedDates.filter(date => date === today || !existingSalesDates.has(date));
+    const missingDates = [...new Set([...requestedDates, ...suggestionDates])]
+      .sort()
+      .filter(date => date === today || !existingSalesDates.has(date));
     const existingInventoryDates = new Set(dailyRows
       .filter(row => row.marketplaceId === config.marketplaceId && row.inventoryFetchedAt && row.sellerSku !== FBA_DATE_MARKER_SKU)
       .map(row => row.date)
@@ -2686,7 +2716,9 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     );
     const shouldFetchTodayInventory = requestedDates.includes(today);
     if (missingDates.length || shouldFetchTodayInventory || missingHistoricalInventoryDates.length) {
-      sync = await syncFbaDailyRange(safeStart, safeEnd, {
+      const syncStart = missingDates.length ? missingDates[0] : safeStart;
+      const syncEnd = missingDates.length ? missingDates[missingDates.length - 1] : safeEnd;
+      sync = await syncFbaDailyRange(syncStart, syncEnd, {
         dates: missingDates,
         inventoryDates: missingHistoricalInventoryDates
       });
@@ -2695,6 +2727,7 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     }
   }
   const rangeRows = dailyRows.filter(row => row.date >= safeStart && row.date <= safeEnd && row.marketplaceId === config.marketplaceId);
+  const suggestionRows = dailyRows.filter(row => suggestionDates.includes(row.date) && row.marketplaceId === config.marketplaceId);
   const allInventoryRows = dailyRows.filter(row => row.marketplaceId === config.marketplaceId && row.inventoryFetchedAt && row.sellerSku !== FBA_DATE_MARKER_SKU);
   const metadataRows = (await readFbaSkuMetadataRows()).filter(row => row.marketplaceId === config.marketplaceId);
   let inventoryRows = allInventoryRows.filter(row => row.date === safeEnd);
@@ -2713,7 +2746,7 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     warnings.push(`结束日期 ${safeEnd} 没有本地 FBA 库存快照；库存字段显示为空，销量仍按所选日期范围统计。`);
   }
   const currentDateColumnsAvailable = inventoryRows.some(row => row.sellerSku !== FBA_DATE_MARKER_SKU);
-  const factoryQuantityByAsin = currentDateColumnsAvailable ? buildFactoryQuantityByAsin(await readDb()) : new Map();
+  const factoryInfoByAsin = buildFactoryInfoByAsin(await readDb());
 
   const latestInventoryBySku = new Map();
   for (const row of inventoryRows) {
@@ -2738,11 +2771,51 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   }
 
   const salesBySku = new Map();
+  const suggestionSalesBySku = new Map();
   const inventoryBySkuDate = new Map();
   for (const row of allInventoryRows) {
     if (!row.sellerSku || !row.date) continue;
     inventoryBySkuDate.set(`${row.sellerSku}|${row.date}`, row);
   }
+  const collectSuggestionSales = (dates, key) => {
+    const dateSet = new Set(dates);
+    for (const row of suggestionRows) {
+      if (row.sellerSku === FBA_DATE_MARKER_SKU || !row.sellerSku || !dateSet.has(row.date)) continue;
+      const sameDayInventory = inventoryBySkuDate.get(`${row.sellerSku}|${row.date}`);
+      const isStockoutDay = !sameDayInventory || Number(sameDayInventory.fulfillableQuantity || 0) <= 0;
+      const item = suggestionSalesBySku.get(row.sellerSku) || {
+        sevenUnits: 0,
+        sevenDays: 0,
+        sevenStockoutUnits: 0,
+        sevenStockoutDays: 0,
+        thirtyUnits: 0,
+        thirtyDays: 0,
+        thirtyStockoutUnits: 0,
+        thirtyStockoutDays: 0
+      };
+      const units = Number(row.salesUnits || 0);
+      if (key === "seven") {
+        if (isStockoutDay) {
+          item.sevenStockoutUnits += units;
+          item.sevenStockoutDays += 1;
+        } else {
+          item.sevenUnits += units;
+          item.sevenDays += 1;
+        }
+      } else {
+        if (isStockoutDay) {
+          item.thirtyStockoutUnits += units;
+          item.thirtyStockoutDays += 1;
+        } else {
+          item.thirtyUnits += units;
+          item.thirtyDays += 1;
+        }
+      }
+      suggestionSalesBySku.set(row.sellerSku, item);
+    }
+  };
+  collectSuggestionSales(suggestion7Dates, "seven");
+  collectSuggestionSales(suggestion30Dates, "thirty");
   for (const row of rangeRows) {
     if (row.sellerSku === FBA_DATE_MARKER_SKU) continue;
     if (!row.sellerSku) continue;
@@ -2778,7 +2851,14 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     const totalGoodsQuantity = inventory ? calculateTotalGoodsQuantity(inventory) : null;
     const inboundQuantity = inventory ? calculateInboundQuantity(inventory) : null;
     const asin = String(metadata.asin || "").trim().toUpperCase();
-    const factoryQuantity = currentDateColumnsAvailable && asin ? Number(factoryQuantityByAsin.get(asin) || 0) : null;
+    const factoryInfo = asin ? factoryInfoByAsin.get(asin) : null;
+    const factoryQuantity = currentDateColumnsAvailable && asin ? Number(factoryInfo?.quantity || 0) : null;
+    const suggestionSales = suggestionSalesBySku.get(sku) || {};
+    const sevenEffectiveDays = Number(suggestionSales.sevenDays || 0);
+    const thirtyEffectiveDays = Number(suggestionSales.thirtyDays || 0);
+    const sevenEffectiveDailySales = sevenEffectiveDays > 0 ? Number((Number(suggestionSales.sevenUnits || 0) / sevenEffectiveDays).toFixed(2)) : 0;
+    const thirtyEffectiveDailySales = thirtyEffectiveDays > 0 ? Number((Number(suggestionSales.thirtyUnits || 0) / thirtyEffectiveDays).toFixed(2)) : 0;
+    const replenishmentBaseDailySales = Math.max(sevenEffectiveDailySales, thirtyEffectiveDailySales);
     const factoryFbaTotalQuantity = totalGoodsQuantity !== null && factoryQuantity !== null
       ? Number(totalGoodsQuantity || 0) + Number(factoryQuantity || 0)
       : null;
@@ -2807,7 +2887,27 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
       totalGoodsQuantity,
       inboundQuantity,
       factoryQuantity,
+      factoryProductId: factoryInfo?.productId || "",
+      factoryBoxSpec: factoryInfo?.boxSpec || "",
+      factoryName: factoryInfo?.name || "",
       factoryFbaTotalQuantity,
+      replenishmentSales: {
+        sevenStartDate: suggestion7Dates[0],
+        sevenEndDate: suggestion7Dates[suggestion7Dates.length - 1],
+        thirtyStartDate: suggestion30Dates[0],
+        thirtyEndDate: suggestion30Dates[suggestion30Dates.length - 1],
+        sevenUnits: Number(suggestionSales.sevenUnits || 0),
+        sevenEffectiveDays,
+        sevenStockoutUnits: Number(suggestionSales.sevenStockoutUnits || 0),
+        sevenStockoutDays: Number(suggestionSales.sevenStockoutDays || 0),
+        sevenDailySales: sevenEffectiveDailySales,
+        thirtyUnits: Number(suggestionSales.thirtyUnits || 0),
+        thirtyEffectiveDays,
+        thirtyStockoutUnits: Number(suggestionSales.thirtyStockoutUnits || 0),
+        thirtyStockoutDays: Number(suggestionSales.thirtyStockoutDays || 0),
+        thirtyDailySales: thirtyEffectiveDailySales,
+        baseDailySales: replenishmentBaseDailySales
+      },
       fulfillableQuantity,
       reservedQuantity: inventory ? Number(inventory.reservedQuantity || 0) : null,
       unfulfillableQuantity: inventory ? Number(inventory.unfulfillableQuantity || 0) : 0,
