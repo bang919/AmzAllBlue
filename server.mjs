@@ -5,10 +5,12 @@ import { extname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import mysql from "mysql2/promise";
+import ExcelJS from "exceljs";
 
 const PORT = Number(process.env.PORT || 4317);
 const ROOT = resolve(".");
 const PUBLIC_DIR = join(ROOT, "public");
+const TEMPLATE_DIR = join(PUBLIC_DIR, "templates");
 const DATA_DIR = join(ROOT, "data");
 const DB_PATH = join(DATA_DIR, "db.json");
 const FBA_DAILY_PATH = join(DATA_DIR, "fba-inventory-daily.json");
@@ -731,6 +733,47 @@ function csvEscape(value) {
   return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  const source = String(text || "");
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (quoted) {
+      if (char === '"' && next === '"') {
+        cell += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        cell += char;
+      }
+    } else if (char === '"') {
+      quoted = true;
+    } else if (char === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (char === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else if (char !== "\r") {
+      cell += char;
+    }
+  }
+  row.push(cell);
+  if (row.length > 1 || row[0]) rows.push(row);
+  return rows;
+}
+
+function normalizeHeader(text) {
+  return String(text || "").replace(/^"|"$/g, "").trim().toLowerCase();
+}
+
 function sendCsv(res, filename, rows) {
   const csv = rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
   res.writeHead(200, {
@@ -739,6 +782,15 @@ function sendCsv(res, filename, rows) {
     ...corsHeaders()
   });
   res.end(`\uFEFF${csv}`);
+}
+
+function sendXlsx(res, filename, buffer) {
+  res.writeHead(200, {
+    "content-type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    ...corsHeaders()
+  });
+  res.end(Buffer.from(buffer));
 }
 
 function parseBody(req) {
@@ -1184,6 +1236,332 @@ async function buildFactoryMovementTemplateRows(db, { operation, date, kind }) {
     ["名称", "FNSKU", "每箱数量", quantityLabel, "共多少箱"],
     ...items.map(item => [item.name, item.fnSku, item.unitsPerBox || "", item.quantity, item.boxCount || ""])
   ];
+}
+
+async function buildFactoryMovementTemplateItems(db, { operation, date }) {
+  const catalog = await ensureFactoryInventoryProductCatalog(db);
+  const products = (Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [])
+    .map(item => normalizeFactoryProduct(item));
+  const productById = new Map(products.map(product => [product.id, product]));
+  const movements = (Array.isArray(db.factoryInventory?.movements) ? db.factoryInventory.movements : [])
+    .map(item => normalizeFactoryMovement(item))
+    .filter(movement => movement.date === date && movement.note === operation && movement.quantity);
+  return movements.map(movement => {
+    const product = productById.get(movement.productId);
+    if (!product) return null;
+    const fbaProduct = catalog.fbaCatalogByAsin.get(product.asin) || {};
+    const quantity = Math.abs(Number(movement.quantity || 0));
+    const unitsPerBox = parseFactoryBoxQuantity(product.boxSpec);
+    const boxCount = unitsPerBox > 0 ? Math.ceil(quantity / unitsPerBox) : 0;
+    const dimensions = parseFactoryBoxDimensions(product.boxSpec);
+    return {
+      name: product.name || fbaProduct.title || product.asin,
+      asin: product.asin,
+      fnSku: fbaProduct.fnSku || "",
+      sellerSku: fbaProduct.sellerSku || product.asin,
+      quantity,
+      unitsPerBox,
+      boxCount,
+      currentQuantity: Number(product.currentQuantity || 0),
+      ...dimensions
+    };
+  }).filter(Boolean);
+}
+
+async function loadTemplateWorkbook(fileName) {
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.readFile(join(TEMPLATE_DIR, fileName));
+  return workbook;
+}
+
+async function buildFactoryMovementTemplateWorkbook(db, { operation, date, kind }) {
+  const items = await buildFactoryMovementTemplateItems(db, { operation, date });
+  const templateName = kind === "backend" ? "后台发货模版.xlsx" : kind === "shipping" ? "发货模版.xlsx" : "补货模版.xlsx";
+  const workbook = await loadTemplateWorkbook(templateName);
+  const worksheet = kind === "backend"
+    ? (workbook.getWorksheet("Create workflow – template") || workbook.worksheets[0])
+    : workbook.worksheets[0];
+  const startRow = kind === "backend" ? 9 : 2;
+
+  items.forEach((item, index) => {
+    const row = worksheet.getRow(startRow + index);
+    if (kind === "backend") {
+      row.getCell(1).value = item.sellerSku;
+      row.getCell(2).value = item.quantity;
+      row.getCell(5).value = item.unitsPerBox || "";
+      row.getCell(6).value = item.boxCount || "";
+      row.getCell(7).value = item.lengthCm ? Number((item.lengthCm / 2.54).toFixed(2)) : "";
+      row.getCell(8).value = item.widthCm ? Number((item.widthCm / 2.54).toFixed(2)) : "";
+      row.getCell(9).value = item.heightCm ? Number((item.heightCm / 2.54).toFixed(2)) : "";
+      row.getCell(10).value = item.lengthCm === 60 ? 45 : 33;
+    } else {
+      row.getCell(1).value = item.name;
+      row.getCell(2).value = item.fnSku;
+      row.getCell(3).value = item.unitsPerBox || "";
+      row.getCell(4).value = item.quantity;
+      row.getCell(5).value = item.boxCount || "";
+      if (kind === "replenishment") {
+        row.getCell(7).value = Math.max(0, item.currentQuantity - item.quantity);
+        row.getCell(8).value = item.currentQuantity;
+      }
+    }
+    row.commit();
+  });
+
+  return workbook.xlsx.writeBuffer();
+}
+
+function parseShipmentFilename(filename) {
+  const stem = String(filename || "").replace(/\.(csv|txt)$/i, "");
+  const parts = stem.split("_");
+  return {
+    fbaNumber: parts[0] || "",
+    poNumber: parts[1] || "",
+    warehouseCode: parts[2] || ""
+  };
+}
+
+function findShipmentColumn(headers, matchers) {
+  return headers.findIndex(header => matchers.some(matcher => {
+    if (matcher instanceof RegExp) return matcher.test(header);
+    return header === matcher;
+  }));
+}
+
+function buildShipmentSkuMap(factoryRows) {
+  const map = new Map();
+  for (const product of factoryRows) {
+    for (const key of [product.sellerSku, product.fnSku, product.asin]) {
+      const normalized = String(key || "").trim();
+      if (normalized && !map.has(normalized)) map.set(normalized, product);
+    }
+  }
+  return map;
+}
+
+function processShipmentCsvContent(content, filename, skuMap) {
+  const rows = parseCsvRows(content);
+  let headerIndex = -1;
+  let skuIndex = -1;
+  let quantityIndex = -1;
+  let boxNumberIndex = -1;
+  for (let index = 0; index < Math.min(30, rows.length); index += 1) {
+    const headers = rows[index].map(normalizeHeader);
+    const candidateSku = findShipmentColumn(headers, ["sku", "merchant sku", "msku", "seller sku", "seller-sku"]);
+    const candidateQuantity = findShipmentColumn(headers, [/箱子总数/, /number of boxes/, /box count/, /^quantity$/]);
+    const candidateBoxNumber = findShipmentColumn(headers, [/箱号/, /box number/, /carton/, /box id/]);
+    if (candidateSku >= 0 && candidateQuantity >= 0 && candidateBoxNumber >= 0) {
+      headerIndex = index;
+      skuIndex = candidateSku;
+      quantityIndex = candidateQuantity;
+      boxNumberIndex = candidateBoxNumber;
+      break;
+    }
+  }
+  if (headerIndex === -1) throw new Error(`无法在 ${filename} 中找到 SKU、箱子总数、箱号列`);
+
+  const bySku = new Map();
+  for (const row of rows.slice(headerIndex + 1)) {
+    const sku = String(row[skuIndex] || "").replace(/^"|"$/g, "").trim();
+    const quantity = Number(String(row[quantityIndex] || "").replace(/[^\d.-]/g, "")) || 0;
+    const boxNumberText = String(row[boxNumberIndex] || "").replace(/^"|"$/g, "").trim();
+    if (!sku || !quantity || !boxNumberText) continue;
+    const product = skuMap.get(sku);
+    if (!product) continue;
+    const item = bySku.get(sku) || {
+      sku,
+      name: product.name || product.title || sku,
+      asin: product.asin || "",
+      boxCount: 0,
+      boxNumbers: [],
+      product
+    };
+    item.boxCount += quantity;
+    for (const boxNumber of boxNumberText.split(/[,，、\s]+/).map(value => value.trim()).filter(Boolean)) {
+      if (!item.boxNumbers.includes(boxNumber)) item.boxNumbers.push(boxNumber);
+    }
+    bySku.set(sku, item);
+  }
+  return [...bySku.values()];
+}
+
+async function buildLabelWorkbook(files) {
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet("贴标");
+  worksheet.columns = [
+    { header: "文件", key: "file", width: 32 },
+    { header: "名称", key: "name", width: 42 },
+    { header: "箱子数量", key: "boxCount", width: 12 },
+    { header: "编号", key: "boxNumbers", width: 42 }
+  ];
+  worksheet.getRow(1).font = { bold: true };
+  for (const file of files) {
+    worksheet.addRow([file.name]);
+    const titleRow = worksheet.lastRow;
+    titleRow.font = { bold: true };
+    titleRow.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFFF99" } };
+    for (const item of file.items.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"))) {
+      worksheet.addRow([file.name, item.name, item.boxCount, item.boxNumbers.join(", ")]);
+    }
+    worksheet.addRow([]);
+  }
+  return workbook.xlsx.writeBuffer();
+}
+
+function sortBoxNumbers(boxNumbers) {
+  return [...boxNumbers].sort((a, b) => {
+    const numA = Number(String(a).match(/(\d+)$/)?.[1] || 0);
+    const numB = Number(String(b).match(/(\d+)$/)?.[1] || 0);
+    return numA - numB;
+  });
+}
+
+async function buildInvoiceWorkbook(templateType, shipmentData) {
+  const workbook = await loadTemplateWorkbook(templateType === "jinsheng" ? "锦盛天成发票.xlsx" : "喜悦发票.xlsx");
+  const worksheet = workbook.worksheets[0];
+  const { fbaNumber, poNumber, warehouseCode, items } = shipmentData;
+  const totalBoxes = items.reduce((sum, item) => sum + item.boxNumbers.length, 0);
+  const defaultProductInfo = {
+    weight: 20,
+    englishName: "Hanging Organizer",
+    chineseName: "悬挂式收纳袋",
+    declaredPrice: 3.5,
+    material: "Cotton",
+    customsCode: "6307900090",
+    usage: "Organizer",
+    brand: "无",
+    model: "无"
+  };
+
+  if (templateType === "jinsheng") {
+    worksheet.getCell("B1").value = fbaNumber;
+    worksheet.getCell("B2").value = "美国准时达";
+    const sheet1 = workbook.worksheets.find(ws => ws.name === "Sheet1");
+    let addressCode = "";
+    const values = {};
+    if (sheet1) {
+      for (let rowNumber = 1; rowNumber <= sheet1.rowCount; rowNumber += 1) {
+        const row = sheet1.getRow(rowNumber);
+        if (String(row.getCell(3).value || "") === warehouseCode) {
+          addressCode = String(row.getCell(1).value || "");
+          values.col4 = row.getCell(4).value || "";
+          values.col6 = row.getCell(6).value || "";
+          values.col8 = row.getCell(8).value || "";
+          values.col11 = row.getCell(11).value || "";
+          values.col12 = row.getCell(12).value || "";
+          values.col13 = row.getCell(13).value || "";
+          values.col14 = row.getCell(14).value || "";
+          break;
+        }
+      }
+    }
+    worksheet.getCell("B3").value = addressCode;
+    worksheet.getCell("B4").value = values.col4 || "";
+    worksheet.getCell("B6").value = values.col8 || "";
+    worksheet.getCell("B9").value = values.col11 || "";
+    worksheet.getCell("B10").value = values.col12 || "";
+    worksheet.getCell("B11").value = values.col14 || "";
+    worksheet.getCell("B12").value = values.col13 || "";
+    worksheet.getCell("B13").value = values.col6 || "";
+    worksheet.getCell("B15").value = poNumber;
+    worksheet.getCell("B23").value = totalBoxes;
+    worksheet.getCell("B24").value = warehouseCode;
+  } else {
+    worksheet.getCell("B1").value = fbaNumber;
+    worksheet.getCell("B3").value = warehouseCode;
+    worksheet.getCell("B4").value = warehouseCode;
+    worksheet.getCell("B15").value = poNumber;
+    worksheet.getCell("B16").value = totalBoxes;
+  }
+
+  let currentRow = templateType === "jinsheng" ? 26 : 18;
+  for (const item of [...items].sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"))) {
+    const boxNumbers = sortBoxNumbers(item.boxNumbers.length ? item.boxNumbers : [""]);
+    const boxQuantity = parseFactoryBoxQuantity(item.product?.boxSpec || "") || 1;
+    const dimensions = parseFactoryBoxDimensions(item.product?.boxSpec || "");
+    for (const boxNumber of boxNumbers) {
+      const row = worksheet.getRow(currentRow);
+      if (templateType === "jinsheng") {
+        row.getCell(1).value = boxNumber;
+        row.getCell(2).value = poNumber;
+        row.getCell(3).value = defaultProductInfo.weight;
+        row.getCell(4).value = dimensions.lengthCm || "";
+        row.getCell(5).value = dimensions.widthCm || "";
+        row.getCell(6).value = dimensions.heightCm || "";
+        row.getCell(7).value = defaultProductInfo.chineseName;
+        row.getCell(8).value = defaultProductInfo.englishName;
+        row.getCell(9).value = defaultProductInfo.declaredPrice;
+        row.getCell(10).value = "USD";
+        row.getCell(11).value = boxQuantity;
+        row.getCell(12).value = defaultProductInfo.material;
+        row.getCell(13).value = defaultProductInfo.usage;
+        row.getCell(14).value = defaultProductInfo.customsCode;
+        row.getCell(15).value = "否";
+        row.getCell(16).value = "/";
+        row.getCell(17).value = "/";
+        row.getCell(18).value = "/";
+        row.getCell(19).value = "/";
+        row.getCell(20).value = "/";
+      } else {
+        row.getCell(1).value = fbaNumber;
+        row.getCell(2).value = poNumber;
+        row.getCell(3).value = defaultProductInfo.weight;
+        row.getCell(4).value = dimensions.lengthCm || "";
+        row.getCell(5).value = dimensions.widthCm || "";
+        row.getCell(6).value = dimensions.heightCm || "";
+        row.getCell(7).value = defaultProductInfo.englishName;
+        row.getCell(8).value = defaultProductInfo.chineseName;
+        row.getCell(9).value = defaultProductInfo.declaredPrice;
+        row.getCell(10).value = boxQuantity;
+        row.getCell(11).value = defaultProductInfo.material;
+        row.getCell(12).value = defaultProductInfo.customsCode;
+        row.getCell(13).value = defaultProductInfo.usage;
+        row.getCell(14).value = defaultProductInfo.brand;
+        row.getCell(15).value = defaultProductInfo.model;
+      }
+      row.commit();
+      currentRow += 1;
+    }
+  }
+  return workbook.xlsx.writeBuffer();
+}
+
+async function buildShipmentDocumentFiles(db, body) {
+  const catalog = await ensureFactoryInventoryProductCatalog(db);
+  const factoryView = await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin });
+  const skuMap = buildShipmentSkuMap(factoryView.products || []);
+  const templateType = String(body.templateType || "jinsheng");
+  const inputFiles = Array.isArray(body.files) ? body.files : [];
+  const processedFiles = [];
+  const warehouseShipments = new Map();
+  for (const file of inputFiles) {
+    const name = String(file.name || "");
+    if (!/^fba/i.test(name)) continue;
+    const filenameInfo = parseShipmentFilename(name);
+    const items = processShipmentCsvContent(file.content || "", name, skuMap);
+    processedFiles.push({ name, items });
+    if (!filenameInfo.warehouseCode) continue;
+    const existing = warehouseShipments.get(filenameInfo.warehouseCode) || { ...filenameInfo, items: [] };
+    existing.items.push(...items);
+    warehouseShipments.set(filenameInfo.warehouseCode, existing);
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const files = [];
+  files.push({
+    filename: `贴标_${today}.xlsx`,
+    contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    base64: Buffer.from(await buildLabelWorkbook(processedFiles)).toString("base64")
+  });
+  for (const shipment of warehouseShipments.values()) {
+    if (!shipment.items.length) continue;
+    const templateName = templateType === "jinsheng" ? "锦盛天成发票" : "赤道发票";
+    files.push({
+      filename: `${templateName}_${shipment.warehouseCode}_${shipment.fbaNumber}_${today}.xlsx`,
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      base64: Buffer.from(await buildInvoiceWorkbook(templateType, shipment)).toString("base64")
+    });
+  }
+  return { files };
 }
 
 async function buildFbaProductCatalog(db) {
@@ -4204,6 +4582,24 @@ async function handleApi(req, res, url) {
     const rows = await buildFactoryMovementTemplateRows(db, { operation, date, kind });
     const label = kind === "backend" ? "后台发货模版" : kind === "shipping" ? "发货模版" : "补货模版";
     return sendCsv(res, `${label}_${date}.csv`, rows);
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/factory-inventory/movement-template.xlsx") {
+    const operation = String(url.searchParams.get("operation") || "").trim();
+    const date = String(url.searchParams.get("date") || "").slice(0, 10);
+    const kind = String(url.searchParams.get("kind") || "").trim();
+    if (!operation || !date) return sendJson(res, { error: "Missing movement row identity" }, 400);
+    if (!["shipping", "replenishment", "backend"].includes(kind)) return sendJson(res, { error: "Invalid template kind" }, 400);
+    const db = await readDb();
+    const buffer = await buildFactoryMovementTemplateWorkbook(db, { operation, date, kind });
+    const label = kind === "backend" ? "后台发货模版" : kind === "shipping" ? "工厂发货模版" : "工厂补货模版";
+    return sendXlsx(res, `${label}_${date}.xlsx`, buffer);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/factory-inventory/shipment-documents") {
+    const body = await parseBody(req);
+    const db = await readDb();
+    return sendJson(res, await buildShipmentDocumentFiles(db, body));
   }
 
   if (req.method === "POST" && url.pathname === "/api/factory-inventory/movements") {
