@@ -6,7 +6,9 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 data/fba-inventory-daily.json
+data/db.json
 data/gmail-token.json
 data/ads-token.json
 data/ads-profile.json
 data/network-debug.jsonl
+data/sp-api-report-cache.json
