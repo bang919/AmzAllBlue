@@ -726,6 +726,21 @@ function sendJson(res, value, status = 200) {
   res.end(JSON.stringify(value));
 }
 
+function csvEscape(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function sendCsv(res, filename, rows) {
+  const csv = rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
+  res.writeHead(200, {
+    "content-type": "text/csv; charset=utf-8",
+    "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    ...corsHeaders()
+  });
+  res.end(`\uFEFF${csv}`);
+}
+
 function parseBody(req) {
   return new Promise((resolveBody, reject) => {
     let raw = "";
@@ -1098,6 +1113,77 @@ function applyFactoryQuantity(product, delta) {
     }),
     updatedAt: new Date().toISOString()
   });
+}
+
+function parseFactoryBoxQuantity(boxSpec) {
+  const text = String(boxSpec || "");
+  const match = text.match(/\/\s*(\d+(?:\.\d+)?)\s*(?:个|pcs?|件|套)?/i)
+    || text.match(/(\d+(?:\.\d+)?)\s*(?:个|pcs?|件|套)\s*$/i);
+  return match ? Number(match[1]) : 0;
+}
+
+function parseFactoryBoxDimensions(boxSpec) {
+  const text = String(boxSpec || "");
+  const match = text.match(/(\d+(?:\.\d+)?)\s*[*x×]\s*(\d+(?:\.\d+)?)\s*[*x×]\s*(\d+(?:\.\d+)?)/i);
+  if (!match) return { lengthCm: 0, widthCm: 0, heightCm: 0 };
+  return {
+    lengthCm: Number(match[1] || 0),
+    widthCm: Number(match[2] || 0),
+    heightCm: Number(match[3] || 0)
+  };
+}
+
+async function buildFactoryMovementTemplateRows(db, { operation, date, kind }) {
+  const catalog = await ensureFactoryInventoryProductCatalog(db);
+  const products = (Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [])
+    .map(item => normalizeFactoryProduct(item));
+  const productById = new Map(products.map(product => [product.id, product]));
+  const movements = (Array.isArray(db.factoryInventory?.movements) ? db.factoryInventory.movements : [])
+    .map(item => normalizeFactoryMovement(item))
+    .filter(movement => movement.date === date && movement.note === operation && movement.quantity);
+  const items = movements.map(movement => {
+    const product = productById.get(movement.productId);
+    if (!product) return null;
+    const fbaProduct = catalog.fbaCatalogByAsin.get(product.asin) || {};
+    const quantity = Math.abs(Number(movement.quantity || 0));
+    const unitsPerBox = parseFactoryBoxQuantity(product.boxSpec);
+    const boxCount = unitsPerBox > 0 ? Math.ceil(quantity / unitsPerBox) : 0;
+    const dimensions = parseFactoryBoxDimensions(product.boxSpec);
+    return {
+      name: product.name || fbaProduct.title || product.asin,
+      asin: product.asin,
+      fnSku: fbaProduct.fnSku || "",
+      sellerSku: fbaProduct.sellerSku || product.asin,
+      quantity,
+      unitsPerBox,
+      boxCount,
+      ...dimensions
+    };
+  }).filter(Boolean);
+
+  if (kind === "backend") {
+    return [
+      ["Merchant SKU", "Quantity", "Prep owner", "Labeling owner", "Units per box", "Number of boxes", "Box length (in)", "Box width (in)", "Box height (in)", "Box weight (lb)"],
+      ...items.map(item => [
+        item.sellerSku,
+        item.quantity,
+        "",
+        "",
+        item.unitsPerBox || "",
+        item.boxCount || "",
+        item.lengthCm ? (item.lengthCm / 2.54).toFixed(2) : "",
+        item.widthCm ? (item.widthCm / 2.54).toFixed(2) : "",
+        item.heightCm ? (item.heightCm / 2.54).toFixed(2) : "",
+        item.lengthCm === 60 ? 45 : 33
+      ])
+    ];
+  }
+
+  const quantityLabel = kind === "replenishment" ? "补货数(套)" : "发货数(套)";
+  return [
+    ["名称", "FNSKU", "每箱数量", quantityLabel, "共多少箱"],
+    ...items.map(item => [item.name, item.fnSku, item.unitsPerBox || "", item.quantity, item.boxCount || ""])
+  ];
 }
 
 async function buildFbaProductCatalog(db) {
@@ -4106,6 +4192,18 @@ async function handleApi(req, res, url) {
     const catalog = await ensureFactoryInventoryProductCatalog(db);
     if (catalog.changed) await writeDb(db);
     return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/factory-inventory/movement-template.csv") {
+    const operation = String(url.searchParams.get("operation") || "").trim();
+    const date = String(url.searchParams.get("date") || "").slice(0, 10);
+    const kind = String(url.searchParams.get("kind") || "").trim();
+    if (!operation || !date) return sendJson(res, { error: "Missing movement row identity" }, 400);
+    if (!["shipping", "replenishment", "backend"].includes(kind)) return sendJson(res, { error: "Invalid template kind" }, 400);
+    const db = await readDb();
+    const rows = await buildFactoryMovementTemplateRows(db, { operation, date, kind });
+    const label = kind === "backend" ? "后台发货模版" : kind === "shipping" ? "发货模版" : "补货模版";
+    return sendCsv(res, `${label}_${date}.csv`, rows);
   }
 
   if (req.method === "POST" && url.pathname === "/api/factory-inventory/movements") {

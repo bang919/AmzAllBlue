@@ -1045,6 +1045,75 @@ function closeModal(modal) {
   modal.remove();
 }
 
+function downloadTextFile(filename, content, type = "text/csv;charset=utf-8") {
+  const blob = new Blob([content], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function csvEscape(value) {
+  const text = String(value ?? "");
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+function toCsv(rows) {
+  return `\uFEFF${rows.map(row => row.map(csvEscape).join(",")).join("\r\n")}`;
+}
+
+function parseCsvRows(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  const source = String(text || "");
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    const next = source[index + 1];
+    if (quoted) {
+      if (char === '"' && next === '"') {
+        cell += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        cell += char;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+    } else if (char === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (char === "\n") {
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else if (char !== "\r") {
+      cell += char;
+    }
+  }
+  row.push(cell);
+  if (row.length > 1 || row[0]) rows.push(row);
+  return rows;
+}
+
+function csvRowsToObjects(rows) {
+  const headerIndex = rows.findIndex(row => row.some(cell => /sku|fnsku|quantity|box|箱/i.test(String(cell || ""))));
+  if (headerIndex === -1) return [];
+  const headers = rows[headerIndex].map(cell => String(cell || "").trim());
+  return rows.slice(headerIndex + 1)
+    .filter(row => row.some(cell => String(cell || "").trim()))
+    .map(row => Object.fromEntries(headers.map((header, index) => [header, row[index] ?? ""])));
+}
+
 function createModal(title, bodyHtml) {
   const overlay = document.createElement("div");
   overlay.className = "modal-backdrop";
@@ -1838,6 +1907,42 @@ function sortFactoryProductsForMatrix(items) {
   });
 }
 
+function getFactoryMovementTemplateKind(operation) {
+  const text = String(operation || "");
+  if (/发货|出库|发出/i.test(text)) return "shipping";
+  if (/补货|入库|进货/i.test(text)) return "replenishment";
+  return "";
+}
+
+function factoryMovementTemplateButtons(row) {
+  const kind = getFactoryMovementTemplateKind(row.operation);
+  if (!kind) return "";
+  const baseAttrs = `data-template-operation="${escapeHtml(row.operation)}" data-template-date="${escapeHtml(row.date || "")}"`;
+  if (kind === "shipping") {
+    return `
+      <span class="factory-row-template-tools" aria-label="下载发货模板">
+        <button type="button" class="factory-row-shipping-button" data-download-movement-template="shipping" ${baseAttrs}>下载工厂发货模版</button>
+        <button type="button" class="factory-row-shipping-button" data-download-movement-template="backend" ${baseAttrs}>下载后台发货模版</button>
+        <button type="button" class="factory-row-documents-button" data-open-factory-documents>回填货件资料</button>
+      </span>
+    `;
+  }
+  return `
+    <span class="factory-row-template-tools" aria-label="下载补货模板">
+      <button type="button" class="factory-row-replenishment-button" data-download-movement-template="replenishment" ${baseAttrs}>下载工厂补货模版</button>
+    </span>
+  `;
+}
+
+function downloadFactoryMovementTemplate(button) {
+  const kind = button?.dataset?.downloadMovementTemplate || "";
+  const operation = button?.dataset?.templateOperation || "";
+  const date = button?.dataset?.templateDate || "";
+  if (!kind || !operation || !date) return;
+  const params = new URLSearchParams({ kind, operation, date });
+  window.location.href = `/api/factory-inventory/movement-template.csv?${params.toString()}`;
+}
+
 function renderFactoryInventory() {
   const matrixBody = $("#factoryMatrixBody");
   if (!matrixBody) return;
@@ -1982,7 +2087,10 @@ function renderFactoryInventory() {
           <button type="button" class="factory-row-delete" data-delete-row-operation="${escapeHtml(row.operation)}" data-delete-row-date="${escapeHtml(row.date || "")}" title="删除这一行">-</button>
           <span>${escapeHtml(row.operation)}</span>
         </td>
-        <td class="factory-sticky-col factory-left-2">${escapeHtml(row.date || "-")}</td>
+        <td class="factory-sticky-col factory-left-2 factory-row-date-cell">
+          ${escapeHtml(row.date || "-")}
+          ${factoryMovementTemplateButtons(row)}
+        </td>
         ${visibleProducts.map((product, index) => {
           const value = Number(row.quantities.get(product.id) || 0);
           return `<td class="factory-product-cell ${productGroupClass(product)} factory-col-${index % 5} ${value < 0 ? "quantity-negative" : value > 0 ? "quantity-positive" : ""}">${value ? `${value > 0 ? "+" : ""}${formatNumber(value)}` : ""}</td>`;
@@ -2107,7 +2215,7 @@ async function insertFbaPlanToFactory(type) {
   factoryMovements = data.movements || [];
   factoryTotals = data.totals || {};
   factoryLoaded = true;
-  alert(`已加入工厂库存：${operation}，共 ${rowCount} 个 ASIN，${formatNumber(totalQuantity)} 件。请到工厂库存页面查看；发货计划、补货计划下载功能后续再做。`);
+  alert(`已加入工厂库存：${operation}，共 ${rowCount} 个 ASIN，${formatNumber(totalQuantity)} 件。请到工厂库存页面继续下载模版、回填货件资料等后续操作。`);
 }
 
 let factoryDraggedProductId = "";
@@ -2321,6 +2429,164 @@ async function openFactoryMovementModal() {
       alert(error.message);
     } finally {
       setBusy(button, false, "保存");
+    }
+  });
+}
+
+function findFactoryProductForSku(sku) {
+  const normalized = String(sku || "").trim().toLowerCase();
+  if (!normalized) return null;
+  return factoryProducts.find(product => [
+    product.sellerSku,
+    product.fnSku,
+    product.asin
+  ].some(value => String(value || "").trim().toLowerCase() === normalized)) || null;
+}
+
+function pickCsvValue(row, names) {
+  const entries = Object.entries(row || {});
+  for (const name of names) {
+    const direct = row[name];
+    if (direct !== undefined && direct !== "") return direct;
+    const found = entries.find(([key]) => key.trim().toLowerCase() === name.trim().toLowerCase());
+    if (found && found[1] !== "") return found[1];
+  }
+  return "";
+}
+
+function parseShipmentFilename(filename) {
+  const stem = String(filename || "").replace(/\.(csv|txt)$/i, "");
+  const parts = stem.split("_");
+  return {
+    fbaNumber: parts[0] || "",
+    poNumber: parts[1] || "",
+    warehouseCode: parts[2] || ""
+  };
+}
+
+async function openFactoryDocumentsModal() {
+  if (!factoryLoaded) {
+    await loadFactoryInventory();
+  }
+  const modal = createModal("回填货件资料", `
+    <div class="modal-body factory-documents-modal">
+      <p class="hint">后台创建发货计划后，上传以 FBA 开头的 CSV，生成贴标资料和发票资料。</p>
+      <label>
+        发票类型
+        <select id="factoryInvoiceType">
+          <option value="jinsheng">锦盛天成发票</option>
+          <option value="xiyue">赤道/喜悦发票</option>
+        </select>
+      </label>
+      <div id="factoryShipmentDropZone" class="factory-shipment-drop-zone" role="button" tabindex="0">
+        <strong>拖拽 FBA 发货 CSV 到这里</strong>
+        <span>或点击选择文件，支持多个 CSV</span>
+        <small id="factoryShipmentFileNames">尚未选择文件</small>
+        <input id="factoryShipmentFiles" type="file" accept=".csv,text/csv" multiple hidden>
+      </div>
+      <div class="fba-modal-actions">
+        <button type="button" class="secondary-button" data-close-modal>取消</button>
+        <button type="button" id="factoryGenerateDocumentsBtn">生成并下载</button>
+      </div>
+    </div>
+  `);
+  const fileInput = modal.querySelector("#factoryShipmentFiles");
+  const dropZone = modal.querySelector("#factoryShipmentDropZone");
+  const fileNames = modal.querySelector("#factoryShipmentFileNames");
+  const updateFileNames = () => {
+    const files = [...(fileInput.files || [])];
+    fileNames.textContent = files.length ? files.map(file => file.name).join("、") : "尚未选择文件";
+  };
+  const setFiles = files => {
+    const transfer = new DataTransfer();
+    [...files].forEach(file => transfer.items.add(file));
+    fileInput.files = transfer.files;
+    updateFileNames();
+  };
+  dropZone.addEventListener("click", () => fileInput.click());
+  dropZone.addEventListener("keydown", event => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    fileInput.click();
+  });
+  fileInput.addEventListener("change", updateFileNames);
+  ["dragenter", "dragover"].forEach(type => {
+    dropZone.addEventListener(type, event => {
+      event.preventDefault();
+      dropZone.classList.add("drag-over");
+    });
+  });
+  ["dragleave", "drop"].forEach(type => {
+    dropZone.addEventListener(type, event => {
+      event.preventDefault();
+      dropZone.classList.remove("drag-over");
+    });
+  });
+  dropZone.addEventListener("drop", event => {
+    const files = [...(event.dataTransfer?.files || [])].filter(file => /\.csv$/i.test(file.name));
+    if (!files.length) {
+      alert("请拖入 CSV 文件。");
+      return;
+    }
+    setFiles(files);
+  });
+  modal.querySelector("#factoryGenerateDocumentsBtn").addEventListener("click", async () => {
+    const button = modal.querySelector("#factoryGenerateDocumentsBtn");
+    const files = [...(modal.querySelector("#factoryShipmentFiles")?.files || [])];
+    if (!files.length) {
+      alert("请先上传 FBA 发货 CSV。");
+      return;
+    }
+    setBusy(button, true, "生成并下载");
+    try {
+      const labelRows = [["文件", "名称", "箱子数量", "编号"]];
+      const invoiceRows = [[
+        "发票类型", "FBA编号", "PO号", "仓库号", "货箱编号", "SKU", "ASIN", "品名", "单箱数量", "箱长(CM)", "箱宽(CM)", "箱高(CM)", "申报单价", "币种", "材质", "海关编码"
+      ]];
+      for (const file of files) {
+        if (!/^fba/i.test(file.name)) {
+          alert(`跳过 ${file.name}：文件名需要以 FBA 开头。`);
+          continue;
+        }
+        const filenameInfo = parseShipmentFilename(file.name);
+        const rows = csvRowsToObjects(parseCsvRows(await file.text()));
+        for (const row of rows) {
+          const sku = pickCsvValue(row, ["Merchant SKU", "MSKU", "SKU", "seller-sku", "sku"]);
+          const quantity = Number(pickCsvValue(row, ["Quantity", "Shipped", "Units", "数量"]) || 0);
+          const boxCount = Number(pickCsvValue(row, ["Number of boxes", "Box count", "箱数"]) || 0) || quantity || 1;
+          const boxNumber = pickCsvValue(row, ["Box number", "Box ID", "Carton ID", "箱号"]) || "";
+          const product = findFactoryProductForSku(sku);
+          const boxQty = parseBoxQuantity(product?.boxSpec || "");
+          const dims = String(product?.boxSpec || "").match(/(\d+(?:\.\d+)?)\s*[*x×]\s*(\d+(?:\.\d+)?)\s*[*x×]\s*(\d+(?:\.\d+)?)/i) || [];
+          labelRows.push([file.name, product?.name || sku, boxCount, boxNumber]);
+          invoiceRows.push([
+            modal.querySelector("#factoryInvoiceType").value === "jinsheng" ? "锦盛天成发票" : "赤道/喜悦发票",
+            filenameInfo.fbaNumber,
+            filenameInfo.poNumber,
+            filenameInfo.warehouseCode,
+            boxNumber || filenameInfo.fbaNumber,
+            sku,
+            product?.asin || "",
+            product?.name || sku,
+            boxQty || quantity || "",
+            dims[1] || "",
+            dims[2] || "",
+            dims[3] || "",
+            "3.5",
+            "USD",
+            "Cotton",
+            "6307900090"
+          ]);
+        }
+      }
+      const date = new Date().toISOString().slice(0, 10);
+      downloadTextFile(`贴标_${date}.csv`, toCsv(labelRows));
+      downloadTextFile(`发票资料_${date}.csv`, toCsv(invoiceRows));
+      closeModal(modal);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setBusy(button, false, "生成并下载");
     }
   });
 }
@@ -2903,11 +3169,24 @@ $("#fbaReplenishmentToggleBtn").addEventListener("click", async () => {
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
 $("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(error => alert(error.message)));
-$("#factoryMovementBtn").addEventListener("click", () => openFactoryMovementModal().catch(error => alert(error.message)));
 $("#factoryRefreshBtn").addEventListener("click", () => loadFactoryInventory().catch(error => alert(error.message)));
 $("#factorySearch").addEventListener("input", renderFactoryInventory);
 $("#factoryStockFilter").addEventListener("change", renderFactoryInventory);
 $("#factoryMatrixBody").addEventListener("click", event => {
+  const documentsButton = event.target?.closest?.("[data-open-factory-documents]");
+  if (documentsButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    openFactoryDocumentsModal().catch(error => alert(error.message));
+    return;
+  }
+  const downloadTemplateButton = event.target?.closest?.("[data-download-movement-template]");
+  if (downloadTemplateButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    downloadFactoryMovementTemplate(downloadTemplateButton);
+    return;
+  }
   const deleteProductButton = event.target?.closest?.("[data-delete-product-id]");
   if (deleteProductButton) {
     event.preventDefault();
