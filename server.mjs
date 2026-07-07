@@ -1587,6 +1587,7 @@ async function checkSpApiStatus() {
 }
 
 const US_MARKETPLACE_TIME_ZONE = process.env.AMZ_US_MARKETPLACE_TIME_ZONE || "America/Los_Angeles";
+const SALES_COMPLETE_BUFFER_HOURS = Number(process.env.AMZ_SALES_COMPLETE_BUFFER_HOURS || 12);
 
 function getZonedParts(date, timeZone) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -1638,6 +1639,21 @@ function dateRangeInclusive(startDate, endDate) {
 function isFbaDailyFrozen(dateValue) {
   const today = formatDateInTimeZone();
   return daysBetweenInclusive(dateValue, today) - 1 > 7;
+}
+
+function isDateReadyForSavedSales(dateValue, fetchedAt = new Date()) {
+  const date = String(dateValue || "").slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  const fetchedTime = fetchedAt instanceof Date ? fetchedAt.getTime() : new Date(fetchedAt).getTime();
+  if (!Number.isFinite(fetchedTime)) return false;
+  const bufferMs = Number.isFinite(SALES_COMPLETE_BUFFER_HOURS)
+    ? Math.max(0, SALES_COMPLETE_BUFFER_HOURS) * 60 * 60 * 1000
+    : 12 * 60 * 60 * 1000;
+  return fetchedTime > zonedDateTimeToUtc(date, 23, 59, 59).getTime() + bufferMs;
+}
+
+function isCompleteSalesDateMarker(row) {
+  return row?.sellerSku === FBA_DATE_MARKER_SKU && row.salesFetchedAt && isDateReadyForSavedSales(row.date, row.salesFetchedAt);
 }
 
 function toIsoDateStart(value) {
@@ -2514,14 +2530,11 @@ async function upsertFbaDailyRecords(records, options = {}) {
 }
 
 function fbaDatesWithSalesRecords(rows, marketplaceId) {
-  const today = formatDateInTimeZone();
   const dates = new Set();
   for (const row of rows) {
     if (row.marketplaceId !== marketplaceId) continue;
-    if (row.sellerSku !== FBA_DATE_MARKER_SKU) continue;
-    if (!row.salesFetchedAt) continue;
+    if (!isCompleteSalesDateMarker(row)) continue;
     const date = String(row.date || "").slice(0, 10);
-    if (date === today) continue;
     dates.add(date);
   }
   return dates;
@@ -2607,26 +2620,26 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
 async function getFbaDailyDateStatus() {
   const rows = await readFbaDailyRows();
   const config = getSpApiConfig();
-  const today = formatDateInTimeZone();
   const byDate = new Map();
   for (const row of rows) {
     if (row.marketplaceId !== config.marketplaceId) continue;
     const date = String(row.date || "").slice(0, 10);
     if (!date) continue;
-    if (date === today) continue;
     const item = byDate.get(date) || {
       date,
       rowCount: 0,
       inventoryCount: 0,
       salesCount: 0,
       salesMarkerCount: 0,
+      pendingSalesMarkerCount: 0,
       complete: false,
       frozenCount: 0
     };
     item.rowCount += 1;
     if (row.inventoryFetchedAt) item.inventoryCount += 1;
     if (row.salesFetchedAt) item.salesCount += 1;
-    if (row.sellerSku === FBA_DATE_MARKER_SKU && row.salesFetchedAt) item.salesMarkerCount += 1;
+    if (isCompleteSalesDateMarker(row)) item.salesMarkerCount += 1;
+    else if (row.sellerSku === FBA_DATE_MARKER_SKU && row.salesFetchedAt) item.pendingSalesMarkerCount += 1;
     if (row.frozenAt) item.frozenCount += 1;
     item.complete = item.inventoryCount > 0 && item.salesMarkerCount > 0;
     byDate.set(date, item);
