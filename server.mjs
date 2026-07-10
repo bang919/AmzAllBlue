@@ -1288,6 +1288,9 @@ function calculateFactoryInventoryValue(product) {
 
 function updateFactoryProduct(input, patch) {
   const next = { ...input };
+  if (Object.prototype.hasOwnProperty.call(patch, "name")) {
+    next.name = String(patch.name || "").trim();
+  }
   if (Object.prototype.hasOwnProperty.call(patch, "asin")) {
     next.asin = String(patch.asin || "").trim().toUpperCase();
   }

@@ -1073,6 +1073,24 @@ h2 {
   text-align: left;
 }
 
+.fba-factory-name-input {
+  width: 100%;
+  min-width: 0;
+  height: 30px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  padding: 0 8px;
+  font: inherit;
+  color: #0f172a;
+  background: #fff;
+}
+
+.fba-factory-name-input:focus {
+  outline: none;
+  border-color: #2563eb;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
+}
+
 .fba-table .fba-col-totalGoodsQuantity,
 .fba-table .fba-col-fulfillableQuantity,
 .fba-table .fba-col-inboundQuantity,
@@ -1379,7 +1397,7 @@ h2 {
 }
 
 .factory-toolbar {
-  grid-template-columns: minmax(280px, 1fr) 180px;
+  grid-template-columns: minmax(280px, 1fr) 180px 120px;
 }
 
 .factory-matrix-wrap {
@@ -1400,8 +1418,8 @@ h2 {
 }
 
 .factory-matrix-table td {
-  width: 138px;
-  min-width: 138px;
+  width: var(--factory-product-column-width, 170px);
+  min-width: var(--factory-product-column-width, 170px);
   height: 31px;
   padding: 5px 7px;
   border-right: 1px solid #d1d5db;

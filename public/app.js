@@ -58,6 +58,7 @@ const FBA_FILTERS_KEY = "amazonAggregator.fbaFilters.v1";
 const FBA_COLUMN_WIDTHS_KEY = "amazonAggregator.fbaColumnWidths.v1";
 const FBA_REPLENISHMENT_OVERRIDES_KEY = "amazonAggregator.fbaReplenishment.overrides.v1";
 const FBA_REPLENISHMENT_MULTIPLIER_KEY = "amazonAggregator.fbaReplenishment.multiplier.v1";
+const FACTORY_COLUMN_WIDTH_KEY = "amazonAggregator.factoryColumnWidth.v1";
 const fbaDateStatus = new Map();
 let dateRangePickerOpen = false;
 let datePickerMonth = "";
@@ -67,6 +68,8 @@ let fbaColumnFilters = {};
 let fbaColumnWidths = {};
 let fbaColumnResizeState = null;
 let fbaReplenishmentOpen = false;
+let factoryProductColumnWidth = Number(localStorage.getItem(FACTORY_COLUMN_WIDTH_KEY) || 170);
+if (!Number.isFinite(factoryProductColumnWidth) || factoryProductColumnWidth <= 0) factoryProductColumnWidth = 170;
 let fbaReplenishmentMultiplier = Number(localStorage.getItem(FBA_REPLENISHMENT_MULTIPLIER_KEY) || 1.2);
 if (!Number.isFinite(fbaReplenishmentMultiplier) || fbaReplenishmentMultiplier <= 0) fbaReplenishmentMultiplier = 1.2;
 let fbaReplenishmentOverrides = {};
@@ -97,7 +100,7 @@ const fbaColumns = [
   { key: "parentAsin", label: "父ASIN", type: "text", value: product => product.parentAsin || "", render: product => product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-" },
   { key: "fnSku", label: "FNSKU/SKU", type: "text", value: product => `${product.fnSku || ""} ${product.sellerSku || ""}`, render: product => `<strong>${escapeHtml(product.fnSku || "-")}</strong><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "title", label: "标题", type: "text", value: product => `${product.title || ""} ${product.brand || ""} ${product.condition || ""}`, render: product => `${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span>` },
-  { key: "factoryName", label: "内部名", type: "text", value: product => product.factoryName || getFactoryProductForFbaProduct(product)?.name || "", render: product => escapeHtml(product.factoryName || getFactoryProductForFbaProduct(product)?.name || "-") },
+  { key: "factoryName", label: "内部名", type: "text", value: product => getFbaProductFactoryName(product), render: product => renderFbaFactoryNameCell(product) },
   { key: "factoryFbaTotalQuantity", label: "工厂+FBA\n总库存", type: "number", value: product => getProductFactoryFbaTotalQuantity(product), render: product => formatInventoryNumber(getProductFactoryFbaTotalQuantity(product)) },
   { key: "factoryQuantity", label: "工厂总库存", type: "number", value: product => getProductFactoryQuantity(product), render: product => formatInventoryNumber(getProductFactoryQuantity(product)) },
   { key: "totalGoodsQuantity", label: "FBA总库存", type: "number", value: product => getProductTotalGoods(product), render: product => formatInventoryNumber(getProductTotalGoods(product)) },
@@ -337,6 +340,14 @@ function getFactoryProductForFbaProduct(product) {
   return factoryProducts.find(item => String(item.asin || "").trim().toUpperCase() === asin) || null;
 }
 
+function getFbaProductFactoryName(product) {
+  return product?.factoryName || getFactoryProductForFbaProduct(product)?.name || "";
+}
+
+function getFbaProductFactoryProductId(product) {
+  return product?.factoryProductId || getFactoryProductForFbaProduct(product)?.id || "";
+}
+
 function updateFbaReplenishmentOverride(product, patch) {
   const key = getFbaReplenishmentKey(product);
   const { grade, ...rowPatch } = patch || {};
@@ -490,6 +501,41 @@ function renderFbaGradeCell(product) {
   `;
 }
 
+function renderFbaFactoryNameCell(product) {
+  const factoryProductId = getFbaProductFactoryProductId(product);
+  const value = getFbaProductFactoryName(product);
+  if (!factoryProductId) {
+    return `<span title="这个 ASIN 还没有对应的工厂库存商品">${escapeHtml(value || "-")}</span>`;
+  }
+  return `
+    <input class="fba-factory-name-input" data-fba-factory-name data-product-id="${escapeHtml(factoryProductId)}" type="text" value="${escapeHtml(value)}" placeholder="内部名">
+  `;
+}
+
+async function saveFactoryProductName(productId, name) {
+  const currentProduct = factoryProducts.find(item => item.id === productId);
+  const currentFbaProduct = products.find(product => getFbaProductFactoryProductId(product) === productId);
+  const current = String(currentProduct?.name ?? currentFbaProduct?.factoryName ?? "");
+  const nextName = String(name || "").trim();
+  if (nextName === current) return;
+  const data = await api(`/api/factory-inventory/products/${encodeURIComponent(productId)}`, {
+    method: "PUT",
+    body: { name: nextName }
+  });
+  factoryProducts = data.products || [];
+  factoryMovements = data.movements || [];
+  factoryTotals = data.totals || {};
+  factoryProducts = factoryProducts.map(item => item.id === productId ? { ...item, name: nextName } : item);
+  const updated = factoryProducts.find(item => item.id === productId);
+  const updatedAsin = String(updated?.asin || currentProduct?.asin || "").trim().toUpperCase();
+  products = products.map(product => {
+    const productFactoryId = getFbaProductFactoryProductId(product);
+    const productAsin = String(product.asin || "").trim().toUpperCase();
+    if (productFactoryId !== productId && (!updatedAsin || productAsin !== updatedAsin)) return product;
+    return { ...product, factoryProductId: productId, factoryName: updated?.name || nextName };
+  });
+}
+
 function renderFbaDailySalesCell(product) {
   const plan = calculateFbaReplenishmentPlan(product);
   const sales = product.replenishmentSales || {};
@@ -583,6 +629,25 @@ const escapeHtml = value => String(value ?? "").replace(/[&<>"']/g, char => ({
   "\"": "&quot;",
   "'": "&#039;"
 }[char]));
+
+function clampFactoryColumnWidth(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(100, Math.min(320, Math.round(number))) : 170;
+}
+
+function applyFactoryColumnWidth(width = factoryProductColumnWidth) {
+  factoryProductColumnWidth = clampFactoryColumnWidth(width);
+  document.documentElement.style.setProperty("--factory-product-column-width", `${factoryProductColumnWidth}px`);
+  const input = $("#factoryColumnWidth");
+  if (input) input.value = String(factoryProductColumnWidth);
+}
+
+function saveFactoryColumnWidth(width) {
+  applyFactoryColumnWidth(width);
+  localStorage.setItem(FACTORY_COLUMN_WIDTH_KEY, String(factoryProductColumnWidth));
+}
+
+applyFactoryColumnWidth();
 
 function renderColumnLabel(label) {
   return escapeHtml(label).replace(/\n/g, "<br>");
@@ -2146,7 +2211,7 @@ function renderFactoryInventory() {
     <tr class="factory-meta-row factory-title-row">
       <td class="factory-sticky-col factory-left-1"></td>
       <td class="factory-sticky-col factory-left-2">内部名</td>
-      ${productCells(product => `<div class="factory-product-title" title="${escapeHtml(product.name || product.asin || "")}">${escapeHtml(product.name || product.asin || "-")}</div>`, "factory-title-cell", true)}
+      ${productCells(product => editableInput(product, "name", product.name), "factory-title-cell", true)}
     </tr>
     <tr class="factory-meta-row factory-asin-row">
       <td class="factory-sticky-col factory-left-1"></td>
@@ -2224,6 +2289,17 @@ async function saveFactoryProductField(input) {
     factoryProducts = data.products || [];
     factoryMovements = data.movements || [];
     factoryTotals = data.totals || {};
+    if (field === "name") {
+      factoryProducts = factoryProducts.map(item => item.id === productId ? { ...item, name: String(nextValue || "") } : item);
+      const updated = factoryProducts.find(item => item.id === productId);
+      const updatedAsin = String(updated?.asin || product.asin || "").trim().toUpperCase();
+      products = products.map(item => {
+        const itemFactoryId = getFbaProductFactoryProductId(item);
+        const itemAsin = String(item.asin || "").trim().toUpperCase();
+        if (itemFactoryId !== productId && (!updatedAsin || itemAsin !== updatedAsin)) return item;
+        return { ...item, factoryProductId: productId, factoryName: updated?.name || String(nextValue || "") };
+      });
+    }
     renderFactoryInventory();
     renderDashboard();
     $("#sandboxStatus").textContent = "工厂库存商品信息已保存";
@@ -3243,6 +3319,12 @@ $("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(e
 $("#factoryRefreshBtn").addEventListener("click", () => loadFactoryInventory().catch(error => alert(error.message)));
 $("#factorySearch").addEventListener("input", renderFactoryInventory);
 $("#factoryStockFilter").addEventListener("change", renderFactoryInventory);
+$("#factoryColumnWidth").addEventListener("change", event => saveFactoryColumnWidth(event.target.value));
+$("#factoryColumnWidth").addEventListener("keydown", event => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  event.target.blur();
+});
 $("#factoryMatrixBody").addEventListener("click", event => {
   const documentsButton = event.target?.closest?.("[data-open-factory-documents]");
   if (documentsButton) {
@@ -3283,12 +3365,14 @@ $("#factoryMatrixBody").addEventListener("change", event => {
 });
 $("#factoryMatrixBody").addEventListener("keydown", event => {
   if (event.key === "Enter" && event.target?.closest?.(".factory-draft-row")) {
+    if (event.isComposing || event.keyCode === 229) return;
     event.preventDefault();
     addFactoryDraftRow().catch(error => alert(error.message));
     return;
   }
   const input = event.target?.closest?.("[data-factory-field]");
   if (!input || event.key !== "Enter") return;
+  if (event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
   input.blur();
 });
@@ -3396,6 +3480,21 @@ $("#fbaTableHead").addEventListener("keydown", event => {
   input.blur();
 });
 $("#productList").addEventListener("change", event => {
+  const factoryNameInput = event.target?.closest?.("[data-fba-factory-name]");
+  if (factoryNameInput) {
+    saveFactoryProductName(factoryNameInput.dataset.productId, factoryNameInput.value)
+      .then(() => {
+        renderProducts();
+        renderFactoryInventory();
+        renderDashboard();
+        $("#sandboxStatus").textContent = "内部名已保存";
+      })
+      .catch(error => {
+        alert(error.message);
+        renderProducts();
+      });
+    return;
+  }
   const input = event.target?.closest?.("[data-fba-plan-field]");
   if (!input) return;
   saveFbaPlanField(input).catch(error => alert(error.message));
@@ -3434,8 +3533,16 @@ $("#productList").addEventListener("click", event => {
   });
 });
 $("#productList").addEventListener("keydown", event => {
+  const factoryNameInput = event.target?.closest?.("[data-fba-factory-name]");
+  if (factoryNameInput && event.key === "Enter") {
+    if (event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    factoryNameInput.blur();
+    return;
+  }
   const input = event.target?.closest?.("[data-fba-plan-field]");
   if (!input || event.key !== "Enter") return;
+  if (event.isComposing || event.keyCode === 229) return;
   event.preventDefault();
   input.blur();
 });
