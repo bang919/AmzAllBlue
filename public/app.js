@@ -83,26 +83,7 @@ const fbaReplenishmentTargets = {
   abandoned: { label: "放弃", abandoned: true }
 };
 
-const fbaDefaultGradeByAsin = {
-  B0B37GZ7MM: "featured",
-  B0B5MS2LJ9: "featured",
-  B0B6SHZ4CV: "featured",
-  B0C3BHF49B: "featured",
-  B0CMPF28T2: "featured",
-  B0B6RV2HD9: "promoted",
-  B0B75LSCFR: "promoted",
-  B0B75M5VCN: "promoted",
-  B0BHNVRLBP: "promoted",
-  B0CDVH9YS6: "promoted",
-  B0CDVHSF26: "promoted",
-  B0CMPCDX16: "promoted",
-  B0CMPFJ3JW: "promoted",
-  B0DFZ1FDGD: "promoted",
-  B0GS6Y7LDG: "featured"
-};
-
 const fbaReplenishmentColumns = [
-  { key: "replenishmentGrade", label: "商品等级", type: "static", render: product => renderFbaGradeCell(product) },
   { key: "replenishmentDailySales", label: "日销量", type: "number", render: product => renderFbaDailySalesCell(product) },
   { key: "replenishmentBoxQty", label: "每箱数量", type: "number", render: product => renderFbaBoxQuantityCell(product) },
   { key: "replenishmentShippingQty", label: "发货数", type: "number", render: product => renderFbaPlanQuantityCell(product, "shipping") },
@@ -110,28 +91,29 @@ const fbaReplenishmentColumns = [
 ];
 
 const fbaColumns = [
+  { key: "replenishmentGrade", label: "商品等级", type: "static", always: true, render: product => renderFbaGradeCell(product) },
   { key: "image", label: "图片", type: "static", always: true, render: product => product.imageUrl ? `<img class="fba-thumb" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title || product.asin)}">` : `<div class="fba-thumb placeholder">无图</div>` },
   { key: "asinSku", label: "ASIN/MSKU", type: "text", always: true, value: product => `${product.asin || ""} ${product.sellerSku || ""}`, render: product => `<a href="https://www.amazon.com/dp/${escapeHtml(product.asin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.asin || "-")}</a><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "parentAsin", label: "父ASIN", type: "text", value: product => product.parentAsin || "", render: product => product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-" },
   { key: "fnSku", label: "FNSKU/SKU", type: "text", value: product => `${product.fnSku || ""} ${product.sellerSku || ""}`, render: product => `<strong>${escapeHtml(product.fnSku || "-")}</strong><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "title", label: "标题", type: "text", value: product => `${product.title || ""} ${product.brand || ""} ${product.condition || ""}`, render: product => `${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span>` },
   { key: "factoryName", label: "内部名", type: "text", value: product => product.factoryName || getFactoryProductForFbaProduct(product)?.name || "", render: product => escapeHtml(product.factoryName || getFactoryProductForFbaProduct(product)?.name || "-") },
-  { key: "factoryFbaTotalQuantity", label: "工厂+FBA\n总库存", type: "number", value: product => product.factoryFbaTotalQuantity, render: product => formatInventoryNumber(product.factoryFbaTotalQuantity) },
-  { key: "factoryQuantity", label: "工厂总库存", type: "number", value: product => product.factoryQuantity, render: product => formatInventoryNumber(product.factoryQuantity) },
+  { key: "factoryFbaTotalQuantity", label: "工厂+FBA\n总库存", type: "number", value: product => getProductFactoryFbaTotalQuantity(product), render: product => formatInventoryNumber(getProductFactoryFbaTotalQuantity(product)) },
+  { key: "factoryQuantity", label: "工厂总库存", type: "number", value: product => getProductFactoryQuantity(product), render: product => formatInventoryNumber(getProductFactoryQuantity(product)) },
   { key: "totalGoodsQuantity", label: "FBA总库存", type: "number", value: product => getProductTotalGoods(product), render: product => formatInventoryNumber(getProductTotalGoods(product)) },
-  { key: "fulfillableQuantity", label: "可售", type: "number", value: product => Number(product.fulfillableQuantity || 0), render: product => formatNumber(product.fulfillableQuantity) },
+  { key: "fulfillableQuantity", label: "可售", type: "number", value: product => Number(getProductInventoryField(product, "fulfillableQuantity") || 0), render: product => formatNumber(getProductInventoryField(product, "fulfillableQuantity")) },
   { key: "inboundQuantity", label: "在路上", type: "number", value: product => getProductInboundQuantity(product), render: product => formatInventoryNumber(getProductInboundQuantity(product)) },
-  { key: "inboundWorkingQuantity", label: "入库计划\n（在路上）", type: "number", value: product => product.inboundWorkingQuantity, render: product => formatInventoryNumber(product.inboundWorkingQuantity) },
-  { key: "inboundShippedQuantity", label: "已发货\n（在路上）", type: "number", value: product => product.inboundShippedQuantity, render: product => formatInventoryNumber(product.inboundShippedQuantity) },
-  { key: "inboundReceivingQuantity", label: "接收中\n（在路上）", type: "number", value: product => product.inboundReceivingQuantity, render: product => formatInventoryNumber(product.inboundReceivingQuantity) },
-  { key: "reservedQuantity", label: "预留", type: "number", value: product => product.reservedQuantity, render: product => formatInventoryNumber(product.reservedQuantity) },
-  { key: "unfulfillableQuantity", label: "不可售", type: "number", value: product => Number(product.unfulfillableQuantity || 0), render: product => formatNumber(product.unfulfillableQuantity) },
+  { key: "inboundWorkingQuantity", label: "入库计划\n（在路上）", type: "number", value: product => getProductInventoryField(product, "inboundWorkingQuantity"), render: product => formatInventoryNumber(getProductInventoryField(product, "inboundWorkingQuantity")) },
+  { key: "inboundShippedQuantity", label: "已发货\n（在路上）", type: "number", value: product => getProductInventoryField(product, "inboundShippedQuantity"), render: product => formatInventoryNumber(getProductInventoryField(product, "inboundShippedQuantity")) },
+  { key: "inboundReceivingQuantity", label: "接收中\n（在路上）", type: "number", value: product => getProductInventoryField(product, "inboundReceivingQuantity"), render: product => formatInventoryNumber(getProductInventoryField(product, "inboundReceivingQuantity")) },
+  { key: "reservedQuantity", label: "预留", type: "number", value: product => getProductInventoryField(product, "reservedQuantity"), render: product => formatInventoryNumber(getProductInventoryField(product, "reservedQuantity")) },
+  { key: "unfulfillableQuantity", label: "不可售", type: "number", value: product => Number(getProductInventoryField(product, "unfulfillableQuantity") || 0), render: product => formatNumber(getProductInventoryField(product, "unfulfillableQuantity")) },
   { key: "salesOrders", label: "售卖订单", type: "number", value: product => Number(product.salesOrders || 0), render: product => formatNumber(product.salesOrders) },
   { key: "salesUnits", label: "售卖数量", type: "number", value: product => Number(product.salesUnits || 0), render: product => formatNumber(product.salesUnits) },
   { key: "dailySales", label: "日销量", type: "number", value: product => Number(product.dailySales || 0), render: product => formatNumber(product.dailySales, 2) },
   { key: "stockoutDays", label: "缺货天数", type: "number", value: product => Number(product.stockoutDays || 0), render: product => Number(product.stockoutDays || 0) > 0 ? `<span class="stock-pill stock-low">${formatNumber(product.stockoutDays)} 天</span>` : "0" },
-  { key: "sellableDays", label: "FBA\n可售天数", type: "number", value: product => product.sellableDays, render: product => getProductTotalGoods(product) === null ? "/" : (product.sellableDays === null ? "无销量" : `<span class="stock-pill stock-${escapeHtml(product.stockLevel)}">${formatNumber(product.sellableDays)} 天</span>`) },
-  { key: "factoryFbaSellableDays", label: "工厂+FBA\n可售天数", type: "number", value: product => product.factoryFbaSellableDays, render: product => product.factoryFbaTotalQuantity === null || product.factoryFbaTotalQuantity === undefined ? "/" : (product.factoryFbaSellableDays === null ? "无销量" : `<span class="stock-pill stock-${escapeHtml(product.factoryFbaStockLevel)}">${formatNumber(product.factoryFbaSellableDays)} 天</span>`) }
+  { key: "sellableDays", label: "FBA\n可售天数", type: "number", value: product => getProductSellableDays(product), render: product => renderProductSellableDays(product) },
+  { key: "factoryFbaSellableDays", label: "工厂+FBA\n可售天数", type: "number", value: product => getProductFactoryFbaSellableDays(product), render: product => renderFactoryFbaSellableDays(product) }
 ];
 
 function getDefaultFbaColumnWidth(column) {
@@ -182,7 +164,7 @@ function renderFbaColumnWidths(visibleColumns = getVisibleFbaColumns()) {
   table.style.width = `${widths.reduce((sum, width) => sum + width, 0)}px`;
   const stickyKeys = new Set(fbaReplenishmentOpen
     ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "asinSku", "fnSku"]
-    : ["image", "asinSku", "fnSku"]);
+    : ["replenishmentGrade", "image", "asinSku", "fnSku"]);
   let stickyLeft = 0;
   visibleColumns.forEach((column, index) => {
     if (!stickyKeys.has(column.key)) return;
@@ -191,7 +173,85 @@ function renderFbaColumnWidths(visibleColumns = getVisibleFbaColumns()) {
   });
 }
 
+function getLatestRealtimeInventory(product) {
+  return product?.latestRealtimeInventory && typeof product.latestRealtimeInventory === "object"
+    ? product.latestRealtimeInventory
+    : null;
+}
+
+function getProductFactoryQuantity(product) {
+  if (fbaReplenishmentOpen) {
+    return Number(getFactoryProductForFbaProduct(product)?.currentQuantity || 0);
+  }
+  return product.factoryQuantity;
+}
+
+function getProductInventoryField(product, field) {
+  const latest = fbaReplenishmentOpen ? getLatestRealtimeInventory(product) : null;
+  if (latest && latest[field] !== null && latest[field] !== undefined && latest[field] !== "") {
+    return latest[field];
+  }
+  return product[field];
+}
+
+function getProductFactoryFbaTotalQuantity(product) {
+  const totalGoods = getProductTotalGoods(product);
+  if (fbaReplenishmentOpen) {
+    const factoryQuantity = getProductFactoryQuantity(product);
+    if (totalGoods === null || factoryQuantity === null || factoryQuantity === undefined) return null;
+    return Number(totalGoods || 0) + Number(factoryQuantity || 0);
+  }
+  if (totalGoods === null) return null;
+  if (product.factoryFbaTotalUsesFactory === false) return Number(totalGoods || 0);
+  const factoryQuantity = getProductFactoryQuantity(product);
+  if (factoryQuantity === null || factoryQuantity === undefined) return null;
+  return Number(totalGoods || 0) + Number(factoryQuantity || 0);
+}
+
+function stockLevelForDays(days) {
+  if (days === null || days === undefined) return "unknown";
+  return days < 14 ? "low" : days < 30 ? "medium" : "healthy";
+}
+
+function getProductSellableDays(product) {
+  const totalQuantity = getProductTotalGoods(product);
+  if (totalQuantity === null || totalQuantity === undefined) return null;
+  const dailySales = Number(product.dailySales || 0);
+  if (dailySales <= 0) return null;
+  return Math.floor(Number(totalQuantity || 0) / dailySales);
+}
+
+function renderProductSellableDays(product) {
+  const totalQuantity = getProductTotalGoods(product);
+  if (totalQuantity === null || totalQuantity === undefined) return "/";
+  const days = getProductSellableDays(product);
+  if (days === null) return "无销量";
+  return `<span class="stock-pill stock-${escapeHtml(stockLevelForDays(days))}">${formatNumber(days)} 天</span>`;
+}
+
+function getProductFactoryFbaSellableDays(product) {
+  const totalQuantity = getProductFactoryFbaTotalQuantity(product);
+  if (totalQuantity === null || totalQuantity === undefined) return null;
+  const dailySales = Number(product.dailySales || 0);
+  if (dailySales <= 0) return null;
+  return Math.floor(Number(totalQuantity || 0) / dailySales);
+}
+
+function renderFactoryFbaSellableDays(product) {
+  const totalQuantity = getProductFactoryFbaTotalQuantity(product);
+  if (totalQuantity === null || totalQuantity === undefined) return "/";
+  const days = getProductFactoryFbaSellableDays(product);
+  if (days === null) return "无销量";
+  return `<span class="stock-pill stock-${escapeHtml(stockLevelForDays(days))}">${formatNumber(days)} 天</span>`;
+}
+
 function getProductTotalGoods(product) {
+  const latest = fbaReplenishmentOpen ? getLatestRealtimeInventory(product) : null;
+  if (latest) {
+    return latest.totalGoodsQuantity === null || latest.totalGoodsQuantity === undefined
+      ? null
+      : Number(latest.totalGoodsQuantity || 0);
+  }
   if (product.totalGoodsQuantity === null || product.totalQuantity === null) return null;
   if (product.totalGoodsQuantity !== undefined && product.totalGoodsQuantity !== "") {
     return Number(product.totalGoodsQuantity || 0);
@@ -214,6 +274,12 @@ function getProductTotalGoods(product) {
 }
 
 function getProductInboundQuantity(product) {
+  const latest = fbaReplenishmentOpen ? getLatestRealtimeInventory(product) : null;
+  if (latest) {
+    return latest.inboundQuantity === null || latest.inboundQuantity === undefined
+      ? null
+      : Number(latest.inboundQuantity || 0);
+  }
   if (product.inboundQuantity !== null && product.inboundQuantity !== undefined && product.inboundQuantity !== "") {
     return Number(product.inboundQuantity || 0);
   }
@@ -230,14 +296,39 @@ function getFbaReplenishmentKey(product) {
   return String(product.sellerSku || product.asin || "").trim();
 }
 
+function getFbaGradeAsin(product) {
+  return String(product?.asin || "").trim().toUpperCase();
+}
+
 function saveFbaReplenishmentSettings() {
   localStorage.setItem(FBA_REPLENISHMENT_MULTIPLIER_KEY, String(fbaReplenishmentMultiplier));
   localStorage.setItem(FBA_REPLENISHMENT_OVERRIDES_KEY, JSON.stringify(fbaReplenishmentOverrides));
 }
 
+async function saveFbaGradesToServer(grades) {
+  const payload = {};
+  for (const [asin, grade] of Object.entries(grades || {})) {
+    const normalizedAsin = String(asin || "").trim().toUpperCase();
+    if (/^B[A-Z0-9]{9}$/.test(normalizedAsin) && fbaReplenishmentTargets[grade]) {
+      payload[normalizedAsin] = grade;
+    }
+  }
+  if (!Object.keys(payload).length) return null;
+  return api("/api/fba/grades", {
+    method: "POST",
+    body: { grades: payload }
+  });
+}
+
+function getFbaGradeOverride(product) {
+  return fbaReplenishmentTargets[product?.replenishmentGrade] ? product.replenishmentGrade : "";
+}
+
 function getFbaReplenishmentOverride(product) {
   const key = getFbaReplenishmentKey(product);
-  return key ? (fbaReplenishmentOverrides[key] || {}) : {};
+  const override = key ? (fbaReplenishmentOverrides[key] || {}) : {};
+  const grade = getFbaGradeOverride(product);
+  return grade ? { ...override, grade } : override;
 }
 
 function getFactoryProductForFbaProduct(product) {
@@ -248,8 +339,17 @@ function getFactoryProductForFbaProduct(product) {
 
 function updateFbaReplenishmentOverride(product, patch) {
   const key = getFbaReplenishmentKey(product);
-  if (!key) return;
-  fbaReplenishmentOverrides[key] = { ...(fbaReplenishmentOverrides[key] || {}), ...patch };
+  const { grade, ...rowPatch } = patch || {};
+  if (grade !== undefined) {
+    product.replenishmentGrade = grade;
+    if (key && fbaReplenishmentOverrides[key]?.grade !== undefined) {
+      const { grade: _legacyGrade, ...rest } = fbaReplenishmentOverrides[key];
+      fbaReplenishmentOverrides[key] = rest;
+    }
+  }
+  if (key && Object.keys(rowPatch).length) {
+    fbaReplenishmentOverrides[key] = { ...(fbaReplenishmentOverrides[key] || {}), ...rowPatch };
+  }
   saveFbaReplenishmentSettings();
 }
 
@@ -274,19 +374,9 @@ function formatPlanInputValue(value, digits = 2) {
   return String(Number(number.toFixed(digits)));
 }
 
-function getDefaultFbaReplenishmentGrade(product) {
-  const totalQuantity = product.factoryFbaTotalQuantity;
-  const dailySales = Number(product.dailySales || 0);
-  if (totalQuantity !== null && totalQuantity !== undefined && Number(totalQuantity || 0) === 0 && dailySales === 0) {
-    return "abandoned";
-  }
-  return fbaDefaultGradeByAsin[String(product.asin || "").trim().toUpperCase()] || "normal";
-}
-
 function calculateFbaReplenishmentPlan(product) {
   const override = getFbaReplenishmentOverride(product);
-  const defaultGrade = getDefaultFbaReplenishmentGrade(product);
-  const grade = fbaReplenishmentTargets[override.grade] ? override.grade : defaultGrade;
+  const grade = fbaReplenishmentTargets[override.grade] ? override.grade : "normal";
   const target = fbaReplenishmentTargets[grade];
   const baseDailySales = Number(product.replenishmentSales?.baseDailySales || product.dailySales || 0);
   const multiplier = Number(fbaReplenishmentMultiplier || 1.2);
@@ -297,6 +387,24 @@ function calculateFbaReplenishmentPlan(product) {
   const boxQuantity = Number.isFinite(Number(override.boxQuantity)) && Number(override.boxQuantity) > 0
     ? Number(override.boxQuantity)
     : parseBoxQuantity(product.factoryBoxSpec || getFactoryProductForFbaProduct(product)?.boxSpec);
+  if (fbaReplenishmentOpen && !getLatestRealtimeInventory(product)) {
+    return {
+      grade,
+      target,
+      baseDailySales,
+      multiplier,
+      calculatedDailySales,
+      dailySales,
+      boxQuantity,
+      fbaCoverageDays: 0,
+      totalCoverageDays: 0,
+      shippingQuantity: 0,
+      shippingBoxes: 0,
+      replenishmentQuantity: 0,
+      replenishmentBoxes: 0,
+      inventoryMissing: true
+    };
+  }
   if (target?.abandoned) {
     return {
       grade,
@@ -315,7 +423,7 @@ function calculateFbaReplenishmentPlan(product) {
     };
   }
   const fbaTotal = getProductTotalGoods(product);
-  const factoryQuantity = Number(product.factoryQuantity ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
+  const factoryQuantity = Number(getProductFactoryQuantity(product) ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
   const fbaCoverageDays = dailySales > 0 && fbaTotal !== null ? Number(fbaTotal || 0) / dailySales : 0;
   const effectiveFbaCoverageDays = Math.max(fbaCoverageDays, 30);
   const shippingRaw = Math.max(0, target.shippingDays - effectiveFbaCoverageDays) * dailySales;
@@ -400,12 +508,15 @@ function renderFbaBoxQuantityCell(product) {
 
 function renderFbaPlanQuantityCell(product, type) {
   const plan = calculateFbaReplenishmentPlan(product);
+  if (plan.inventoryMissing) {
+    return `<span title="缺少最新实时库存，不能生成发补货建议">/</span>`;
+  }
   const isShipping = type === "shipping";
   const boxes = isShipping ? plan.shippingBoxes : plan.replenishmentBoxes;
   const quantity = isShipping ? plan.shippingQuantity : plan.replenishmentQuantity;
   const boxesField = isShipping ? "shippingBoxes" : "replenishmentBoxes";
   const quantityField = isShipping ? "shippingQuantity" : "replenishmentQuantity";
-  const factoryQuantity = Number(product.factoryQuantity ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
+  const factoryQuantity = Number(getProductFactoryQuantity(product) ?? getFactoryProductForFbaProduct(product)?.currentQuantity ?? 0);
   const factoryBoxesAfterReplenishment = plan.boxQuantity > 0
     ? (factoryQuantity + Number(plan.replenishmentQuantity || 0)) / plan.boxQuantity
     : 0;
@@ -1377,7 +1488,7 @@ function productMatches(product) {
 
 function getVisibleFbaColumns() {
   const selectedBaseColumns = fbaColumns.filter(column => column.always || fbaVisibleColumns.has(column.key));
-  const pinnedOrder = ["image", "asinSku", "fnSku"];
+  const pinnedOrder = ["replenishmentGrade", "image", "asinSku", "fnSku"];
   const baseColumns = [
     ...pinnedOrder
       .map(key => selectedBaseColumns.find(column => column.key === key))
@@ -1722,24 +1833,48 @@ function renderProducts() {
   const summary = $("#fbaSummary");
   if (summary && window.fbaInventoryMeta) {
     const { totals, range, config, warnings, sales } = window.fbaInventoryMeta;
+    const displayTotals = fbaReplenishmentOpen
+      ? visible.reduce((acc, row) => {
+        const totalGoods = getProductTotalGoods(row);
+        const factoryQuantity = getProductFactoryQuantity(row);
+        const inboundQuantity = getProductInboundQuantity(row);
+        if (totalGoods === null || totalGoods === undefined) acc.totalGoodsQuantity = null;
+        else if (acc.totalGoodsQuantity !== null) acc.totalGoodsQuantity += totalGoods;
+        if (factoryQuantity === null || factoryQuantity === undefined) acc.factoryQuantity = null;
+        else if (acc.factoryQuantity !== null && row.asin && !acc.factoryAsins.has(row.asin)) {
+          acc.factoryAsins.add(row.asin);
+          acc.factoryQuantity += factoryQuantity || 0;
+        }
+        if (inboundQuantity === null || inboundQuantity === undefined) acc.inboundQuantity = null;
+        else if (acc.inboundQuantity !== null) acc.inboundQuantity += inboundQuantity || 0;
+        acc.fulfillableQuantity += getProductInventoryField(row, "fulfillableQuantity") || 0;
+        acc.salesUnits += row.salesUnits || 0;
+        return acc;
+      }, { totalGoodsQuantity: 0, factoryQuantity: 0, inboundQuantity: 0, fulfillableQuantity: 0, salesUnits: 0, factoryAsins: new Set() })
+      : totals;
+    const displayFactoryFbaTotal = displayTotals?.totalGoodsQuantity === null
+      ? null
+      : (displayTotals?.factoryQuantity === null
+        ? Number(displayTotals?.totalGoodsQuantity || 0)
+        : Number(displayTotals?.totalGoodsQuantity || 0) + Number(displayTotals?.factoryQuantity || 0));
     const inboundTotal = totals?.inventoryCompleteness === "partial"
       ? null
       : (totals?.inboundWorkingQuantity || 0) + (totals?.inboundShippedQuantity || 0) + (totals?.inboundReceivingQuantity || 0);
     summary.innerHTML = `
       <div class="fba-summary-card"><strong>${formatNumber(products.length)}</strong><span>SKU 数</span></div>
-      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.factoryFbaTotalQuantity)}</strong><span>工厂+FBA<br>总库存</span></div>
-      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.factoryQuantity)}</strong><span>工厂总库存</span></div>
-      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.totalGoodsQuantity ?? totals?.totalQuantity)}</strong><span>FBA总库存</span></div>
-      <div class="fba-summary-card"><strong>${formatNumber(totals?.fulfillableQuantity || 0)}</strong><span>可售</span></div>
-      <div class="fba-summary-card"><strong>${formatInventoryNumber(totals?.inboundQuantity ?? inboundTotal)}</strong><span>在路上</span></div>
-      <div class="fba-summary-card"><strong>${formatNumber(totals?.salesUnits || 0)}</strong><span>${escapeHtml(range?.dayCount || 0)} 天售卖数量</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(fbaReplenishmentOpen ? displayFactoryFbaTotal : totals?.factoryFbaTotalQuantity)}</strong><span>工厂+FBA<br>总库存</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(displayTotals?.factoryQuantity)}</strong><span>工厂总库存</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(fbaReplenishmentOpen ? displayTotals?.totalGoodsQuantity : (totals?.totalGoodsQuantity ?? totals?.totalQuantity))}</strong><span>FBA总库存</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(displayTotals?.fulfillableQuantity || 0)}</strong><span>可售</span></div>
+      <div class="fba-summary-card"><strong>${formatInventoryNumber(fbaReplenishmentOpen ? displayTotals?.inboundQuantity : (totals?.inboundQuantity ?? inboundTotal))}</strong><span>在路上</span></div>
+      <div class="fba-summary-card"><strong>${formatNumber(displayTotals?.salesUnits || 0)}</strong><span>${escapeHtml(range?.dayCount || 0)} 天售卖数量</span></div>
       <div class="fba-summary-card"><strong>${formatNumber(sales?.orderCount || 0)}</strong><span>订单数</span></div>
       <div class="fba-summary-card compact-card"><strong>${escapeHtml(config?.marketplaceId || "-")}</strong><span>Marketplace</span></div>
       ${warnings?.length ? `<div class="fba-warning">${escapeHtml(warnings[0])}${warnings.length > 1 ? `，另有 ${warnings.length - 1} 条提示` : ""}</div>` : ""}
     `;
   }
   if (!visible.length) {
-    list.innerHTML = `<tr><td colspan="${visibleColumns.length}"><div class="empty">暂无 FBA 库存数据。点击“查询”或“强制刷新数据”从 SP-API 拉取。</div></td></tr>`;
+    list.innerHTML = `<tr><td colspan="${visibleColumns.length}"><div class="empty">暂无 FBA 库存数据。点击“后台刷新数据”提交同步任务，完成后再查询。</div></td></tr>`;
     $("#fbaTotals").innerHTML = "";
     return;
   }
@@ -1755,24 +1890,29 @@ function renderProducts() {
     const rowTotalGoods = getProductTotalGoods(row);
     if (rowTotalGoods === null || rowTotalGoods === undefined) acc.hasIncompleteTotalGoods = true;
     else acc.totalGoodsQuantity += rowTotalGoods;
-    if (row.factoryQuantity === null || row.factoryQuantity === undefined) acc.hasIncompleteFactory = true;
+    const rowFactoryQuantity = getProductFactoryQuantity(row);
+    if (rowFactoryQuantity === null || rowFactoryQuantity === undefined) acc.hasIncompleteFactory = true;
     else if (row.asin && !acc.factoryAsins.has(row.asin)) {
       acc.factoryAsins.add(row.asin);
-      acc.factoryQuantity += row.factoryQuantity || 0;
+      acc.factoryQuantity += rowFactoryQuantity || 0;
     }
     const rowInboundQuantity = getProductInboundQuantity(row);
     if (rowInboundQuantity === null || rowInboundQuantity === undefined) acc.hasIncompleteInbound = true;
     else acc.inboundQuantity += rowInboundQuantity || 0;
-    acc.fulfillableQuantity += row.fulfillableQuantity || 0;
-    if (row.inboundWorkingQuantity === null || row.inboundWorkingQuantity === undefined) acc.hasIncompleteInboundWorking = true;
-    else acc.inboundWorkingQuantity += row.inboundWorkingQuantity || 0;
-    if (row.inboundShippedQuantity === null || row.inboundShippedQuantity === undefined) acc.hasIncompleteInboundShipped = true;
-    else acc.inboundShippedQuantity += row.inboundShippedQuantity || 0;
-    if (row.inboundReceivingQuantity === null || row.inboundReceivingQuantity === undefined) acc.hasIncompleteInboundReceiving = true;
-    else acc.inboundReceivingQuantity += row.inboundReceivingQuantity || 0;
-    if (row.reservedQuantity === null || row.reservedQuantity === undefined) acc.hasIncompleteReserved = true;
-    else acc.reservedQuantity += row.reservedQuantity || 0;
-    acc.unfulfillableQuantity += row.unfulfillableQuantity || 0;
+    acc.fulfillableQuantity += getProductInventoryField(row, "fulfillableQuantity") || 0;
+    const rowInboundWorking = getProductInventoryField(row, "inboundWorkingQuantity");
+    if (rowInboundWorking === null || rowInboundWorking === undefined) acc.hasIncompleteInboundWorking = true;
+    else acc.inboundWorkingQuantity += rowInboundWorking || 0;
+    const rowInboundShipped = getProductInventoryField(row, "inboundShippedQuantity");
+    if (rowInboundShipped === null || rowInboundShipped === undefined) acc.hasIncompleteInboundShipped = true;
+    else acc.inboundShippedQuantity += rowInboundShipped || 0;
+    const rowInboundReceiving = getProductInventoryField(row, "inboundReceivingQuantity");
+    if (rowInboundReceiving === null || rowInboundReceiving === undefined) acc.hasIncompleteInboundReceiving = true;
+    else acc.inboundReceivingQuantity += rowInboundReceiving || 0;
+    const rowReserved = getProductInventoryField(row, "reservedQuantity");
+    if (rowReserved === null || rowReserved === undefined) acc.hasIncompleteReserved = true;
+    else acc.reservedQuantity += rowReserved || 0;
+    acc.unfulfillableQuantity += getProductInventoryField(row, "unfulfillableQuantity") || 0;
     acc.salesOrders += row.salesOrders || 0;
     acc.salesUnits += row.salesUnits || 0;
     acc.stockoutDays += row.stockoutDays || 0;
@@ -1808,9 +1948,9 @@ function renderProducts() {
     hasIncompleteInboundReceiving: false,
     hasIncompleteReserved: false
   });
-  totals.factoryFbaTotalQuantity = totals.hasIncompleteTotalGoods || totals.hasIncompleteFactory
+  totals.factoryFbaTotalQuantity = totals.hasIncompleteTotalGoods
     ? null
-    : totals.totalGoodsQuantity + totals.factoryQuantity;
+    : (totals.hasIncompleteFactory ? totals.totalGoodsQuantity : totals.totalGoodsQuantity + totals.factoryQuantity);
   $("#fbaTotals").innerHTML = `
     <tr>
       ${visibleColumns.map((column, index) => {
@@ -2104,6 +2244,7 @@ async function saveFbaPlanField(input) {
   if (!product || !field) return;
   if (field === "grade") {
     updateFbaReplenishmentOverride(product, { grade: input.value });
+    await saveFbaGradesToServer({ [getFbaGradeAsin(product)]: input.value });
     renderProducts();
     return;
   }
@@ -2609,7 +2750,7 @@ function renderDatePicker() {
     const dataLabel = hasCompleteData
       ? `库存和销量都已成功：库存 ${dateStatus.inventoryCount || 0} 条，销量 ${dateStatus.salesCount || 0} 条`
       : hasPartialData
-        ? `数据未完整：库存 ${dateStatus.inventoryCount || 0} 条，销量请求标记 ${dateStatus.salesMarkerCount || 0} 条`
+        ? `数据未完整：库存 ${dateStatus.inventoryCount || 0} 条，销量完成标记 ${dateStatus.salesMarkerCount || 0} 条，待确认标记 ${dateStatus.pendingSalesMarkerCount || 0} 条`
         : "";
     return `<button type="button" class="date-picker-day ${inMonth ? "" : "other-month"} ${hasCompleteData ? "has-data" : ""} ${hasPartialData ? "partial-data" : ""} ${inRange ? "in-range" : ""} ${endpoint ? "selected" : ""}" data-date="${value}" title="${escapeHtml(disabled ? "未来日期不可选" : dataLabel)}" ${disabled ? "disabled" : ""}><span>${date.getUTCDate()}</span></button>`;
   }).join("");
@@ -2678,7 +2819,8 @@ async function loadProducts({ mode = "" } = {}) {
     range: data.range || {},
     config: data.config || {},
     sales: data.sales || {},
-    warnings: data.warnings || []
+    warnings: data.warnings || [],
+    syncJob: data.syncJob || null
   };
   renderProducts();
   await loadFbaDateStatus();
@@ -2690,14 +2832,42 @@ async function queryProducts() {
   const button = $("#queryProductsBtn");
   setBusy(button, true, "查询");
   try {
-    const data = await loadProducts({ mode: "query" });
-    $("#sandboxStatus").textContent = `FBA库存查询完成 ${products.length} 个 SKU`;
+    const data = await loadProducts();
+    const warnings = data.warnings || [];
+    $("#sandboxStatus").textContent = warnings.length
+      ? `FBA库存查询完成 ${products.length} 个 SKU；有 ${warnings.length} 条数据提示`
+      : `FBA库存查询完成 ${products.length} 个 SKU`;
     return data;
   } catch (error) {
     $("#sandboxStatus").textContent = `FBA库存查询失败：${error.message}`;
     throw error;
   } finally {
     setBusy(button, false, "查询");
+  }
+}
+
+function fbaSyncJobText(job) {
+  if (!job) return "";
+  const range = job.startDate && job.endDate ? `${job.startDate} 至 ${job.endDate}` : "所选日期";
+  if (job.status === "queued") return `FBA后台同步已排队：${range}`;
+  if (job.status === "running") return `FBA后台同步中：${range}`;
+  if (job.status === "done") return `FBA后台同步完成：${range}`;
+  if (job.status === "partial") return `FBA后台同步部分完成：${job.warnings?.length || 0} 条提示`;
+  if (job.status === "failed") return `FBA后台同步失败：${job.error || "未知错误"}`;
+  return `FBA后台同步状态：${job.status}`;
+}
+
+async function pollFbaSyncJob(jobId, attempt = 0) {
+  if (!jobId || attempt > 60) return;
+  const data = await api("/api/fba/sync").catch(() => null);
+  const job = data?.job;
+  if (!job || job.id !== jobId) return;
+  const text = fbaSyncJobText(job);
+  if (text) $("#sandboxStatus").textContent = text;
+  if (["queued", "running"].includes(job.status)) {
+    setTimeout(() => pollFbaSyncJob(jobId, attempt + 1), 5000);
+  } else if (activeModule === "products") {
+    await loadProducts().catch(() => {});
   }
 }
 
@@ -2725,21 +2895,20 @@ async function loadSandboxStatus() {
 
 async function syncSandboxProducts() {
   const button = $("#syncProductsBtn");
-  setBusy(button, true, "强制刷新数据");
+  setBusy(button, true, "后台刷新数据");
   try {
-    const data = await loadProducts({ mode: "sync" });
-    const warnings = data.warnings || [];
-    if (warnings.length) {
-      $("#sandboxStatus").textContent = `FBA库存强制刷新部分失败：${warnings.length} 条错误/提示`;
-      alert(`FBA库存强制刷新部分失败：\n${warnings.slice(0, 8).join("\n")}${warnings.length > 8 ? `\n另有 ${warnings.length - 8} 条` : ""}`);
-    } else {
-      $("#sandboxStatus").textContent = `FBA库存已强制刷新 ${products.length} 个 SKU`;
-    }
+    const { startDate, endDate } = getSelectedDateRange();
+    const data = await api("/api/fba/sync", {
+      method: "POST",
+      body: { startDate, endDate, reason: "manual", allowFrozenInventoryUpdate: true, forceNewReport: true }
+    });
+    $("#sandboxStatus").textContent = fbaSyncJobText(data.job) || "FBA后台同步任务已提交";
+    pollFbaSyncJob(data.job?.id).catch(() => {});
   } catch (error) {
-    $("#sandboxStatus").textContent = `FBA库存强制刷新失败：${error.message}`;
+    $("#sandboxStatus").textContent = `FBA后台刷新提交失败：${error.message}`;
     alert(error.message);
   } finally {
-    setBusy(button, false, "强制刷新数据");
+    setBusy(button, false, "后台刷新数据");
   }
 }
 
@@ -3259,6 +3428,10 @@ $("#productList").addEventListener("click", event => {
   if (!product || !fbaReplenishmentTargets[grade]) return;
   updateFbaReplenishmentOverride(product, { grade });
   renderProducts();
+  saveFbaGradesToServer({ [getFbaGradeAsin(product)]: grade }).catch(error => {
+    console.warn("Failed to save FBA grade", error);
+    $("#sandboxStatus").textContent = `商品等级保存失败：${error.message}`;
+  });
 });
 $("#productList").addEventListener("keydown", event => {
   const input = event.target?.closest?.("[data-fba-plan-field]");

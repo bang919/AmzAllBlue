@@ -6,6 +6,7 @@ import { randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import mysql from "mysql2/promise";
 import ExcelJS from "exceljs";
+import { logAmazonRequest, logApiRequest, logFbaSync } from "./lib/logger.mjs";
 
 const PORT = Number(process.env.PORT || 4317);
 const ROOT = resolve(".");
@@ -23,11 +24,16 @@ const ENV_PATH = join(ROOT, ".env");
 const FBA_DATE_MARKER_SKU = "__DATE_MARKER__";
 const fbaInventoryCache = new Map();
 const salesReportRequests = new Map();
+const fbaSyncJobs = new Map();
+const fbaSyncLocks = new Map();
+const fbaSyncLastRun = new Map();
+let fbaSyncQueueTail = Promise.resolve();
 let spApiAccessTokenCache = null;
 let salesReportRequestsLoaded = false;
 let mysqlPool = null;
 let fbaDailySchemaReady = false;
 let mysqlDatabaseReady = false;
+let fbaScheduledSyncTimer = null;
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -203,6 +209,17 @@ async function ensureFbaDailyMysqlSchema() {
       KEY idx_fba_sku_metadata_parent_asin (parent_asin)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS fba_product_metadata (
+      marketplace_id VARCHAR(32) NOT NULL,
+      asin VARCHAR(32) NOT NULL,
+      replenishment_grade VARCHAR(32) DEFAULT '',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (marketplace_id, asin),
+      KEY idx_fba_product_metadata_grade (replenishment_grade)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
   await pool.query("ALTER TABLE fba_inventory_daily MODIFY seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL").catch(() => {});
   await pool.query("ALTER TABLE fba_sku_metadata MODIFY seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL").catch(() => {});
   await pool.query("ALTER TABLE fba_inventory_daily ADD COLUMN parent_asin VARCHAR(32) DEFAULT '' AFTER asin").catch(() => {});
@@ -250,6 +267,23 @@ function calculateInboundQuantity(row) {
   ];
   if (values.every(value => value === null || value === undefined || value === "")) return null;
   return values.reduce((sum, value) => sum + Number(value || 0), 0);
+}
+
+function buildInventoryQuantitySnapshot(row) {
+  if (!row) return null;
+  const totalGoodsQuantity = calculateTotalGoodsQuantity(row);
+  return {
+    date: row.date || "",
+    source: inventorySnapshotSource(row),
+    totalGoodsQuantity,
+    inboundQuantity: calculateInboundQuantity(row),
+    fulfillableQuantity: Number(row.fulfillableQuantity || 0),
+    reservedQuantity: Number(row.reservedQuantity || 0),
+    unfulfillableQuantity: Number(row.unfulfillableQuantity || 0),
+    inboundWorkingQuantity: Number(row.inboundWorkingQuantity || 0),
+    inboundShippedQuantity: Number(row.inboundShippedQuantity || 0),
+    inboundReceivingQuantity: Number(row.inboundReceivingQuantity || 0)
+  };
 }
 
 function inventorySnapshotSource(row) {
@@ -332,6 +366,36 @@ async function readFbaSkuMetadataRows() {
   return rows.map(mysqlRowToFbaSkuMetadata);
 }
 
+async function readFbaProductMetadataRows() {
+  if (!isMysqlEnabled()) return [];
+  await ensureFbaDailyMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM fba_product_metadata");
+  return rows.map(row => ({
+    marketplaceId: row.marketplace_id,
+    asin: row.asin || "",
+    replenishmentGrade: normalizeFbaReplenishmentGrade(row.replenishment_grade)
+  }));
+}
+
+async function upsertFbaProductGrades(gradesByAsin, marketplaceId = getSpApiConfig().marketplaceId) {
+  const entries = Object.entries(gradesByAsin || {})
+    .map(([asin, grade]) => [String(asin || "").trim().toUpperCase(), normalizeFbaReplenishmentGrade(grade)])
+    .filter(([asin, grade]) => /^B[A-Z0-9]{9}$/.test(asin) && grade);
+  if (!entries.length) return { saved: {}, changed: false };
+  if (!isMysqlEnabled()) return { saved: Object.fromEntries(entries), changed: false };
+  await ensureFbaDailyMysqlSchema();
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO fba_product_metadata (
+      marketplace_id, asin, replenishment_grade
+    ) VALUES ?
+    ON DUPLICATE KEY UPDATE
+      replenishment_grade = VALUES(replenishment_grade)
+  `, [entries.map(([asin, grade]) => [marketplaceId, asin, grade])]);
+  return { saved: Object.fromEntries(entries), changed: true };
+}
+
 function rowHasFbaMetadata(row) {
   return Boolean(row?.marketplaceId && row?.sellerSku && (row.asin || row.parentAsin || row.fnSku || row.title || row.imageUrl));
 }
@@ -344,6 +408,80 @@ function mergeSkuDisplayMetadata(primary = {}, fallback = {}) {
     result[field] = primarySource[field] || fallbackSource[field] || "";
   }
   return result;
+}
+
+function catalogFetchedAt(row = {}) {
+  const raw = row.rawJson || row.rawInventoryJson || {};
+  return raw.catalogFetchedAt || raw.catalog?.fetchedAt || "";
+}
+
+function isCatalogMetadataFresh(row = {}, now = Date.now()) {
+  if (!row.title && !row.imageUrl && !row.parentAsin && !row.brand) return false;
+  const fetchedAt = catalogFetchedAt(row);
+  const fetchedTime = fetchedAt ? new Date(fetchedAt).getTime() : 0;
+  if (!Number.isFinite(fetchedTime) || fetchedTime <= 0) return false;
+  const ttlMs = Math.max(1, Number(process.env.AMZ_CATALOG_TTL_HOURS || 24)) * 60 * 60 * 1000;
+  return now - fetchedTime < ttlMs;
+}
+
+async function catalogForInventorySummaries(summaries, options = {}) {
+  if (!options.syncCatalog) return new Map();
+  const config = getSpApiConfig();
+  const metadataRows = (await readFbaSkuMetadataRows()).filter(row => row.marketplaceId === config.marketplaceId);
+  const metadataByAsin = new Map();
+  for (const row of metadataRows) {
+    const asin = normalizeAsin(row.asin);
+    if (!asin) continue;
+    const existing = metadataByAsin.get(asin);
+    if (!existing || String(row.lastSeenAt || "") > String(existing.lastSeenAt || "")) metadataByAsin.set(asin, row);
+  }
+  const now = Date.now();
+  const asinSet = new Set();
+  const catalog = new Map();
+  for (const summary of summaries) {
+    const asin = normalizeAsin(summary.asin);
+    if (!asin) continue;
+    asinSet.add(asin);
+    const cached = metadataByAsin.get(asin);
+    if (isCatalogMetadataFresh(cached, now)) {
+      catalog.set(asin, {
+        parentAsin: cached.parentAsin || "",
+        title: cached.title || "",
+        brand: cached.brand || "",
+        imageUrl: cached.imageUrl || "",
+        catalogFetchedAt: catalogFetchedAt(cached)
+      });
+    }
+  }
+  const staleAsins = [...asinSet].filter(asin => !catalog.has(asin));
+  if (!staleAsins.length) return catalog;
+  const fetched = await fetchCatalogDetails(staleAsins);
+  const fetchedAt = new Date().toISOString();
+  const metadataUpdates = [];
+  for (const [asin, item] of fetched.entries()) {
+    const normalizedAsin = normalizeAsin(asin);
+    catalog.set(normalizedAsin, { ...item, catalogFetchedAt: fetchedAt });
+  }
+  for (const summary of summaries) {
+    const asin = normalizeAsin(summary.asin);
+    if (!asin || !fetched.has(asin)) continue;
+    const item = fetched.get(asin);
+    metadataUpdates.push({
+      marketplaceId: config.marketplaceId,
+      sellerSku: summary.sellerSku || summary.sellerSKU || "",
+      asin,
+      parentAsin: item.parentAsin || "",
+      fnSku: summary.fnSku || summary.fnSKU || "",
+      title: item.title || summary.productName || "",
+      brand: item.brand || "",
+      imageUrl: item.imageUrl || "",
+      condition: summary.condition || "",
+      lastSeenAt: fetchedAt,
+      rawJson: { source: "catalog", catalogFetchedAt: fetchedAt }
+    });
+  }
+  await upsertFbaSkuMetadata(metadataUpdates, "catalog").catch(() => {});
+  return catalog;
 }
 
 async function upsertFbaSkuMetadata(rows, source = "inventory") {
@@ -371,7 +509,11 @@ async function upsertFbaSkuMetadata(rows, source = "inventory") {
         item_condition = IF(VALUES(item_condition) <> '', VALUES(item_condition), item_condition),
         source = VALUES(source),
         last_seen_at = VALUES(last_seen_at),
-        raw_json = IF(VALUES(raw_json) IS NOT NULL, VALUES(raw_json), raw_json)
+        raw_json = CASE
+          WHEN VALUES(source) = 'catalog' THEN VALUES(raw_json)
+          WHEN raw_json IS NULL THEN VALUES(raw_json)
+          ELSE raw_json
+        END
     `, [batch.map(row => [
       row.marketplaceId,
       row.sellerSku,
@@ -404,7 +546,6 @@ async function writeFbaDailyRowsToMysql(rows) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    await connection.query("DELETE FROM fba_inventory_daily");
     const batchSize = Math.max(1, Number(process.env.DB_BULK_INSERT_BATCH_SIZE || 100));
     for (const batch of chunkArray(uniqueRows, batchSize)) {
       await connection.query(`
@@ -415,6 +556,32 @@ async function writeFbaDailyRowsToMysql(rows) {
           researching_quantity, sales_units, sales_orders, is_sufficient, inventory_fetched_at, sales_fetched_at,
           frozen_at, last_updated_time, raw_inventory_json, raw_sales_json
         ) VALUES ?
+        ON DUPLICATE KEY UPDATE
+          asin = VALUES(asin),
+          parent_asin = VALUES(parent_asin),
+          fn_sku = VALUES(fn_sku),
+          title = VALUES(title),
+          brand = VALUES(brand),
+          image_url = VALUES(image_url),
+          item_condition = VALUES(item_condition),
+          amazon_total_quantity = VALUES(amazon_total_quantity),
+          total_goods_quantity = VALUES(total_goods_quantity),
+          fulfillable_quantity = VALUES(fulfillable_quantity),
+          reserved_quantity = VALUES(reserved_quantity),
+          unfulfillable_quantity = VALUES(unfulfillable_quantity),
+          inbound_working_quantity = VALUES(inbound_working_quantity),
+          inbound_shipped_quantity = VALUES(inbound_shipped_quantity),
+          inbound_receiving_quantity = VALUES(inbound_receiving_quantity),
+          researching_quantity = VALUES(researching_quantity),
+          sales_units = VALUES(sales_units),
+          sales_orders = VALUES(sales_orders),
+          is_sufficient = VALUES(is_sufficient),
+          inventory_fetched_at = VALUES(inventory_fetched_at),
+          sales_fetched_at = VALUES(sales_fetched_at),
+          frozen_at = VALUES(frozen_at),
+          last_updated_time = VALUES(last_updated_time),
+          raw_inventory_json = VALUES(raw_inventory_json),
+          raw_sales_json = VALUES(raw_sales_json)
       `, [batch.map(row => [
         row.date,
         row.marketplaceId,
@@ -1085,16 +1252,23 @@ function normalizeProduct(input) {
   };
 }
 
+function normalizeFbaReplenishmentGrade(value) {
+  const grade = String(value || "").trim();
+  return ["normal", "promoted", "featured", "abandoned"].includes(grade) ? grade : "";
+}
+
 function normalizeFactoryProduct(input) {
   const source = input && typeof input === "object" ? input : {};
   const asin = String(source.asin || "").trim().toUpperCase();
   const name = String(source.name || source.title || "").trim();
+  const replenishmentGrade = normalizeFbaReplenishmentGrade(source.replenishmentGrade || source.grade);
   return {
     id: String(source.id || asin || name || randomUUID()).trim(),
     name,
     asin,
     parentAsin: String(source.parentAsin || source.parent_asin || "").trim().toUpperCase(),
     boxSpec: String(source.boxSpec || "").trim(),
+    replenishmentGrade,
     unitCost: source.unitCost === "" || source.unitCost === undefined ? "" : Number(source.unitCost || 0),
     currentQuantity: Number(source.currentQuantity || 0),
     inventoryValue: source.inventoryValue === "" || source.inventoryValue === undefined ? "" : Number(source.inventoryValue || 0),
@@ -1123,6 +1297,9 @@ function updateFactoryProduct(input, patch) {
   }
   if (Object.prototype.hasOwnProperty.call(patch, "boxSpec")) {
     next.boxSpec = String(patch.boxSpec || "").trim();
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "replenishmentGrade")) {
+    next.replenishmentGrade = normalizeFbaReplenishmentGrade(patch.replenishmentGrade);
   }
   next.updatedAt = new Date().toISOString();
   return normalizeFactoryProduct(next);
@@ -1742,16 +1919,36 @@ function buildFactoryInfoByAsin(db) {
       quantity: 0,
       productId: "",
       boxSpec: "",
-      name: ""
+      name: "",
+      replenishmentGrade: ""
     };
     info.set(asin, {
       quantity: Number(existing.quantity || 0) + Number(product.currentQuantity || 0),
       productId: existing.productId || product.id,
       boxSpec: existing.boxSpec || product.boxSpec || "",
-      name: existing.name || product.name || ""
+      name: existing.name || product.name || "",
+      replenishmentGrade: existing.replenishmentGrade || product.replenishmentGrade || ""
     });
   }
   return info;
+}
+
+async function buildFbaGradeByAsin(db) {
+  const grades = new Map();
+  const productMetadataRows = await readFbaProductMetadataRows();
+  for (const row of productMetadataRows) {
+    const asin = normalizeAsin(row.asin);
+    const grade = normalizeFbaReplenishmentGrade(row.replenishmentGrade);
+    if (asin && grade) grades.set(asin, grade);
+  }
+  if (isMysqlEnabled()) return grades;
+  const rawGrades = db && typeof db.fbaProductGrades === "object" && db.fbaProductGrades ? db.fbaProductGrades : {};
+  for (const [asin, grade] of Object.entries(rawGrades)) {
+    const normalizedAsin = String(asin || "").trim().toUpperCase();
+    const normalizedGrade = normalizeFbaReplenishmentGrade(grade);
+    if (normalizedAsin && normalizedGrade && !grades.has(normalizedAsin)) grades.set(normalizedAsin, normalizedGrade);
+  }
+  return grades;
 }
 
 function requestAsins(item) {
@@ -2135,6 +2332,7 @@ function isFbaDailyFrozen(dateValue) {
 function isDateReadyForSavedSales(dateValue, fetchedAt = new Date()) {
   const date = String(dateValue || "").slice(0, 10);
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  if (date <= addDays(formatDateInTimeZone(), -3)) return true;
   const fetchedTime = fetchedAt instanceof Date ? fetchedAt.getTime() : new Date(fetchedAt).getTime();
   if (!Number.isFinite(fetchedTime)) return false;
   const bufferMs = Number.isFinite(SALES_COMPLETE_BUFFER_HOURS)
@@ -2145,6 +2343,309 @@ function isDateReadyForSavedSales(dateValue, fetchedAt = new Date()) {
 
 function isCompleteSalesDateMarker(row) {
   return row?.sellerSku === FBA_DATE_MARKER_SKU && row.salesFetchedAt && isDateReadyForSavedSales(row.date, row.salesFetchedAt);
+}
+
+function summarizeFbaDateCoverage(rows, marketplaceId, dates) {
+  const inventoryDates = new Set();
+  const salesDates = new Set();
+  for (const row of rows) {
+    if (row.marketplaceId !== marketplaceId) continue;
+    const date = String(row.date || "").slice(0, 10);
+    if (!dates.includes(date)) continue;
+    if (row.inventoryFetchedAt && row.sellerSku !== FBA_DATE_MARKER_SKU) inventoryDates.add(date);
+    if (isCompleteSalesDateMarker(row)) salesDates.add(date);
+  }
+  return {
+    missingInventoryDates: dates.filter(date => !inventoryDates.has(date)),
+    missingSalesDates: dates.filter(date => !salesDates.has(date))
+  };
+}
+
+function summarizeDateList(dates, limit = 8) {
+  const values = [...new Set(dates)].sort();
+  if (!values.length) return "";
+  const shown = values.slice(0, limit).join("、");
+  return values.length > limit ? `${shown} 等 ${values.length} 天` : shown;
+}
+
+function fbaJobPublicView(job) {
+  if (!job) return null;
+  return {
+    id: job.id,
+    key: job.key,
+    status: job.status,
+    reason: job.reason,
+    startDate: job.startDate,
+    endDate: job.endDate,
+    dates: job.dates || [],
+    createdAt: job.createdAt,
+    startedAt: job.startedAt || "",
+    finishedAt: job.finishedAt || "",
+    error: job.error || "",
+    warnings: job.warnings || [],
+    result: job.result || null
+  };
+}
+
+function latestFbaSyncJob() {
+  return [...fbaSyncJobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))[0] || null;
+}
+
+function pruneFbaSyncJobs() {
+  const jobs = [...fbaSyncJobs.values()].sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  for (const job of jobs.slice(Number(process.env.AMZ_FBA_SYNC_JOB_HISTORY || 20))) {
+    fbaSyncJobs.delete(job.id);
+  }
+}
+
+async function runFbaSyncJob(job) {
+  job.status = "running";
+  job.startedAt = new Date().toISOString();
+  logFbaSync({
+    time: job.startedAt,
+    status: "running",
+    reason: job.reason,
+    startDate: job.startDate,
+    endDate: job.endDate,
+    days: job.dates?.length || 0,
+  });
+  try {
+    const result = await syncFbaDailyRange(job.startDate, job.endDate, {
+      dates: job.dates,
+      inventoryDates: job.inventoryDates || [],
+      allowFrozenInventoryUpdate: Boolean(job.allowFrozenInventoryUpdate),
+      forceNewReport: Boolean(job.forceNewReport),
+      reuseSameDayReport: Boolean(job.reuseSameDayReport),
+      syncCurrentInventory: job.syncCurrentInventory !== false,
+      syncHistoricalInventory: job.syncHistoricalInventory !== false,
+      syncSales: job.syncSales !== false,
+      syncCatalog: Boolean(job.syncCatalog)
+    });
+    job.status = result.warnings?.length ? "partial" : "done";
+    job.result = result;
+    job.warnings = result.warnings || [];
+    job.finishedAt = new Date().toISOString();
+    logFbaSync({
+      time: job.finishedAt,
+      status: job.status,
+      reason: job.reason,
+      warnings: job.warnings.length,
+    });
+    fbaInventoryCache.clear();
+  } catch (error) {
+    job.status = "failed";
+    job.error = error.message || "FBA 同步失败";
+    job.finishedAt = new Date().toISOString();
+    logFbaSync({
+      time: job.finishedAt,
+      status: "failed",
+      reason: job.reason,
+      error: job.error,
+    });
+  } finally {
+    fbaSyncLocks.delete(job.key);
+    pruneFbaSyncJobs();
+  }
+}
+
+function scheduleFbaSyncJob(job) {
+  const run = () => runFbaSyncJob(job);
+  fbaSyncQueueTail = fbaSyncQueueTail.then(run, run);
+}
+
+function enqueueFbaSyncJob(input = {}) {
+  const today = formatDateInTimeZone();
+  const requestedDates = input.dates?.length
+    ? [...new Set(input.dates.map(date => String(date).slice(0, 10)).filter(Boolean))].sort()
+    : dateRangeInclusive(input.startDate || addDays(today, -29), input.endDate || today);
+  const dates = requestedDates.length ? requestedDates : [today];
+  const startDate = dates[0];
+  const endDate = dates[dates.length - 1];
+  const syncFlags = [
+    input.syncCurrentInventory !== false ? "current" : "",
+    input.syncHistoricalInventory !== false ? "historical" : "",
+    input.syncSales !== false ? "sales" : "",
+    input.syncCatalog ? "catalog" : ""
+  ].filter(Boolean).join("+");
+  const key = `${getSpApiConfig().marketplaceId}|${input.reason || "manual"}|${syncFlags}|${startDate}|${endDate}|${dates.join(",")}`;
+  const existingId = fbaSyncLocks.get(key);
+  if (existingId) {
+    const existing = fbaSyncJobs.get(existingId);
+    if (existing && ["queued", "running"].includes(existing.status)) return existing;
+  }
+  const job = {
+    id: randomUUID(),
+    key,
+    status: "queued",
+    reason: input.reason || "manual",
+    startDate,
+    endDate,
+    dates,
+    inventoryDates: input.inventoryDates || dates.filter(date => date <= today),
+    allowFrozenInventoryUpdate: Boolean(input.allowFrozenInventoryUpdate),
+    forceNewReport: Boolean(input.forceNewReport),
+    reuseSameDayReport: Boolean(input.reuseSameDayReport),
+    syncCurrentInventory: input.syncCurrentInventory !== false,
+    syncHistoricalInventory: input.syncHistoricalInventory !== false,
+    syncSales: input.syncSales !== false,
+    syncCatalog: Boolean(input.syncCatalog),
+    createdAt: new Date().toISOString(),
+    warnings: []
+  };
+  fbaSyncJobs.set(job.id, job);
+  fbaSyncLocks.set(key, job.id);
+  scheduleFbaSyncJob(job);
+  return job;
+}
+
+function shouldRunIntervalJob(key, intervalMs) {
+  const lastRun = fbaSyncLastRun.get(key) || 0;
+  return Date.now() - lastRun >= intervalMs;
+}
+
+function markIntervalJobRun(key) {
+  fbaSyncLastRun.set(key, Date.now());
+}
+
+function enqueueIntervalJob(key, intervalMs, buildJob) {
+  if (!shouldRunIntervalJob(key, intervalMs)) return null;
+  markIntervalJobRun(key);
+  return enqueueFbaSyncJob(buildJob());
+}
+
+function dateSegments(dates) {
+  const sorted = [...new Set(dates)].sort();
+  const segments = [];
+  let current = [];
+  for (const date of sorted) {
+    if (!current.length || addDays(current[current.length - 1], 1) === date) {
+      current.push(date);
+    } else {
+      segments.push(current);
+      current = [date];
+    }
+  }
+  if (current.length) segments.push(current);
+  return segments;
+}
+
+async function enqueueStartupFbaSyncJobs() {
+  const today = formatDateInTimeZone();
+  const stableEnd = addDays(today, -1);
+  const historyDates = dateRangeInclusive(addDays(stableEnd, -29), stableEnd);
+  markIntervalJobRun("sales_sku_today_hourly");
+  markIntervalJobRun("inventory_current_6h");
+  markIntervalJobRun(`daily_history_backfill:${stableEnd}`);
+  const rows = await readFbaDailyRows();
+  const coverage = summarizeFbaDateCoverage(rows, getSpApiConfig().marketplaceId, historyDates);
+  const missingDates = [...new Set([...coverage.missingInventoryDates, ...coverage.missingSalesDates])].sort();
+  if (missingDates.length) {
+    logFbaSync({
+      status: "queued",
+      reason: "startup_history_gap",
+      startDate: missingDates[0],
+      endDate: missingDates[missingDates.length - 1],
+      days: missingDates.length,
+      detail: `inventory:${summarizeDateList(coverage.missingInventoryDates)};sales:${summarizeDateList(coverage.missingSalesDates)}`
+    });
+  }
+  const missingInventoryDateSet = new Set(coverage.missingInventoryDates);
+  const missingSalesDateSet = new Set(coverage.missingSalesDates);
+
+  enqueueFbaSyncJob({
+    reason: "startup_today_sales",
+    dates: [today],
+    inventoryDates: [],
+    allowFrozenInventoryUpdate: false,
+    forceNewReport: true,
+    syncCurrentInventory: false,
+    syncHistoricalInventory: false,
+    syncSales: true,
+    syncCatalog: false
+  });
+
+  enqueueFbaSyncJob({
+    reason: "startup_current_inventory",
+    dates: [today],
+    inventoryDates: [today],
+    allowFrozenInventoryUpdate: false,
+    forceNewReport: true,
+    syncCurrentInventory: true,
+    syncHistoricalInventory: false,
+    syncSales: false,
+    syncCatalog: true
+  });
+
+  for (const segment of dateSegments(missingDates)) {
+    const segmentInventoryDates = segment.filter(date => missingInventoryDateSet.has(date));
+    const segmentSalesDates = segment.filter(date => missingSalesDateSet.has(date));
+    if (!segmentInventoryDates.length && !segmentSalesDates.length) continue;
+    enqueueFbaSyncJob({
+      reason: "startup_history_gap",
+      dates: segmentSalesDates.length ? segmentSalesDates : segment,
+      inventoryDates: segmentInventoryDates,
+      allowFrozenInventoryUpdate: false,
+      forceNewReport: true,
+      syncCurrentInventory: false,
+      syncHistoricalInventory: segmentInventoryDates.length > 0,
+      syncSales: segmentSalesDates.length > 0,
+      syncCatalog: false
+    });
+  }
+}
+
+function enqueueDueFbaSyncJobs() {
+  const today = formatDateInTimeZone();
+  const stableEnd = addDays(today, -1);
+  const historyDates = dateRangeInclusive(addDays(stableEnd, -29), stableEnd);
+  const oneHourMs = Math.max(15, Number(process.env.AMZ_FBA_TODAY_SALES_INTERVAL_MINUTES || 60)) * 60 * 1000;
+  const sixHourMs = Math.max(1, Number(process.env.AMZ_FBA_CURRENT_INVENTORY_INTERVAL_HOURS || 6)) * 60 * 60 * 1000;
+
+  enqueueIntervalJob("sales_sku_today_hourly", oneHourMs, () => ({
+    reason: "sales_sku_today_hourly",
+    dates: [today],
+    inventoryDates: [],
+    allowFrozenInventoryUpdate: false,
+    forceNewReport: true,
+    syncCurrentInventory: false,
+    syncHistoricalInventory: false,
+    syncSales: true,
+    syncCatalog: false
+  }));
+
+  enqueueIntervalJob("inventory_current_6h", sixHourMs, () => ({
+    reason: "inventory_current_6h",
+    dates: [today],
+    inventoryDates: [today],
+    allowFrozenInventoryUpdate: false,
+    forceNewReport: false,
+    syncCurrentInventory: true,
+    syncHistoricalInventory: false,
+    syncSales: false,
+    syncCatalog: true
+  }));
+
+  const dailyKey = `daily_history_backfill:${stableEnd}`;
+  enqueueIntervalJob(dailyKey, 24 * 60 * 60 * 1000, () => ({
+    reason: "daily_history_backfill",
+    dates: historyDates,
+    inventoryDates: historyDates,
+    allowFrozenInventoryUpdate: false,
+    forceNewReport: true,
+    syncCurrentInventory: false,
+    syncHistoricalInventory: true,
+    syncSales: true,
+    syncCatalog: false
+  }));
+}
+
+function scheduleNextFbaSync({ runNow = false } = {}) {
+  if (process.env.AMZ_FBA_SCHEDULE_ENABLED === "0" || process.env.AMZ_FBA_SCHEDULE_ENABLED === "false") return;
+  if (fbaScheduledSyncTimer) clearTimeout(fbaScheduledSyncTimer);
+  if (runNow) enqueueDueFbaSyncJobs();
+  fbaScheduledSyncTimer = setTimeout(() => {
+    scheduleNextFbaSync({ runNow: true });
+  }, Math.max(60_000, Number(process.env.AMZ_FBA_SCHEDULE_CHECK_MS || 60_000)));
 }
 
 function toIsoDateStart(value) {
@@ -2172,6 +2673,11 @@ function daysBetweenInclusive(startDate, endDate) {
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRetryableAmazonError(error) {
+  const message = String(error?.message || error || "");
+  return /\b(429|500|502|503|504)\b|QuotaExceeded|throttl|UND_ERR_SOCKET|other_side_closed|socket|ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed|请求超时/i.test(message);
 }
 
 function amazonFetchTimeoutMs() {
@@ -2202,13 +2708,15 @@ async function spApiFetch(pathname, params = {}, options = {}) {
   const token = await requestSpApiAccessToken();
   if (!token.ok) throw new Error(token.error || "SP-API LWA token failed");
   const url = new URL(pathname, token.config.endpoint);
+  const method = options.method || "GET";
+  const startedAt = Date.now();
   Object.entries(params).forEach(([key, value]) => {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   });
   let response;
   try {
     response = await fetchAmazonWithTimeout(url, {
-      method: options.method || "GET",
+      method,
       headers: {
         "accept": "application/json",
         "content-type": "application/json",
@@ -2223,9 +2731,11 @@ async function spApiFetch(pathname, params = {}, options = {}) {
   } catch (error) {
     const cause = error.cause || {};
     const detail = [cause.code, cause.message || error.message].filter(Boolean).join(" ");
+    logAmazonRequest({ method, path: pathname, status: "ERR", durationMs: Date.now() - startedAt, context: options.logContext, error: detail || "fetch_failed" });
     throw new Error(`${pathname} 请求失败：${detail || "fetch failed"}`);
   }
   const data = await response.json().catch(() => ({}));
+  logAmazonRequest({ method, path: pathname, status: response.status, durationMs: Date.now() - startedAt, context: options.logContext });
   if (!response.ok) {
     const error = data.errors?.[0]
       ? `${data.errors[0].code || ""} ${data.errors[0].message || ""} ${data.errors[0].details || ""}`.trim()
@@ -2242,9 +2752,9 @@ async function spApiFetchWithRetry(pathname, params = {}, options = {}) {
     try {
       return await spApiFetch(pathname, params, options);
     } catch (error) {
-      const retryable = /\b(429|500|502|503|504)\b|QuotaExceeded|throttl/i.test(error.message || "");
+      const retryable = isRetryableAmazonError(error);
       if (!retryable || attempt === retries) throw error;
-      await wait(retryDelayMs * (attempt + 1));
+      await wait(retryDelayMs * (attempt + 1) + Math.floor(Math.random() * 250));
     }
   }
   throw new Error("SP-API request failed");
@@ -2269,7 +2779,9 @@ async function fetchFbaInventorySummaries() {
         granularityId: config.marketplaceId,
         marketplaceIds: config.marketplaceId
       };
-    const data = await spApiFetchWithRetry("/fba/inventory/v1/summaries", params);
+    const data = await spApiFetchWithRetry("/fba/inventory/v1/summaries", params, {
+      logContext: `fbaInventoryPage:${page + 1}`
+    });
     const payload = data.payload || data;
     summaries.push(...(payload.inventorySummaries || []));
     nextToken = payload.nextToken || data.pagination?.nextToken || "";
@@ -2333,17 +2845,20 @@ async function fetchCatalogDetails(asins) {
   const config = getSpApiConfig();
   const enrichLimit = Number(process.env.AMZ_CATALOG_ENRICH_LIMIT || 300);
   const uniqueAsins = unique(asins).slice(0, Math.max(20, enrichLimit));
-  const chunkSize = Math.max(1, Math.min(20, Number(process.env.AMZ_CATALOG_CHUNK_SIZE || 10)));
-  const delayMs = Number(process.env.AMZ_CATALOG_DELAY_MS || 250);
+  const chunkSize = Math.max(1, Math.min(20, Number(process.env.AMZ_CATALOG_CHUNK_SIZE || 20)));
+  const delayMs = Number(process.env.AMZ_CATALOG_DELAY_MS || 1200);
   const byAsin = new Map();
   for (let index = 0; index < uniqueAsins.length; index += chunkSize) {
     const identifiers = uniqueAsins.slice(index, index + chunkSize);
+    const batchNumber = Math.floor(index / chunkSize) + 1;
     try {
       const data = await spApiFetchWithRetry("/catalog/2022-04-01/items", {
         marketplaceIds: config.marketplaceId,
         identifiers: identifiers.join(","),
         identifiersType: "ASIN",
         includedData: "images,summaries,relationships"
+      }, {
+        logContext: `catalogBatch:${batchNumber}:asinCount:${identifiers.length}`
       });
       for (const item of data.items || []) {
         const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
@@ -2354,7 +2869,11 @@ async function fetchCatalogDetails(asins) {
           imageUrl: findCatalogImageLink(item.images)
         });
       }
-    } catch {
+    } catch (error) {
+      if (isRetryableAmazonError(error)) {
+        if (delayMs > 0 && index + chunkSize < uniqueAsins.length) await wait(delayMs * 2);
+        continue;
+      }
       for (const asin of identifiers) {
         try {
           const data = await spApiFetchWithRetry("/catalog/2022-04-01/items", {
@@ -2362,7 +2881,7 @@ async function fetchCatalogDetails(asins) {
             identifiers: asin,
             identifiersType: "ASIN",
             includedData: "images,summaries,relationships"
-          }, { retries: 1, retryDelayMs: 1600 });
+          }, { retries: 1, retryDelayMs: 1600, logContext: `catalogSingleRetry:${batchNumber}:asinCount:1` });
           const item = (data.items || [])[0];
           if (!item) continue;
           const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
@@ -2380,37 +2899,6 @@ async function fetchCatalogDetails(asins) {
     if (delayMs > 0 && index + chunkSize < uniqueAsins.length) await wait(delayMs);
   }
   return byAsin;
-}
-
-async function fetchOrderItems(orderId) {
-  const items = [];
-  let nextToken = "";
-  for (let page = 0; page < 10; page += 1) {
-    const data = await spApiFetchWithRetry(
-      `/orders/v0/orders/${encodeURIComponent(orderId)}/orderItems`,
-      nextToken ? { NextToken: nextToken } : {},
-      { retries: 4, retryDelayMs: 2500 }
-    );
-    const payload = data.payload || data;
-    items.push(...(payload.OrderItems || payload.orderItems || []));
-    nextToken = payload.NextToken || payload.nextToken || "";
-    if (!nextToken) break;
-  }
-  return items;
-}
-
-async function mapWithConcurrency(items, limit, worker) {
-  const results = new Array(items.length);
-  let nextIndex = 0;
-  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (nextIndex < items.length) {
-      const current = nextIndex;
-      nextIndex += 1;
-      results[current] = await worker(items[current], current);
-    }
-  });
-  await Promise.all(workers);
-  return results;
 }
 
 function parseFlatReport(text) {
@@ -2437,19 +2925,37 @@ function firstReportValue(row, keys) {
   return "";
 }
 
-async function downloadReportDocument(documentId) {
-  const document = await spApiFetchWithRetry(`/reports/2021-06-30/documents/${encodeURIComponent(documentId)}`, {}, { retries: 2 });
+function reportLogContext(kind, startDate, endDate, reportId = "", documentId = "") {
+  return [
+    kind,
+    `${startDate}..${endDate}`,
+    reportId ? `reportId:${reportId}` : "",
+    documentId ? `documentId:${documentId}` : ""
+  ].filter(Boolean).join(":");
+}
+
+async function downloadReportDocument(documentId, options = {}) {
+  const context = options.logContext || "";
+  const document = await spApiFetchWithRetry(`/reports/2021-06-30/documents/${encodeURIComponent(documentId)}`, {}, {
+    retries: 2,
+    logContext: context
+  });
   const payload = document.payload || document;
   if (!payload.url) throw new Error("订单报表文档缺少下载 URL");
   let response;
   let lastFetchError;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
+    const startedAt = Date.now();
     try {
       response = await fetchAmazonWithTimeout(payload.url, { headers: { "user-agent": "AmzAllBlue/0.1" } });
+      logAmazonRequest({ method: "GET", path: "reportDocumentDownload", status: response.status, durationMs: Date.now() - startedAt, attempt, context });
       if (response.ok) break;
       if (![429, 500, 502, 503, 504].includes(response.status)) break;
     } catch (error) {
       lastFetchError = error;
+      const cause = error.cause || {};
+      const detail = [cause.code, cause.message || error.message].filter(Boolean).join(" ");
+      logAmazonRequest({ method: "GET", path: "reportDocumentDownload", status: "ERR", durationMs: Date.now() - startedAt, attempt, context, error: detail || "fetch_failed" });
     }
     if (attempt < 3) await wait(700 * attempt);
   }
@@ -2470,9 +2976,12 @@ async function getOrCreateSalesReport(startDate, endDate, options = {}) {
   await ensureSalesReportRequestsLoaded();
   const config = getSpApiConfig();
   const reportType = process.env.AMZ_ORDER_REPORT_TYPE || "GET_FLAT_FILE_ALL_ORDERS_DATA_BY_ORDER_DATE_GENERAL";
+  const context = reportLogContext("salesReport", startDate, endDate);
   const key = `${config.marketplaceId}|${reportType}|${startDate}|${endDate}`;
   const existing = salesReportRequests.get(key);
-  if (existing?.reportId && (!options.forceNewReport || (options.reuseSameDayReport && isReportFromToday(existing)))) return existing;
+  if (shouldReuseReport(existing, options)) {
+    return { ...existing, startDate, endDate, reportKind: "salesReport" };
+  }
   const created = await spApiFetchWithRetry("/reports/2021-06-30/reports", {}, {
     method: "POST",
     body: {
@@ -2482,12 +2991,13 @@ async function getOrCreateSalesReport(startDate, endDate, options = {}) {
       dataEndTime: toOrdersCreatedBefore(endDate)
     },
     retries: 2,
-    retryDelayMs: 30000
+    retryDelayMs: 30000,
+    logContext: context
   });
   const payload = created.payload || created;
   const reportId = payload.reportId || payload.ReportId;
   if (!reportId) throw new Error("订单报表创建失败：缺少 reportId");
-  const item = { reportId, reportType, createdAt: Date.now() };
+  const item = { reportId, reportType, startDate, endDate, reportKind: "salesReport", createdAt: Date.now() };
   await rememberSalesReportRequest(key, item);
   return item;
 }
@@ -2498,8 +3008,12 @@ async function waitForReportDocument(report, label) {
   const deadline = Date.now() + waitMs;
   let latestStatus = "";
   let reportDocumentId = "";
+  const context = reportLogContext(report.reportKind || label, report.startDate || "unknown", report.endDate || "unknown", report.reportId);
   while (Date.now() <= deadline) {
-    const statusData = await spApiFetchWithRetry(`/reports/2021-06-30/reports/${encodeURIComponent(report.reportId)}`, {}, { retries: 1 });
+    const statusData = await spApiFetchWithRetry(`/reports/2021-06-30/reports/${encodeURIComponent(report.reportId)}`, {}, {
+      retries: 1,
+      logContext: context
+    });
     const payload = statusData.payload || statusData;
     latestStatus = payload.processingStatus || payload.ProcessingStatus || "";
     reportDocumentId = payload.reportDocumentId || payload.ReportDocumentId || "";
@@ -2513,44 +3027,6 @@ async function waitForReportDocument(report, label) {
     throw new Error(`${label}仍在生成（reportId: ${report.reportId}，状态：${latestStatus || "未知"}），稍后再点“查询”会继续复用这个报表。`);
   }
   return reportDocumentId;
-}
-
-async function fetchSalesBySkuFromReport(startDate, endDate, options = {}) {
-  const report = await getOrCreateSalesReport(startDate, endDate, options);
-  const reportDocumentId = await waitForReportDocument(report, "订单报表");
-  const text = await downloadReportDocument(reportDocumentId);
-  const rows = parseFlatReport(text);
-  const bySku = new Map();
-  const orderIds = new Set();
-  for (const row of rows) {
-    const sku = firstReportValue(row, ["sku", "seller-sku", "merchant-sku"]);
-    if (!sku) continue;
-    const orderId = firstReportValue(row, ["amazon-order-id", "order-id"]);
-    const asin = firstReportValue(row, ["asin"]);
-    const quantity = Number(firstReportValue(row, ["quantity", "quantity-purchased", "qty"]) || 0);
-    const existing = bySku.get(sku) || { sku, asin, units: 0, orderIds: new Set() };
-    existing.units += Number.isFinite(quantity) ? quantity : 0;
-    if (asin && !existing.asin) existing.asin = asin;
-    if (orderId) {
-      existing.orderIds.add(orderId);
-      orderIds.add(orderId);
-    }
-    bySku.set(sku, existing);
-  }
-  return {
-    source: "reports",
-    reportId: report.reportId,
-    reportType: report.reportType,
-    orderCount: orderIds.size,
-    orderItemErrorCount: 0,
-    warnings: [],
-    bySku: new Map([...bySku.entries()].map(([sku, value]) => [sku, {
-      sku,
-      asin: value.asin,
-      units: value.units,
-      orders: value.orderIds.size
-    }]))
-  };
 }
 
 function reportRowMarketplaceDate(row, fallbackDate) {
@@ -2571,7 +3047,9 @@ function reportRowMarketplaceDate(row, fallbackDate) {
 async function fetchSalesByDateSkuFromReport(startDate, endDate, options = {}) {
   const report = await getOrCreateSalesReport(startDate, endDate, options);
   const reportDocumentId = await waitForReportDocument(report, "订单报表");
-  const text = await downloadReportDocument(reportDocumentId);
+  const text = await downloadReportDocument(reportDocumentId, {
+    logContext: reportLogContext(report.reportKind || "salesReport", startDate, endDate, report.reportId, reportDocumentId)
+  });
   const rows = parseFlatReport(text);
   const dates = dateRangeInclusive(startDate, endDate);
   const requestedDates = new Set(dates);
@@ -2618,80 +3096,6 @@ async function fetchSalesByDateSkuFromReport(startDate, endDate, options = {}) {
   return byDate;
 }
 
-async function fetchSalesBySku(startDate, endDate, options = {}) {
-  if ((process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders") {
-    return fetchSalesBySkuFromReport(startDate, endDate, options);
-  }
-  const config = getSpApiConfig();
-  const bySku = new Map();
-  const orders = [];
-  const warnings = [];
-  const orderStatuses = process.env.AMZ_ORDER_STATUSES || "Pending,Unshipped,PartiallyShipped,Shipped";
-  let nextToken = "";
-  for (let page = 0; page < 20; page += 1) {
-    const params = nextToken
-      ? { NextToken: nextToken }
-      : {
-        MarketplaceIds: config.marketplaceId,
-        CreatedAfter: toIsoDateStart(startDate),
-        CreatedBefore: toOrdersCreatedBefore(endDate),
-        OrderStatuses: orderStatuses
-      };
-    const data = await spApiFetchWithRetry("/orders/v0/orders", params);
-    const payload = data.payload || data;
-    orders.push(...(payload.Orders || payload.orders || []));
-    nextToken = payload.NextToken || payload.nextToken || "";
-    if (!nextToken) break;
-  }
-
-  const orderItemGroups = await mapWithConcurrency(orders, Number(process.env.AMZ_ORDER_ITEMS_CONCURRENCY || 2), async order => {
-    const orderId = order.AmazonOrderId || order.amazonOrderId;
-    if (!orderId) return { orderId: "", items: [] };
-    try {
-      return { orderId, items: await fetchOrderItems(orderId) };
-    } catch (error) {
-      return { orderId, items: [], error: error.message };
-    }
-  });
-
-  for (const group of orderItemGroups) {
-    const orderId = group.orderId;
-    const orderItems = group.items || [];
-    if (group.error) {
-      warnings.push(`订单 ${orderId} 的明细拉取失败：${group.error}`);
-    }
-    if (!orderId || !orderItems.length) continue;
-    const skusInOrder = new Set();
-    for (const item of orderItems) {
-      const sku = item.SellerSKU || item.sellerSKU || item.SellerSku || "";
-      if (!sku) continue;
-      const asin = item.ASIN || item.asin || "";
-      const quantity = Number(item.QuantityOrdered || item.quantityOrdered || 0);
-      const existing = bySku.get(sku) || { sku, asin, units: 0, orderIds: new Set() };
-      existing.units += quantity;
-      if (asin && !existing.asin) existing.asin = asin;
-      if (!skusInOrder.has(sku)) {
-        existing.orderIds.add(orderId);
-        skusInOrder.add(sku);
-      }
-      bySku.set(sku, existing);
-    }
-  }
-
-  return {
-    orderCount: orders.length,
-    orderItemErrorCount: warnings.length,
-    orderStatuses,
-    warnings: warnings.slice(0, 10),
-    bySku: new Map([...bySku.entries()].map(([sku, value]) => [sku, {
-      sku,
-      asin: value.asin,
-      units: value.units,
-      orders: value.orderIds.size
-    }]))
-  };
-}
-
 function toLedgerIsoDateStart(dateValue) {
   return `${String(dateValue).slice(0, 10)}T00:00:00Z`;
 }
@@ -2705,13 +3109,21 @@ function isReportFromToday(report) {
   return formatDateInTimeZone(new Date(report.createdAt)) === formatDateInTimeZone();
 }
 
+function shouldReuseReport(existing, options = {}) {
+  if (!existing?.reportId || options.forceNewReport) return false;
+  return options.reuseSameDayReport ? isReportFromToday(existing) : true;
+}
+
 async function getOrCreateLedgerReport(startDate, endDate, options = {}) {
   await ensureSalesReportRequestsLoaded();
   const config = getSpApiConfig();
   const reportType = "GET_LEDGER_SUMMARY_VIEW_DATA";
+  const context = reportLogContext("ledgerReport", startDate, endDate);
   const key = `${config.marketplaceId}|${reportType}|${startDate}|${endDate}|DAILY|COUNTRY`;
   const existing = salesReportRequests.get(key);
-  if (existing?.reportId && (!options.forceNewReport || (options.reuseSameDayReport && isReportFromToday(existing)))) return existing;
+  if (shouldReuseReport(existing, options)) {
+    return { ...existing, startDate, endDate, reportKind: "ledgerReport" };
+  }
   const created = await spApiFetchWithRetry("/reports/2021-06-30/reports", {}, {
     method: "POST",
     body: {
@@ -2725,12 +3137,13 @@ async function getOrCreateLedgerReport(startDate, endDate, options = {}) {
       }
     },
     retries: 2,
-    retryDelayMs: 30000
+    retryDelayMs: 30000,
+    logContext: context
   });
   const payload = created.payload || created;
   const reportId = payload.reportId || payload.ReportId;
   if (!reportId) throw new Error("库存账本报表创建失败：缺少 reportId");
-  const item = { reportId, reportType, createdAt: Date.now() };
+  const item = { reportId, reportType, startDate, endDate, reportKind: "ledgerReport", createdAt: Date.now() };
   await rememberSalesReportRequest(key, item);
   return item;
 }
@@ -2752,7 +3165,9 @@ async function fetchLedgerInventoryRecords(startDate, endDate, options = {}) {
   const config = getSpApiConfig();
   const report = await getOrCreateLedgerReport(startDate, endDate, options);
   const reportDocumentId = await waitForReportDocument(report, "库存账本报表");
-  const text = await downloadReportDocument(reportDocumentId);
+  const text = await downloadReportDocument(reportDocumentId, {
+    logContext: reportLogContext(report.reportKind || "ledgerReport", startDate, endDate, report.reportId, reportDocumentId)
+  });
   const rows = parseFlatReport(text);
   const grouped = new Map();
 
@@ -3020,17 +3435,6 @@ async function upsertFbaDailyRecords(records, options = {}) {
   return { inserted, updated, skippedFrozen };
 }
 
-function fbaDatesWithSalesRecords(rows, marketplaceId) {
-  const dates = new Set();
-  for (const row of rows) {
-    if (row.marketplaceId !== marketplaceId) continue;
-    if (!isCompleteSalesDateMarker(row)) continue;
-    const date = String(row.date || "").slice(0, 10);
-    dates.add(date);
-  }
-  return dates;
-}
-
 async function syncFbaDailyRange(startDate, endDate, options = {}) {
   const config = getSpApiConfig();
   const today = formatDateInTimeZone();
@@ -3039,14 +3443,18 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
   const inventoryDates = options.inventoryDates || [];
   const forceNewReport = Boolean(options.forceNewReport);
   const reuseSameDayReport = Boolean(options.reuseSameDayReport);
+  const syncCurrentInventory = options.syncCurrentInventory !== false;
+  const syncHistoricalInventory = options.syncHistoricalInventory !== false;
+  const syncSales = options.syncSales !== false;
+  const syncCatalog = Boolean(options.syncCatalog);
   const inventoryRecords = [];
   const warnings = [];
   let inventorySynced = false;
 
-  if (rangeDates.includes(today)) {
+  if (syncCurrentInventory && rangeDates.includes(today)) {
     try {
       const inventory = await fetchFbaInventorySummaries();
-      const catalog = await fetchCatalogDetails(inventory.map(item => item.asin).filter(Boolean));
+      const catalog = await catalogForInventorySummaries(inventory, { syncCatalog });
       inventoryRecords.push(...inventory.map(summary => buildInventoryDailyRecord(summary, catalog, today, config)));
       inventorySynced = true;
     } catch (error) {
@@ -3055,7 +3463,7 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
   }
 
   const historicalInventoryDates = inventoryDates.filter(date => date < today);
-  if (historicalInventoryDates.length) {
+  if (syncHistoricalInventory && historicalInventoryDates.length) {
     try {
       const ledgerRecords = await fetchLedgerInventoryRecords(historicalInventoryDates[0], historicalInventoryDates[historicalInventoryDates.length - 1], { forceNewReport, reuseSameDayReport });
       const requestedSet = new Set(historicalInventoryDates);
@@ -3069,20 +3477,17 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
   let orderCount = 0;
   let orderItemErrorCount = 0;
   let salesByDate = null;
-  const useSalesReport = (process.env.AMZ_SALES_SOURCE || "reports").toLowerCase() !== "orders";
-  let salesReportFailed = false;
-  if (useSalesReport && dates.length) {
+  if (syncSales && dates.length) {
     try {
       salesByDate = await fetchSalesByDateSkuFromReport(dates[0], dates[dates.length - 1], { forceNewReport, reuseSameDayReport });
     } catch (error) {
-      salesReportFailed = true;
       warnings.push(`${dates[0]} 至 ${dates[dates.length - 1]} Orders 销量报表拉取失败：${error.message}`);
     }
   }
-  for (const date of dates) {
-    try {
-      if (useSalesReport && salesReportFailed && forceNewReport) continue;
-      const sales = salesByDate?.get(date) || await fetchSalesBySku(date, date, { forceNewReport, reuseSameDayReport });
+  if (salesByDate) {
+    for (const date of dates) {
+      const sales = salesByDate.get(date);
+      if (!sales) continue;
       orderCount += sales.orderCount || 0;
       orderItemErrorCount += sales.orderItemErrorCount || 0;
       warnings.push(...(sales.warnings || []));
@@ -3090,8 +3495,6 @@ async function syncFbaDailyRange(startDate, endDate, options = {}) {
       for (const sale of sales.bySku.values()) {
         salesRecords.push(buildSalesDailyRecord(sale, date, config));
       }
-    } catch (error) {
-      warnings.push(`${date} Orders 销量拉取失败：${error.message}`);
     }
   }
 
@@ -3152,47 +3555,15 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   const suggestion7Dates = dateRangeInclusive(addDays(suggestionEndDate, -6), suggestionEndDate);
   const suggestion30Dates = dateRangeInclusive(addDays(suggestionEndDate, -29), suggestionEndDate);
   const suggestionDates = [...new Set([...suggestion7Dates, ...suggestion30Dates])].sort();
-  if (options.mode === "sync") {
-    const syncDates = [...new Set([...requestedDates, ...suggestionDates])].sort();
-    sync = await syncFbaDailyRange(syncDates[0], syncDates[syncDates.length - 1], {
-      dates: syncDates,
-      inventoryDates: requestedDates.filter(date => date < today),
-      allowFrozenInventoryUpdate: true,
-      forceNewReport: true,
-      reuseSameDayReport: true
-    });
-    warnings.push(...(sync.warnings || []));
-    if (Number(sync.storage?.skippedFrozen || 0) > 0) {
-      warnings.push(`强制刷新有 ${sync.storage.skippedFrozen} 条库存记录因为冻结状态未写入，请检查保存逻辑。`);
-    }
-    dailyRows = await readFbaDailyRows();
-  } else if (options.mode === "query") {
-    const existingSalesDates = fbaDatesWithSalesRecords(dailyRows, config.marketplaceId);
-    const missingDates = [...new Set([...requestedDates, ...suggestionDates])]
-      .sort()
-      .filter(date => date === today || !existingSalesDates.has(date));
-    const existingInventoryDates = new Set(dailyRows
-      .filter(row => row.marketplaceId === config.marketplaceId && row.inventoryFetchedAt && row.sellerSku !== FBA_DATE_MARKER_SKU)
-      .map(row => row.date)
-    );
-    const missingHistoricalInventoryDates = requestedDates.filter(date => date < today && !existingInventoryDates.has(date));
-    const hasEndDateInventory = dailyRows.some(row =>
-      row.marketplaceId === config.marketplaceId &&
-      row.date === safeEnd &&
-      row.inventoryFetchedAt &&
-      row.sellerSku !== FBA_DATE_MARKER_SKU
-    );
-    const shouldFetchTodayInventory = requestedDates.includes(today);
-    if (missingDates.length || shouldFetchTodayInventory || missingHistoricalInventoryDates.length) {
-      const syncStart = missingDates.length ? missingDates[0] : safeStart;
-      const syncEnd = missingDates.length ? missingDates[missingDates.length - 1] : safeEnd;
-      sync = await syncFbaDailyRange(syncStart, syncEnd, {
-        dates: missingDates,
-        inventoryDates: missingHistoricalInventoryDates
-      });
-      warnings.push(...(sync.warnings || []));
-      dailyRows = await readFbaDailyRows();
-    }
+  const coverageDates = [...new Set([...requestedDates, ...suggestionDates])].sort();
+  const coverage = summarizeFbaDateCoverage(dailyRows, config.marketplaceId, coverageDates);
+  if (coverage.missingSalesDates.length) {
+    warnings.push(`有 ${coverage.missingSalesDates.length} 天销量未同步：${summarizeDateList(coverage.missingSalesDates)}；页面先展示本地已有数据，可点击“后台刷新数据”补齐。`);
+  }
+  const requestedInventoryCoverage = summarizeFbaDateCoverage(dailyRows, config.marketplaceId, requestedDates);
+  const missingHistoricalInventoryDates = requestedInventoryCoverage.missingInventoryDates.filter(date => date < today);
+  if (missingHistoricalInventoryDates.length) {
+    warnings.push(`所选范围有 ${missingHistoricalInventoryDates.length} 天历史库存快照缺失；库存字段会优先显示结束日期已有快照。`);
   }
   const rangeRows = dailyRows.filter(row => row.date >= safeStart && row.date <= safeEnd && row.marketplaceId === config.marketplaceId);
   const suggestionRows = dailyRows.filter(row => suggestionDates.includes(row.date) && row.marketplaceId === config.marketplaceId);
@@ -3200,21 +3571,13 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   const metadataRows = (await readFbaSkuMetadataRows()).filter(row => row.marketplaceId === config.marketplaceId);
   let inventoryRows = allInventoryRows.filter(row => row.date === safeEnd);
 
-  if (!inventoryRows.length && safeEnd === today) {
-    try {
-      const inventory = await fetchFbaInventorySummaries();
-      const catalog = await fetchCatalogDetails(inventory.map(item => item.asin).filter(Boolean));
-      inventoryRows = inventory.map(summary => buildInventoryDailyRecord(summary, catalog, today, config));
-      await upsertFbaSkuMetadata(inventoryRows, "inventory");
-      warnings.push("当前展示使用实时 FBA 库存兜底；点击同步后会保存当天库存快照。");
-    } catch (error) {
-      throw new Error(`FBA Inventory 拉取失败：${error.message}`);
-    }
-  } else if (!inventoryRows.length) {
+  if (!inventoryRows.length) {
     warnings.push(`结束日期 ${safeEnd} 没有本地 FBA 库存快照；库存字段显示为空，销量仍按所选日期范围统计。`);
   }
-  const currentDateColumnsAvailable = inventoryRows.some(row => row.sellerSku !== FBA_DATE_MARKER_SKU);
-  const factoryInfoByAsin = buildFactoryInfoByAsin(await readDb());
+  const currentDateColumnsAvailable = inventoryRows.some(row => row.sellerSku !== FBA_DATE_MARKER_SKU && isRealtimeInventorySnapshot(row));
+  const localDb = await readDb();
+  const factoryInfoByAsin = buildFactoryInfoByAsin(localDb);
+  const fbaGradeByAsin = await buildFbaGradeByAsin(localDb);
 
   const latestInventoryBySku = new Map();
   for (const row of inventoryRows) {
@@ -3222,6 +3585,15 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
     const existing = latestInventoryBySku.get(row.sellerSku);
     if (!existing || String(row.date || "") > String(existing.date || "")) {
       latestInventoryBySku.set(row.sellerSku, row);
+    }
+  }
+
+  const latestRealtimeInventoryBySku = new Map();
+  for (const row of allInventoryRows) {
+    if (row.sellerSku === FBA_DATE_MARKER_SKU || !isRealtimeInventorySnapshot(row)) continue;
+    const existing = latestRealtimeInventoryBySku.get(row.sellerSku);
+    if (!existing || String(row.date || "") > String(existing.date || "")) {
+      latestRealtimeInventoryBySku.set(row.sellerSku, row);
     }
   }
 
@@ -3309,18 +3681,22 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
   const rowSkus = new Set([...latestInventoryBySku.keys(), ...salesBySku.keys()]);
   const rows = [...rowSkus].map(sku => {
     const inventory = latestInventoryBySku.get(sku) || null;
+    const latestRealtimeInventory = latestRealtimeInventoryBySku.get(sku) || null;
     const metadata = mergeSkuDisplayMetadata(latestMetadataBySku.get(sku), inventory);
     const sale = salesBySku.get(sku) || { units: 0, orders: 0, sufficientUnits: 0, sufficientDays: 0 };
     const dailySales = sale.units / dayCount;
     const inventorySource = inventorySnapshotSource(inventory);
     const isWarehouseOnlyInventory = inventorySource === "ledger_summary";
+    const hasRealtimeEndInventory = inventory && isRealtimeInventorySnapshot(inventory);
     const fulfillableQuantity = inventory ? Number(inventory.fulfillableQuantity || 0) : 0;
     const warehouseQuantity = inventory ? Number(inventory.fulfillableQuantity || 0) + Number(inventory.unfulfillableQuantity || 0) : 0;
-    const totalGoodsQuantity = inventory ? calculateTotalGoodsQuantity(inventory) : null;
-    const inboundQuantity = inventory ? calculateInboundQuantity(inventory) : null;
+    const totalGoodsQuantity = hasRealtimeEndInventory
+      ? calculateTotalGoodsQuantity(inventory)
+      : (inventory ? fulfillableQuantity : null);
+    const inboundQuantity = hasRealtimeEndInventory ? calculateInboundQuantity(inventory) : null;
     const asin = String(metadata.asin || "").trim().toUpperCase();
     const factoryInfo = asin ? factoryInfoByAsin.get(asin) : null;
-    const factoryQuantity = currentDateColumnsAvailable && asin ? Number(factoryInfo?.quantity || 0) : null;
+    const factoryQuantity = hasRealtimeEndInventory && currentDateColumnsAvailable && asin ? Number(factoryInfo?.quantity || 0) : null;
     const suggestionSales = suggestionSalesBySku.get(sku) || {};
     const sevenEffectiveDays = Number(suggestionSales.sevenDays || 0);
     const thirtyEffectiveDays = Number(suggestionSales.thirtyDays || 0);
@@ -3355,9 +3731,12 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
       totalGoodsQuantity,
       inboundQuantity,
       factoryQuantity,
+      factoryFbaTotalUsesFactory: factoryQuantity !== null,
+      latestRealtimeInventory: buildInventoryQuantitySnapshot(latestRealtimeInventory),
       factoryProductId: factoryInfo?.productId || "",
       factoryBoxSpec: factoryInfo?.boxSpec || "",
       factoryName: factoryInfo?.name || "",
+      replenishmentGrade: fbaGradeByAsin.get(asin) || (!isMysqlEnabled() ? factoryInfo?.replenishmentGrade : "") || "",
       factoryFbaTotalQuantity,
       replenishmentSales: {
         sevenStartDate: suggestion7Dates[0],
@@ -3377,11 +3756,11 @@ async function buildFbaInventoryView(startDate, endDate, options = {}) {
         baseDailySales: replenishmentBaseDailySales
       },
       fulfillableQuantity,
-      reservedQuantity: inventory ? Number(inventory.reservedQuantity || 0) : null,
+      reservedQuantity: hasRealtimeEndInventory ? Number(inventory.reservedQuantity || 0) : null,
       unfulfillableQuantity: inventory ? Number(inventory.unfulfillableQuantity || 0) : 0,
-      inboundWorkingQuantity: inventory ? Number(inventory.inboundWorkingQuantity || 0) : null,
-      inboundShippedQuantity: inventory ? Number(inventory.inboundShippedQuantity || 0) : null,
-      inboundReceivingQuantity: inventory ? Number(inventory.inboundReceivingQuantity || 0) : null,
+      inboundWorkingQuantity: hasRealtimeEndInventory ? Number(inventory.inboundWorkingQuantity || 0) : null,
+      inboundShippedQuantity: hasRealtimeEndInventory ? Number(inventory.inboundShippedQuantity || 0) : null,
+      inboundReceivingQuantity: hasRealtimeEndInventory ? Number(inventory.inboundReceivingQuantity || 0) : null,
       salesOrders: Number(sale.orders || 0),
       salesUnits: Number(sale.units || 0),
       sufficientSalesDays: Number(sale.sufficientDays || 0),
@@ -4812,17 +5191,74 @@ async function handleApi(req, res, url) {
   if (req.method === "GET" && url.pathname === "/api/fba/inventory") {
     const startDate = url.searchParams.get("startDate") || "";
     const endDate = url.searchParams.get("endDate") || "";
-    const mode = url.searchParams.get("mode") || "";
-    const refresh = url.searchParams.get("refresh") === "1" || mode === "sync" || mode === "query";
-    const cacheKey = `fba-view-v2:${startDate}:${endDate}:${mode}:${getSpApiConfig().marketplaceId}`;
+    const cacheKey = `fba-view-v3:${startDate}:${endDate}:${getSpApiConfig().marketplaceId}`;
     const cacheTtlMs = Number(process.env.AMZ_FBA_CACHE_TTL_MS || 300000);
     const cached = fbaInventoryCache.get(cacheKey);
-    if (!refresh && cached && Date.now() - cached.cachedAt < cacheTtlMs) {
-      return sendJson(res, { ...cached.data, cached: true, cachedAt: cached.cachedAt });
+    if (cached && Date.now() - cached.cachedAt < cacheTtlMs) {
+      return sendJson(res, { ...cached.data, syncJob: fbaJobPublicView(latestFbaSyncJob()), cached: true, cachedAt: cached.cachedAt });
     }
-    const result = await buildFbaInventoryView(startDate, endDate, { mode: mode || (refresh ? "sync" : "") });
+    const result = await buildFbaInventoryView(startDate, endDate);
     fbaInventoryCache.set(cacheKey, { cachedAt: Date.now(), data: result });
-    return sendJson(res, result);
+    return sendJson(res, { ...result, syncJob: fbaJobPublicView(latestFbaSyncJob()) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/fba/grades") {
+    const body = await parseBody(req);
+    const rawGrades = body && typeof body.grades === "object" && body.grades ? body.grades : {};
+    const normalizedGrades = {};
+    for (const [rawAsin, rawGrade] of Object.entries(rawGrades)) {
+      const asin = String(rawAsin || "").trim().toUpperCase();
+      const grade = normalizeFbaReplenishmentGrade(rawGrade);
+      if (/^B[A-Z0-9]{9}$/.test(asin) && grade) normalizedGrades[asin] = grade;
+    }
+    const mysqlResult = await upsertFbaProductGrades(normalizedGrades);
+    const db = await readDb();
+    const nextGrades = db.fbaProductGrades && typeof db.fbaProductGrades === "object" ? { ...db.fbaProductGrades } : {};
+    const store = db.factoryInventory || { products: [], movements: [] };
+    store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
+    let changed = Boolean(mysqlResult.changed);
+    for (const [asin, grade] of Object.entries(normalizedGrades)) {
+      if (!isMysqlEnabled() && nextGrades[asin] !== grade) {
+        nextGrades[asin] = grade;
+        changed = true;
+      }
+      store.products = store.products.map(product => {
+        if (product.asin !== asin || product.replenishmentGrade === grade) return product;
+        changed = true;
+        return normalizeFactoryProduct({ ...product, replenishmentGrade: grade, updatedAt: new Date().toISOString() });
+      });
+    }
+    if (changed) {
+      if (!isMysqlEnabled()) db.fbaProductGrades = nextGrades;
+      db.factoryInventory = store;
+      await writeDb(db);
+      fbaInventoryCache.clear();
+    }
+    return sendJson(res, { saved: normalizedGrades, changed });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/fba/sync") {
+    return sendJson(res, { job: fbaJobPublicView(latestFbaSyncJob()) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/fba/sync") {
+    const body = await parseBody(req);
+    const today = formatDateInTimeZone();
+    const startDate = String(body.startDate || addDays(today, -29)).slice(0, 10);
+    const endDate = String(body.endDate || today).slice(0, 10);
+    const dates = body.dates?.length ? body.dates : dateRangeInclusive(startDate, endDate);
+    const job = enqueueFbaSyncJob({
+      reason: body.reason || "manual",
+      dates,
+      inventoryDates: body.inventoryDates || dates.filter(date => date <= today),
+      allowFrozenInventoryUpdate: body.allowFrozenInventoryUpdate !== false,
+      forceNewReport: Boolean(body.forceNewReport),
+      syncCurrentInventory: body.syncCurrentInventory !== false,
+      syncHistoricalInventory: body.syncHistoricalInventory !== false,
+      syncSales: body.syncSales !== false,
+      syncCatalog: body.syncCatalog !== false
+    });
+    return sendJson(res, { job: fbaJobPublicView(job) }, 202);
   }
 
   if (req.method === "GET" && url.pathname === "/api/fba/inventory/dates") {
@@ -5045,13 +5481,20 @@ async function serveStatic(req, res, url) {
 }
 
 const server = createServer(async (req, res) => {
+  const startedAt = Date.now();
+  let url;
   try {
     if (req.method === "OPTIONS") {
       res.writeHead(204, corsHeaders());
       res.end();
       return;
     }
-    const url = new URL(req.url || "/", `http://${req.headers.host}`);
+    url = new URL(req.url || "/", `http://${req.headers.host}`);
+    if (url.pathname.startsWith("/api/")) {
+      res.on("finish", () => {
+        logApiRequest({ method: req.method, path: url.pathname, status: res.statusCode, durationMs: Date.now() - startedAt });
+      });
+    }
     if (url.pathname.startsWith("/api/")) {
       await handleApi(req, res, url);
     } else {
@@ -5065,4 +5508,17 @@ const server = createServer(async (req, res) => {
 await ensureDb();
 server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
+  if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
+    setTimeout(async () => {
+      try {
+        await enqueueStartupFbaSyncJobs();
+      } catch (error) {
+        console.error(`FBA startup sync failed: ${error.message}`);
+      } finally {
+        scheduleNextFbaSync();
+      }
+    }, Number(process.env.AMZ_FBA_STARTUP_SYNC_DELAY_MS || 15000));
+  } else {
+    scheduleNextFbaSync();
+  }
 });

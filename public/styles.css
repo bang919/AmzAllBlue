@@ -1090,7 +1090,6 @@ h2 {
   background: #fff8db;
 }
 
-.fba-table .fba-col-replenishmentGrade,
 .fba-table .fba-col-replenishmentDailySales,
 .fba-table .fba-col-replenishmentBoxQty,
 .fba-table .fba-col-replenishmentShippingQty,
@@ -1101,7 +1100,12 @@ h2 {
   text-overflow: clip;
 }
 
-.fba-table th.fba-col-replenishmentGrade,
+.fba-table .fba-col-replenishmentGrade {
+  text-align: center;
+  overflow: visible;
+  text-overflow: clip;
+}
+
 .fba-table th.fba-col-replenishmentDailySales,
 .fba-table th.fba-col-replenishmentBoxQty,
 .fba-table th.fba-col-replenishmentShippingQty,
@@ -1207,16 +1211,15 @@ h2 {
 .fba-grade-menu {
   position: absolute;
   top: calc(100% + 4px);
-  left: 50%;
+  left: 12px;
   z-index: 50;
   display: none;
-  min-width: 160px;
+  min-width: 172px;
   padding: 4px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
   box-shadow: 0 12px 28px rgba(15, 23, 42, 0.16);
-  transform: translateX(-50%);
 }
 
 .fba-grade-picker.open .fba-grade-menu {

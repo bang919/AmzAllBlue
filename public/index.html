@@ -119,10 +119,10 @@
               <div class="fba-toolbar-actions">
                 <button id="fbaColumnSettingsBtn" class="secondary-button" type="button" title="选择表格显示哪些列，并设置默认排序。">显示列</button>
                 <button id="fbaFilterSettingsBtn" class="secondary-button" type="button" title="设置表格筛选条件，只影响当前页面显示，不请求 API。">筛选数据</button>
-                <button id="syncProductsBtn" type="button" title="强制按所选日期范围重新请求 API，并把成功返回的库存和销量覆盖写入数据库。">强制刷新数据</button>
+                <button id="syncProductsBtn" type="button" title="把所选日期范围加入后台同步任务；页面会先展示数据库已有数据，同步完成后再查询即可看到新数据。">后台刷新数据</button>
                 <div class="fba-query-stack">
                   <button id="fbaReplenishmentToggleBtn" class="primary" type="button" title="打开或关闭发补货建议列。">打开发补货</button>
-                  <button id="queryProductsBtn" type="button" title="先查询数据库；如果所选日期范围有缺失日期，才请求缺失日期的 API 并写入数据库。">查询</button>
+                  <button id="queryProductsBtn" type="button" title="只查询数据库已有库存和销量；缺失日期请点击后台刷新数据。">查询</button>
                 </div>
               </div>
             </div>
