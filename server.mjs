@@ -2,7 +2,7 @@
 import { readFile, writeFile, appendFile, mkdir } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import { extname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, randomBytes, randomUUID } from "node:crypto";
 import { gunzipSync } from "node:zlib";
 import mysql from "mysql2/promise";
 import ExcelJS from "exceljs";
@@ -18,6 +18,11 @@ const SP_API_REPORT_CACHE_PATH = join(DATA_DIR, "sp-api-report-cache.json");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
 const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
 const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
+const SECRET_KEYS = {
+  gmailToken: "gmail_token",
+  adsToken: "amazon_ads_token",
+  adsProfile: "amazon_ads_profile"
+};
 const ENV_PATH = join(ROOT, ".env");
 const FBA_DATE_MARKER_SKU = "__DATE_MARKER__";
 const fbaInventoryCache = new Map();
@@ -214,8 +219,79 @@ async function ensureAppMysqlSchema() {
       PRIMARY KEY (parent_asin)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_secrets (
+      secret_key VARCHAR(128) NOT NULL,
+      encrypted_value JSON NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (secret_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
   appMysqlSchemaReady = true;
   return true;
+}
+
+function secretEncryptionKey() {
+  const raw = String(process.env.TOKEN_ENCRYPTION_KEY || "").trim();
+  if (!raw) throw new Error("请先在 .env 配置 TOKEN_ENCRYPTION_KEY，用于加密数据库中的授权 token");
+  return createHash("sha256").update(raw).digest();
+}
+
+function encryptSecretValue(value) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", secretEncryptionKey(), iv);
+  const plaintext = Buffer.from(JSON.stringify(value ?? null), "utf8");
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  return {
+    algorithm: "aes-256-gcm",
+    iv: iv.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+    ciphertext: ciphertext.toString("base64")
+  };
+}
+
+function decryptSecretValue(encrypted) {
+  const payload = typeof encrypted === "string" ? JSON.parse(encrypted) : encrypted;
+  if (payload?.algorithm !== "aes-256-gcm") throw new Error("数据库授权 token 加密格式不支持");
+  const decipher = createDecipheriv("aes-256-gcm", secretEncryptionKey(), Buffer.from(payload.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(payload.tag, "base64"));
+  const plaintext = Buffer.concat([
+    decipher.update(Buffer.from(payload.ciphertext, "base64")),
+    decipher.final()
+  ]);
+  return JSON.parse(plaintext.toString("utf8"));
+}
+
+async function readJsonFileIfExists(pathname) {
+  if (!existsSync(pathname)) return null;
+  try {
+    return JSON.parse(await readFile(pathname, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+async function readAppSecret(secretKey, fallbackPath = "") {
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT encrypted_value FROM app_secrets WHERE secret_key = ?", [secretKey]);
+  if (rows[0]?.encrypted_value) return decryptSecretValue(rows[0].encrypted_value);
+
+  const fallback = fallbackPath ? await readJsonFileIfExists(fallbackPath) : null;
+  if (fallback) await writeAppSecret(secretKey, fallback);
+  return fallback;
+}
+
+async function writeAppSecret(secretKey, value) {
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const encrypted = encryptSecretValue(value);
+  await pool.query(`
+    INSERT INTO app_secrets (secret_key, encrypted_value)
+    VALUES (?, CAST(? AS JSON))
+    ON DUPLICATE KEY UPDATE encrypted_value = VALUES(encrypted_value)
+  `, [secretKey, JSON.stringify(encrypted)]);
 }
 
 function jsonRowId(row, index) {
@@ -4503,17 +4579,11 @@ function assertGmailConfig() {
 }
 
 async function readGmailToken() {
-  if (!existsSync(GMAIL_TOKEN_PATH)) return null;
-  try {
-    return JSON.parse(await readFile(GMAIL_TOKEN_PATH, "utf8"));
-  } catch {
-    return null;
-  }
+  return readAppSecret(SECRET_KEYS.gmailToken, GMAIL_TOKEN_PATH);
 }
 
 async function writeGmailToken(token) {
-  await ensureDataDir();
-  await writeFile(GMAIL_TOKEN_PATH, JSON.stringify(token, null, 2), "utf8");
+  await writeAppSecret(SECRET_KEYS.gmailToken, token);
 }
 
 function gmailAuthUrl() {
@@ -4632,31 +4702,19 @@ function assertAdsConfig() {
 }
 
 async function readAdsToken() {
-  if (!existsSync(ADS_TOKEN_PATH)) return null;
-  try {
-    return JSON.parse(await readFile(ADS_TOKEN_PATH, "utf8"));
-  } catch {
-    return null;
-  }
+  return readAppSecret(SECRET_KEYS.adsToken, ADS_TOKEN_PATH);
 }
 
 async function writeAdsToken(token) {
-  await ensureDataDir();
-  await writeFile(ADS_TOKEN_PATH, JSON.stringify(token, null, 2), "utf8");
+  await writeAppSecret(SECRET_KEYS.adsToken, token);
 }
 
 async function readAdsProfileSelection() {
-  if (!existsSync(ADS_PROFILE_PATH)) return null;
-  try {
-    return JSON.parse(await readFile(ADS_PROFILE_PATH, "utf8"));
-  } catch {
-    return null;
-  }
+  return readAppSecret(SECRET_KEYS.adsProfile, ADS_PROFILE_PATH);
 }
 
 async function writeAdsProfileSelection(profile) {
-  await ensureDataDir();
-  await writeFile(ADS_PROFILE_PATH, JSON.stringify(profile, null, 2), "utf8");
+  await writeAppSecret(SECRET_KEYS.adsProfile, profile);
 }
 
 function adsAuthUrl() {
