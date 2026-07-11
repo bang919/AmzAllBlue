@@ -13,17 +13,17 @@
 
 ## 数据对象
 
-第一版使用本地 JSON 数据库 `data/db.json`，新增节点：
+工厂库存使用本机 MySQL 持久化。服务层仍向业务代码提供以下逻辑结构：
 
 ```text
 factoryInventory.products
 factoryInventory.movements
 ```
 
-后续如果系统全面迁移到 MySQL，可按相同字段拆成两张表：
+数据库中按相同字段拆成两张表：
 
 ```text
-factory_products
+factory_inventory_products
 factory_inventory_movements
 ```
 

@@ -2169,6 +2169,7 @@ function renderFactoryInventory() {
     for (let index = 0; index < visibleProducts.length;) {
       const product = visibleProducts[index];
       const key = getFactoryProductGroupKey(product);
+      const parentInternalName = String(product.parentInternalName || "").trim();
       let span = 1;
       while (index + span < visibleProducts.length) {
         const next = visibleProducts[index + span];
@@ -2177,7 +2178,11 @@ function renderFactoryInventory() {
       }
       cells.push(`
         <td class="factory-product-cell ${productGroupClass(product)} factory-parent-cell factory-parent-draggable" colspan="${span}" draggable="true" data-parent-key="${escapeHtml(key)}" title="拖动调整父ASIN组顺序">
-          ${product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-"}
+          <span class="factory-parent-label">
+            ${product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : `<span>${escapeHtml(key || "-")}</span>`}
+            <span class="factory-parent-divider">|</span>
+            <input class="factory-parent-name-input" data-factory-parent-name data-parent-key="${escapeHtml(key)}" type="text" value="${escapeHtml(parentInternalName)}" placeholder="内部名">
+          </span>
         </td>
       `);
       index += span;
@@ -2269,6 +2274,30 @@ function renderFactoryInventory() {
       </tr>
     `).join("")}
   `;
+}
+
+async function saveFactoryParentInternalName(input) {
+  const parentKey = input?.dataset?.parentKey || "";
+  if (!parentKey) return;
+  const currentProduct = factoryProducts.find(product => getFactoryProductGroupKey(product) === parentKey);
+  const current = String(currentProduct?.parentInternalName || "");
+  const nextValue = String(input.value || "").trim();
+  if (nextValue === current) return;
+  input.disabled = true;
+  try {
+    const data = await api(`/api/factory-inventory/parent-groups/${encodeURIComponent(parentKey)}`, {
+      method: "PUT",
+      body: { parentInternalName: nextValue }
+    });
+    factoryProducts = data.products || [];
+    factoryMovements = data.movements || [];
+    factoryTotals = data.totals || {};
+    renderFactoryInventory();
+    $("#sandboxStatus").textContent = "父ASIN内部名已保存";
+  } catch (error) {
+    alert(error.message);
+    input.disabled = false;
+  }
 }
 
 async function saveFactoryProductField(input) {
@@ -3360,6 +3389,11 @@ $("#factoryMatrixBody").addEventListener("click", event => {
   }
 });
 $("#factoryMatrixBody").addEventListener("change", event => {
+  const parentNameInput = event.target?.closest?.("[data-factory-parent-name]");
+  if (parentNameInput) {
+    saveFactoryParentInternalName(parentNameInput);
+    return;
+  }
   const input = event.target?.closest?.("[data-factory-field]");
   if (input) saveFactoryProductField(input);
 });
@@ -3371,6 +3405,13 @@ $("#factoryMatrixBody").addEventListener("keydown", event => {
     return;
   }
   const input = event.target?.closest?.("[data-factory-field]");
+  const parentNameInput = event.target?.closest?.("[data-factory-parent-name]");
+  if (parentNameInput && event.key === "Enter") {
+    if (event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    parentNameInput.blur();
+    return;
+  }
   if (!input || event.key !== "Enter") return;
   if (event.isComposing || event.keyCode === 229) return;
   event.preventDefault();

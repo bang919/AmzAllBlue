@@ -13,8 +13,6 @@ const ROOT = resolve(".");
 const PUBLIC_DIR = join(ROOT, "public");
 const TEMPLATE_DIR = join(PUBLIC_DIR, "templates");
 const DATA_DIR = join(ROOT, "data");
-const DB_PATH = join(DATA_DIR, "db.json");
-const FBA_DAILY_PATH = join(DATA_DIR, "fba-inventory-daily.json");
 const NETWORK_DEBUG_PATH = join(DATA_DIR, "network-debug.jsonl");
 const SP_API_REPORT_CACHE_PATH = join(DATA_DIR, "sp-api-report-cache.json");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
@@ -32,6 +30,7 @@ let spApiAccessTokenCache = null;
 let salesReportRequestsLoaded = false;
 let mysqlPool = null;
 let fbaDailySchemaReady = false;
+let appMysqlSchemaReady = false;
 let mysqlDatabaseReady = false;
 let fbaScheduledSyncTimer = null;
 
@@ -76,27 +75,50 @@ function corsHeaders() {
   };
 }
 
-async function ensureDb() {
+async function ensureDataDir() {
   await mkdir(DATA_DIR, { recursive: true });
-  if (!existsSync(DB_PATH)) {
-    await writeFile(DB_PATH, JSON.stringify({ requests: [] }, null, 2), "utf8");
-  }
 }
 
 async function readDb() {
-  await ensureDb();
-  const raw = await readFile(DB_PATH, "utf8");
-  return JSON.parse(raw || "{\"requests\":[]}");
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const [requestRows] = await pool.query("SELECT payload FROM collaboration_requests ORDER BY position ASC, created_at DESC");
+  const [productRows] = await pool.query("SELECT payload FROM manual_products ORDER BY position ASC, updated_at DESC");
+  const [factoryProductRows] = await pool.query("SELECT payload FROM factory_inventory_products ORDER BY position ASC, updated_at DESC");
+  const [factoryMovementRows] = await pool.query("SELECT payload FROM factory_inventory_movements ORDER BY position ASC, created_at DESC");
+  return {
+    requests: requestRows.map(row => parseMysqlJson(row.payload)).filter(Boolean),
+    products: productRows.map(row => parseMysqlJson(row.payload)).filter(Boolean),
+    factoryInventory: {
+      products: factoryProductRows.map(row => parseMysqlJson(row.payload)).filter(Boolean),
+      movements: factoryMovementRows.map(row => parseMysqlJson(row.payload)).filter(Boolean)
+    }
+  };
 }
 
 async function writeDb(db) {
-  await ensureDb();
-  await writeFile(DB_PATH, JSON.stringify(db, null, 2), "utf8");
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await replaceJsonTableRows(connection, "collaboration_requests", (Array.isArray(db.requests) ? db.requests : []).map(item => normalizeRequest(item)));
+    await replaceJsonTableRows(connection, "manual_products", (Array.isArray(db.products) ? db.products : []).map(item => normalizeProduct(item)));
+    const factoryStore = db.factoryInventory || { products: [], movements: [] };
+    await replaceJsonTableRows(connection, "factory_inventory_products", (Array.isArray(factoryStore.products) ? factoryStore.products : []).map(item => normalizeFactoryProduct(item)));
+    await replaceJsonTableRows(connection, "factory_inventory_movements", (Array.isArray(factoryStore.movements) ? factoryStore.movements : []).map(item => normalizeFactoryMovement(item)));
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 function getMysqlConfig() {
   return {
-    enabled: process.env.DB_ENABLED === "1" || process.env.DB_ENABLED === "true",
+    enabled: process.env.DB_DISABLED !== "1" && process.env.DB_DISABLED !== "true",
     host: process.env.DB_HOST || "127.0.0.1",
     port: Number(process.env.DB_PORT || 3306),
     user: process.env.DB_USER || "root",
@@ -110,7 +132,9 @@ function isMysqlEnabled() {
 }
 
 function getMysqlPool() {
-  if (!isMysqlEnabled()) return null;
+  if (!isMysqlEnabled()) {
+    throw new Error("Database storage is required. Remove DB_DISABLED or configure DB_* in .env.");
+  }
   if (!mysqlPool) {
     const config = getMysqlConfig();
     mysqlPool = mysql.createPool({
@@ -128,8 +152,94 @@ function getMysqlPool() {
   return mysqlPool;
 }
 
+async function ensureAppMysqlSchema() {
+  if (!isMysqlEnabled()) {
+    throw new Error("Database storage is required. Remove DB_DISABLED or configure DB_* in .env.");
+  }
+  if (appMysqlSchemaReady) return true;
+  await ensureMysqlDatabase();
+  const pool = getMysqlPool();
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS collaboration_requests (
+      id VARCHAR(64) NOT NULL,
+      position INT NOT NULL DEFAULT 0,
+      payload JSON NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_collaboration_requests_position (position),
+      KEY idx_collaboration_requests_created_at (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS manual_products (
+      id VARCHAR(64) NOT NULL,
+      position INT NOT NULL DEFAULT 0,
+      payload JSON NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_manual_products_position (position)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS factory_inventory_products (
+      id VARCHAR(64) NOT NULL,
+      position INT NOT NULL DEFAULT 0,
+      payload JSON NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_factory_inventory_products_position (position)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS factory_inventory_movements (
+      id VARCHAR(64) NOT NULL,
+      position INT NOT NULL DEFAULT 0,
+      payload JSON NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_factory_inventory_movements_position (position),
+      KEY idx_factory_inventory_movements_created_at (created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS parent_asin_metadata (
+      parent_asin VARCHAR(32) NOT NULL,
+      internal_name VARCHAR(255) NOT NULL DEFAULT '',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (parent_asin)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  appMysqlSchemaReady = true;
+  return true;
+}
+
+function jsonRowId(row, index) {
+  return String(row?.id || row?.asin || row?.sellerSku || `row-${index + 1}`).slice(0, 64);
+}
+
+async function replaceJsonTableRows(connection, tableName, rows) {
+  await connection.query(`DELETE FROM ${tableName}`);
+  if (!rows.length) return;
+  const batchSize = Math.max(1, Number(process.env.DB_BULK_INSERT_BATCH_SIZE || 100));
+  for (let offset = 0; offset < rows.length; offset += batchSize) {
+    const batch = rows.slice(offset, offset + batchSize);
+    await connection.query(
+      `INSERT INTO ${tableName} (id, position, payload) VALUES ?`,
+      [batch.map((row, index) => [jsonRowId(row, offset + index), offset + index, JSON.stringify(row)])]
+    );
+  }
+}
+
 async function ensureMysqlDatabase() {
-  if (!isMysqlEnabled() || mysqlDatabaseReady) return false;
+  if (!isMysqlEnabled()) {
+    throw new Error("Database storage is required. Remove DB_DISABLED or configure DB_* in .env.");
+  }
+  if (mysqlDatabaseReady) return false;
   const config = getMysqlConfig();
   const connection = await mysql.createConnection({
     host: config.host,
@@ -147,7 +257,10 @@ async function ensureMysqlDatabase() {
 }
 
 async function ensureFbaDailyMysqlSchema() {
-  if (!isMysqlEnabled() || fbaDailySchemaReady) return false;
+  if (!isMysqlEnabled()) {
+    throw new Error("Database storage is required. Remove DB_DISABLED or configure DB_* in .env.");
+  }
+  if (fbaDailySchemaReady) return false;
   await ensureMysqlDatabase();
   const pool = getMysqlPool();
   await pool.query(`
@@ -359,7 +472,6 @@ function mysqlRowToFbaSkuMetadata(row) {
 }
 
 async function readFbaSkuMetadataRows() {
-  if (!isMysqlEnabled()) return [];
   await ensureFbaDailyMysqlSchema();
   const pool = getMysqlPool();
   const [rows] = await pool.query("SELECT * FROM fba_sku_metadata");
@@ -367,7 +479,6 @@ async function readFbaSkuMetadataRows() {
 }
 
 async function readFbaProductMetadataRows() {
-  if (!isMysqlEnabled()) return [];
   await ensureFbaDailyMysqlSchema();
   const pool = getMysqlPool();
   const [rows] = await pool.query("SELECT * FROM fba_product_metadata");
@@ -383,7 +494,6 @@ async function upsertFbaProductGrades(gradesByAsin, marketplaceId = getSpApiConf
     .map(([asin, grade]) => [String(asin || "").trim().toUpperCase(), normalizeFbaReplenishmentGrade(grade)])
     .filter(([asin, grade]) => /^B[A-Z0-9]{9}$/.test(asin) && grade);
   if (!entries.length) return { saved: {}, changed: false };
-  if (!isMysqlEnabled()) return { saved: Object.fromEntries(entries), changed: false };
   await ensureFbaDailyMysqlSchema();
   const pool = getMysqlPool();
   await pool.query(`
@@ -490,7 +600,6 @@ async function upsertFbaSkuMetadata(rows, source = "inventory") {
     .map(row => [`${row.marketplaceId}|${row.sellerSku}`, row])
   ).values()];
   if (!metadataRows.length) return { inserted: 0, updated: 0 };
-  if (!isMysqlEnabled()) return { inserted: 0, updated: 0 };
   await ensureFbaDailyMysqlSchema();
   const pool = getMysqlPool();
   const batchSize = Math.max(1, Number(process.env.DB_BULK_INSERT_BATCH_SIZE || 100));
@@ -622,13 +731,6 @@ async function writeFbaDailyRowsToMysql(rows) {
   }
 }
 
-async function ensureFbaDailyStore() {
-  await mkdir(DATA_DIR, { recursive: true });
-  if (!existsSync(FBA_DAILY_PATH)) {
-    await writeFile(FBA_DAILY_PATH, JSON.stringify({ rows: [] }, null, 2), "utf8");
-  }
-}
-
 function makeFbaDailyKey(row) {
   return [
     String(row.marketplaceId || "").trim(),
@@ -638,36 +740,21 @@ function makeFbaDailyKey(row) {
 }
 
 async function readFbaDailyRows() {
-  if (isMysqlEnabled()) {
-    return readFbaDailyRowsFromMysql();
-  }
-  await ensureFbaDailyStore();
-  const raw = await readFile(FBA_DAILY_PATH, "utf8");
-  const data = JSON.parse(raw || "{\"rows\":[]}");
-  return Array.isArray(data.rows) ? data.rows : [];
+  return readFbaDailyRowsFromMysql();
 }
 
 async function writeFbaDailyRows(rows) {
-  if (isMysqlEnabled()) {
-    return writeFbaDailyRowsToMysql(rows);
-  }
-  await ensureFbaDailyStore();
-  rows.sort((a, b) => {
-    const dateCompare = String(b.date || "").localeCompare(String(a.date || ""));
-    if (dateCompare) return dateCompare;
-    return String(a.sellerSku || "").localeCompare(String(b.sellerSku || ""));
-  });
-  await writeFile(FBA_DAILY_PATH, JSON.stringify({ rows }, null, 2), "utf8");
+  return writeFbaDailyRowsToMysql(rows);
 }
 
 async function appendNetworkDebug(events) {
-  await ensureDb();
+  await ensureDataDir();
   const lines = events.map(event => JSON.stringify(event)).join("\n") + "\n";
   await appendFile(NETWORK_DEBUG_PATH, lines, "utf8");
 }
 
 async function readNetworkDebug() {
-  await ensureDb();
+  await ensureDataDir();
   const events = [];
   if (!existsSync(NETWORK_DEBUG_PATH)) return [];
   const raw = await readFile(NETWORK_DEBUG_PATH, "utf8");
@@ -684,21 +771,13 @@ async function readNetworkDebug() {
     })
     .filter(Boolean));
 
-  try {
-    const dbRaw = await readFile(DB_PATH, "utf8");
-    const db = JSON.parse(dbRaw || "{}");
-    if (Array.isArray(db.networkDebug)) events.push(...db.networkDebug);
-  } catch {
-    // Ignore legacy debug records if db.json is temporarily invalid.
-  }
-
   return events;
 }
 
 async function ensureSalesReportRequestsLoaded() {
   if (salesReportRequestsLoaded) return;
   salesReportRequestsLoaded = true;
-  await ensureDb();
+  await ensureDataDir();
   if (!existsSync(SP_API_REPORT_CACHE_PATH)) return;
   const raw = await readFile(SP_API_REPORT_CACHE_PATH, "utf8").catch(() => "");
   if (!raw.trim()) return;
@@ -715,7 +794,7 @@ async function ensureSalesReportRequestsLoaded() {
 }
 
 async function writeSalesReportRequestsCache() {
-  await ensureDb();
+  await ensureDataDir();
   const today = formatDateInTimeZone();
   const rows = [...salesReportRequests.entries()]
     .filter(([, item]) => item?.reportId && isReportFromToday(item, today))
@@ -1267,6 +1346,7 @@ function normalizeFactoryProduct(input) {
     name,
     asin,
     parentAsin: String(source.parentAsin || source.parent_asin || "").trim().toUpperCase(),
+    parentInternalName: String(source.parentInternalName || "").trim(),
     boxSpec: String(source.boxSpec || "").trim(),
     replenishmentGrade,
     unitCost: source.unitCost === "" || source.unitCost === undefined ? "" : Number(source.unitCost || 0),
@@ -1279,6 +1359,38 @@ function normalizeFactoryProduct(input) {
     createdAt: source.createdAt || new Date().toISOString(),
     updatedAt: source.updatedAt || new Date().toISOString()
   };
+}
+
+function getFactoryProductGroupKey(product) {
+  return product?.parentAsin || product?.asin || product?.id || "";
+}
+
+function getFactoryProductEffectiveGroupKey(product, fbaCatalogByAsin = new Map()) {
+  const asin = String(product?.asin || "").trim().toUpperCase();
+  const fbaProduct = asin ? fbaCatalogByAsin.get(asin) : null;
+  return fbaProduct?.parentAsin || product?.parentAsin || product?.asin || product?.id || "";
+}
+
+async function readParentAsinMetadataMap() {
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT parent_asin, internal_name FROM parent_asin_metadata");
+  return new Map(rows
+    .map(row => [String(row.parent_asin || "").trim().toUpperCase(), String(row.internal_name || "").trim()])
+    .filter(([parentAsin]) => parentAsin)
+  );
+}
+
+async function upsertParentAsinMetadata(parentAsin, internalName) {
+  const normalizedParentAsin = String(parentAsin || "").trim().toUpperCase();
+  if (!normalizedParentAsin) throw new Error("Missing parent ASIN");
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO parent_asin_metadata (parent_asin, internal_name)
+    VALUES (?, ?)
+    ON DUPLICATE KEY UPDATE internal_name = VALUES(internal_name)
+  `, [normalizedParentAsin, String(internalName || "").trim()]);
 }
 
 function calculateFactoryInventoryValue(product) {
@@ -1825,6 +1937,7 @@ async function ensureFactoryInventoryProductCatalog(db) {
 
 async function buildFactoryInventoryView(db, options = {}) {
   const fbaCatalogByAsin = options.fbaCatalogByAsin || await buildFbaProductCatalog(db);
+  const parentAsinMetadata = await readParentAsinMetadataMap();
   const storedProducts = (Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [])
     .map(item => normalizeFactoryProduct(item));
   const productsById = new Map();
@@ -1869,6 +1982,7 @@ async function buildFactoryInventoryView(db, options = {}) {
       ...product,
       imageUrl: fbaProduct.imageUrl || "",
       parentAsin: fbaProduct.parentAsin || product.parentAsin || "",
+      parentInternalName: parentAsinMetadata.get(String(fbaProduct.parentAsin || product.parentAsin || "").trim().toUpperCase()) || product.parentInternalName || "",
       sellerSku: fbaProduct.sellerSku || "",
       fnSku: fbaProduct.fnSku || "",
       title: fbaProduct.title || product.name || "",
@@ -1943,13 +2057,6 @@ async function buildFbaGradeByAsin(db) {
     const asin = normalizeAsin(row.asin);
     const grade = normalizeFbaReplenishmentGrade(row.replenishmentGrade);
     if (asin && grade) grades.set(asin, grade);
-  }
-  if (isMysqlEnabled()) return grades;
-  const rawGrades = db && typeof db.fbaProductGrades === "object" && db.fbaProductGrades ? db.fbaProductGrades : {};
-  for (const [asin, grade] of Object.entries(rawGrades)) {
-    const normalizedAsin = String(asin || "").trim().toUpperCase();
-    const normalizedGrade = normalizeFbaReplenishmentGrade(grade);
-    if (normalizedAsin && normalizedGrade && !grades.has(normalizedAsin)) grades.set(normalizedAsin, normalizedGrade);
   }
   return grades;
 }
@@ -4405,7 +4512,7 @@ async function readGmailToken() {
 }
 
 async function writeGmailToken(token) {
-  await ensureDb();
+  await ensureDataDir();
   await writeFile(GMAIL_TOKEN_PATH, JSON.stringify(token, null, 2), "utf8");
 }
 
@@ -4534,7 +4641,7 @@ async function readAdsToken() {
 }
 
 async function writeAdsToken(token) {
-  await ensureDb();
+  await ensureDataDir();
   await writeFile(ADS_TOKEN_PATH, JSON.stringify(token, null, 2), "utf8");
 }
 
@@ -4548,7 +4655,7 @@ async function readAdsProfileSelection() {
 }
 
 async function writeAdsProfileSelection(profile) {
-  await ensureDb();
+  await ensureDataDir();
   await writeFile(ADS_PROFILE_PATH, JSON.stringify(profile, null, 2), "utf8");
 }
 
@@ -5136,6 +5243,17 @@ async function handleApi(req, res, url) {
     return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
   }
 
+  const factoryParentGroupMatch = url.pathname.match(/^\/api\/factory-inventory\/parent-groups\/([^/]+)$/);
+  if (req.method === "PUT" && factoryParentGroupMatch) {
+    const parentKey = decodeURIComponent(factoryParentGroupMatch[1]).trim().toUpperCase();
+    const body = await parseBody(req);
+    const parentInternalName = String(body.parentInternalName || "").trim();
+    const db = await readDb();
+    const catalog = await ensureFactoryInventoryProductCatalog(db);
+    await upsertParentAsinMetadata(parentKey, parentInternalName);
+    return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
+  }
+
   const factoryProductMatch = url.pathname.match(/^\/api\/factory-inventory\/products\/([^/]+)$/);
   if (req.method === "DELETE" && factoryProductMatch) {
     const productId = decodeURIComponent(factoryProductMatch[1]);
@@ -5216,15 +5334,10 @@ async function handleApi(req, res, url) {
     }
     const mysqlResult = await upsertFbaProductGrades(normalizedGrades);
     const db = await readDb();
-    const nextGrades = db.fbaProductGrades && typeof db.fbaProductGrades === "object" ? { ...db.fbaProductGrades } : {};
     const store = db.factoryInventory || { products: [], movements: [] };
     store.products = Array.isArray(store.products) ? store.products.map(item => normalizeFactoryProduct(item)) : [];
     let changed = Boolean(mysqlResult.changed);
     for (const [asin, grade] of Object.entries(normalizedGrades)) {
-      if (!isMysqlEnabled() && nextGrades[asin] !== grade) {
-        nextGrades[asin] = grade;
-        changed = true;
-      }
       store.products = store.products.map(product => {
         if (product.asin !== asin || product.replenishmentGrade === grade) return product;
         changed = true;
@@ -5232,7 +5345,6 @@ async function handleApi(req, res, url) {
       });
     }
     if (changed) {
-      if (!isMysqlEnabled()) db.fbaProductGrades = nextGrades;
       db.factoryInventory = store;
       await writeDb(db);
       fbaInventoryCache.clear();
@@ -5508,7 +5620,8 @@ const server = createServer(async (req, res) => {
   }
 });
 
-await ensureDb();
+await ensureDataDir();
+await ensureAppMysqlSchema();
 server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
   if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
