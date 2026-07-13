@@ -3019,48 +3019,26 @@ async function syncSandboxProducts() {
 
 function renderAdsStatus(status = window.adsStatusMeta || {}) {
   const statusNode = $("#adsStatus");
-  const summary = $("#adsSummary");
-  if (!statusNode || !summary) return;
+  if (!statusNode) return;
 
   const configured = Boolean(status.configured);
   const authorized = Boolean(status.authorized);
   const selected = status.selectedProfile || null;
+  statusNode.classList.toggle("ok", configured && authorized);
+  statusNode.classList.toggle("warn", !configured || !authorized);
   if (!configured) {
-    statusNode.textContent = `缺少配置：${(status.missing || []).join("、") || "Amazon Ads .env"}`;
+    statusNode.textContent = "未配置";
+    statusNode.title = `缺少配置：${(status.missing || []).join("、") || "Amazon Ads .env"}`;
   } else if (!authorized) {
-    statusNode.textContent = "已读取 Ads 配置，等待授权广告账户";
+    statusNode.textContent = "未授权";
+    statusNode.title = "已读取 Ads 配置，等待授权广告账户";
   } else if (!selected?.profileId) {
-    statusNode.textContent = "广告账户已授权，请选择一个 Profile";
+    statusNode.textContent = "已授权";
+    statusNode.title = "广告账户已授权，请选择一个 Profile";
   } else {
-    statusNode.textContent = `已连接 Profile ${selected.profileId}`;
+    statusNode.textContent = "已授权";
+    statusNode.title = `已选择 ${selected.countryCode || selected.profileId}`;
   }
-
-  summary.innerHTML = `
-    <div class="fba-summary-card">
-      <strong>${configured ? "已配置" : "缺配置"}</strong>
-      <span>Client ID / Secret</span>
-    </div>
-    <div class="fba-summary-card">
-      <strong>${authorized ? "已授权" : "未授权"}</strong>
-      <span>Refresh token</span>
-    </div>
-    <div class="fba-summary-card">
-      <strong>${escapeHtml(selected?.countryCode || "-")}</strong>
-      <span>当前国家</span>
-    </div>
-    <div class="fba-summary-card">
-      <strong>${escapeHtml(selected?.currencyCode || "-")}</strong>
-      <span>币种</span>
-    </div>
-    <div class="fba-summary-card wide-card">
-      <strong>${escapeHtml(status.endpoint || "-")}</strong>
-      <span>Ads API endpoint</span>
-    </div>
-    <div class="fba-summary-card wide-card">
-      <strong>${escapeHtml(status.redirectUri || "-")}</strong>
-      <span>授权回调地址</span>
-    </div>
-  `;
 
   const quick = $("#adsQuickText");
   if (quick) {
@@ -3070,26 +3048,36 @@ function renderAdsStatus(status = window.adsStatusMeta || {}) {
   }
 }
 
+function adsProfileLabel(profile) {
+  return [
+    profile.countryCode || "",
+    profile.currencyCode || "",
+    profile.accountName || "",
+    profile.type || ""
+  ].filter(Boolean).join(" / ") || profile.profileId;
+}
+
+function preferredAdsProfileId() {
+  return (
+    adsProfiles.find(profile => profile.countryCode === "US") ||
+    adsProfiles.find(profile => profile.currencyCode === "USD") ||
+    adsProfiles[0]
+  )?.profileId || "";
+}
+
 function renderAdsProfiles() {
-  const container = $("#adsProfiles");
-  if (!container) return;
+  const select = $("#adsProfileSelect");
+  if (!select) return;
   if (!adsProfiles.length) {
-    container.innerHTML = `<div class="empty">暂无广告 Profile。先点击“授权广告账户”，授权后再刷新。</div>`;
+    select.innerHTML = `<option value="">选择 Profile</option>`;
+    select.disabled = true;
     return;
   }
-  container.innerHTML = adsProfiles.map(profile => {
-    const active = profile.profileId === selectedAdsProfileId;
-    return `
-      <button class="ads-profile-card${active ? " active" : ""}" data-profile-id="${escapeHtml(profile.profileId)}">
-        <strong>${escapeHtml(profile.accountName || profile.profileId)}</strong>
-        <span>${escapeHtml([profile.countryCode, profile.currencyCode, profile.type].filter(Boolean).join(" / ") || "Amazon Ads Profile")}</span>
-        <small>${escapeHtml(profile.profileId)}${profile.sellerStringId ? ` · ${escapeHtml(profile.sellerStringId)}` : ""}</small>
-      </button>
-    `;
-  }).join("");
-  container.querySelectorAll("[data-profile-id]").forEach(button => {
-    button.addEventListener("click", () => selectAdsProfile(button.dataset.profileId));
-  });
+  select.disabled = false;
+  select.innerHTML = adsProfiles.map(profile => `
+    <option value="${escapeHtml(profile.profileId)}">${escapeHtml(adsProfileLabel(profile))}</option>
+  `).join("");
+  select.value = selectedAdsProfileId || preferredAdsProfileId();
 }
 
 async function loadAdsStatus() {
@@ -3113,9 +3101,17 @@ async function refreshAds() {
   adsLoaded = true;
   if (status.authorized) {
     try {
-      await loadAdsProfiles();
+      const profilesData = await loadAdsProfiles();
+      if (!profilesData.selectedProfile?.profileId && preferredAdsProfileId()) {
+        await selectAdsProfile(preferredAdsProfileId());
+      }
     } catch (error) {
-      $("#adsProfiles").innerHTML = `<div class="empty">读取 Amazon Ads Profile 失败：${escapeHtml(error.message)}</div>`;
+      const select = $("#adsProfileSelect");
+      if (select) {
+        select.innerHTML = `<option value="">Profile 读取失败</option>`;
+        select.disabled = true;
+        select.title = error.message;
+      }
     }
   }
 }
@@ -3344,6 +3340,7 @@ $("#fbaReplenishmentToggleBtn").addEventListener("click", async () => {
 });
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
+$("#adsProfileSelect").addEventListener("change", event => selectAdsProfile(event.target.value).catch(error => alert(error.message)));
 $("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(error => alert(error.message)));
 $("#factoryRefreshBtn").addEventListener("click", () => loadFactoryInventory().catch(error => alert(error.message)));
 $("#factorySearch").addEventListener("input", renderFactoryInventory);
@@ -3650,11 +3647,6 @@ $("#globalSearch").addEventListener("input", () => {
   } else if (activeModule === "influencers") {
     $("#search").value = value;
     renderList();
-  } else if (activeModule === "ads") {
-    const needle = value.trim().toLowerCase();
-    document.querySelectorAll(".ads-profile-card").forEach(card => {
-      card.hidden = needle && !card.textContent.toLowerCase().includes(needle);
-    });
   } else if (activeModule === "inventory") {
     $("#factorySearch").value = value;
     renderFactoryInventory();

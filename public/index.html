@@ -145,27 +145,15 @@
               <h1>广告管理</h1>
               <p>连接 Amazon Ads，选择广告 Profile，为花费、广告销售额和 ACOS 报表做准备</p>
             </div>
-            <div class="actions slim">
+            <div class="actions slim ads-toolbar">
+              <span id="adsStatus" class="ads-auth-status">检查中</span>
+              <select id="adsProfileSelect" class="ads-profile-select" aria-label="广告 Profile">
+                <option value="">选择 Profile</option>
+              </select>
               <button id="adsAuthBtn">授权广告账户</button>
               <button id="adsRefreshBtn">刷新</button>
             </div>
           </div>
-
-          <section class="panel ads-panel">
-            <div class="panel-head">
-              <h2>连接状态</h2>
-              <span id="adsStatus" class="hint">正在检查 Amazon Ads 状态...</span>
-            </div>
-            <div id="adsSummary" class="fba-summary"></div>
-          </section>
-
-          <section class="panel ads-panel">
-            <div class="panel-head">
-              <h2>广告 Profile</h2>
-              <span class="hint">Profile 决定后续报表读取哪个国家/店铺的广告数据</span>
-            </div>
-            <div id="adsProfiles" class="ads-profile-list"></div>
-          </section>
 
           <section class="panel ads-panel">
             <div class="panel-head">

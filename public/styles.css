@@ -1977,42 +1977,48 @@ h2 {
   margin: 0 28px 16px;
 }
 
-.ads-profile-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-  gap: 12px;
-  padding: 16px;
+.ads-toolbar {
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
-.ads-profile-card {
-  display: grid;
-  gap: 6px;
-  min-height: 104px;
-  padding: 14px;
+.ads-auth-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.ads-auth-status.ok {
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #15803d;
+}
+
+.ads-auth-status.warn {
+  border-color: #fed7aa;
+  background: #fff7ed;
+  color: #c2410c;
+}
+
+.ads-profile-select {
+  min-width: 220px;
+  max-width: 320px;
+  height: 34px;
+  padding: 0 34px 0 10px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: #fff;
-  text-align: left;
-}
-
-.ads-profile-card.active {
-  border-color: var(--accent);
-  background: var(--soft);
-}
-
-.ads-profile-card strong,
-.ads-profile-card span,
-.ads-profile-card small {
-  display: block;
-}
-
-.ads-profile-card span,
-.ads-profile-card small {
-  color: var(--muted);
-}
-
-.ads-profile-card small {
-  font-size: 12px;
+  color: var(--text);
+  font-size: 13px;
 }
 
 .ads-report-grid {
