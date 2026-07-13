@@ -18,6 +18,7 @@ const SP_API_REPORT_CACHE_PATH = join(DATA_DIR, "sp-api-report-cache.json");
 const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
 const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
 const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
+const ADS_MANAGED_PORTFOLIO_NAME = "AmzAllBlue_ERP";
 const SECRET_KEYS = {
   gmailToken: "gmail_token",
   adsToken: "amazon_ads_token",
@@ -38,6 +39,8 @@ let fbaDailySchemaReady = false;
 let appMysqlSchemaReady = false;
 let mysqlDatabaseReady = false;
 let fbaScheduledSyncTimer = null;
+let adsHourlySyncTimer = null;
+let adsRollingSyncTimer = null;
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -157,6 +160,299 @@ function getMysqlPool() {
   return mysqlPool;
 }
 
+async function ensureAdsMysqlSchema(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_managed_portfolios (
+      profile_id VARCHAR(64) NOT NULL,
+      portfolio_id VARCHAR(64) NULL,
+      portfolio_name VARCHAR(255) NOT NULL DEFAULT '${ADS_MANAGED_PORTFOLIO_NAME}',
+      country_code VARCHAR(8) NOT NULL DEFAULT '',
+      currency_code VARCHAR(8) NOT NULL DEFAULT '',
+      timezone VARCHAR(128) NOT NULL DEFAULT '',
+      management_status VARCHAR(32) NOT NULL DEFAULT 'UNVERIFIED',
+      conflicting_object_count INT UNSIGNED NOT NULL DEFAULT 0,
+      last_error TEXT NULL,
+      verified_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (profile_id),
+      UNIQUE KEY uq_ads_managed_portfolio_id (profile_id, portfolio_id),
+      KEY idx_ads_managed_portfolios_status (management_status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_creation_templates (
+      profile_id VARCHAR(64) NOT NULL,
+      currency_code VARCHAR(8) NOT NULL DEFAULT '',
+      daily_budget DECIMAL(14, 2) NOT NULL DEFAULT 8.00,
+      bidding_strategy VARCHAR(32) NOT NULL DEFAULT 'FIXED_BIDS',
+      default_bid DECIMAL(14, 2) NOT NULL DEFAULT 0.20,
+      top_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 200,
+      rest_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      product_page_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      exact_enabled TINYINT(1) NOT NULL DEFAULT 1,
+      phrase_enabled TINYINT(1) NOT NULL DEFAULT 0,
+      broad_enabled TINYINT(1) NOT NULL DEFAULT 0,
+      initial_state VARCHAR(16) NOT NULL DEFAULT 'ENABLED',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (profile_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_keywords (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      profile_id VARCHAR(64) NOT NULL,
+      parent_asin VARCHAR(32) NOT NULL,
+      keyword_text VARCHAR(255) NOT NULL,
+      normalized_keyword VARCHAR(255) NOT NULL,
+      creation_batch VARCHAR(24) NOT NULL DEFAULT '',
+      active_scope_key VARCHAR(512) NULL,
+      keyword_group VARCHAR(16) NOT NULL DEFAULT 'NORMAL',
+      lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      stopped_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_keywords_active_scope (active_scope_key),
+      KEY idx_ads_keywords_parent_group (profile_id, parent_asin, keyword_group),
+      KEY idx_ads_keywords_creation_batch (profile_id, creation_batch),
+      KEY idx_ads_keywords_updated_at (updated_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_campaigns (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      keyword_id BIGINT UNSIGNED NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      portfolio_id VARCHAR(64) NOT NULL,
+      ad_type VARCHAR(8) NOT NULL DEFAULT 'SP',
+      match_type VARCHAR(16) NOT NULL,
+      child_asin VARCHAR(32) NULL,
+      seller_sku VARCHAR(128) COLLATE utf8mb4_bin NULL,
+      creation_batch VARCHAR(24) NOT NULL DEFAULT '',
+      entity_key VARCHAR(255) NULL,
+      amazon_campaign_id VARCHAR(64) NULL,
+      campaign_name VARCHAR(255) NOT NULL,
+      amazon_campaign_name VARCHAR(255) NULL,
+      desired_state VARCHAR(16) NOT NULL DEFAULT 'ENABLED',
+      lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      stopped_at DATETIME NULL,
+      amazon_state VARCHAR(16) NULL,
+      daily_budget DECIMAL(14, 2) NOT NULL,
+      bidding_strategy VARCHAR(32) NOT NULL DEFAULT 'FIXED_BIDS',
+      top_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 200,
+      rest_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      product_page_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      start_date DATE NOT NULL,
+      end_date DATE NULL,
+      creation_status VARCHAR(32) NOT NULL DEFAULT 'NOT_CREATED',
+      sync_status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+      failed_step VARCHAR(64) NULL,
+      last_error TEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_campaign_entity_key (profile_id, entity_key),
+      UNIQUE KEY uq_ads_campaign_amazon_id (profile_id, amazon_campaign_id),
+      KEY idx_ads_campaigns_portfolio (profile_id, portfolio_id),
+      KEY idx_ads_campaigns_creation_status (creation_status),
+      CONSTRAINT fk_ads_campaigns_keyword FOREIGN KEY (keyword_id) REFERENCES ads_keywords (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ad_units (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      campaign_id BIGINT UNSIGNED NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      child_asin VARCHAR(32) NOT NULL,
+      seller_sku VARCHAR(128) COLLATE utf8mb4_bin NOT NULL,
+      creation_batch VARCHAR(24) NOT NULL DEFAULT '',
+      entity_key VARCHAR(255) NULL,
+      ad_group_name VARCHAR(255) NOT NULL,
+      amazon_ad_group_name VARCHAR(255) NULL,
+      amazon_ad_group_id VARCHAR(64) NULL,
+      amazon_product_ad_id VARCHAR(64) NULL,
+      amazon_target_id VARCHAR(64) NULL,
+      bid DECIMAL(14, 2) NOT NULL,
+      desired_state VARCHAR(16) NOT NULL DEFAULT 'ENABLED',
+      amazon_state VARCHAR(16) NULL,
+      amazon_ad_group_state VARCHAR(16) NULL,
+      amazon_product_ad_state VARCHAR(16) NULL,
+      amazon_target_state VARCHAR(16) NULL,
+      lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      creation_status VARCHAR(32) NOT NULL DEFAULT 'NOT_CREATED',
+      sync_status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+      failed_step VARCHAR(64) NULL,
+      last_error TEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_ad_unit_child (campaign_id, child_asin),
+      UNIQUE KEY uq_ads_ad_unit_entity_key (profile_id, entity_key),
+      UNIQUE KEY uq_ads_ad_group_amazon_id (profile_id, amazon_ad_group_id),
+      UNIQUE KEY uq_ads_product_ad_amazon_id (profile_id, amazon_product_ad_id),
+      UNIQUE KEY uq_ads_target_amazon_id (profile_id, amazon_target_id),
+      KEY idx_ads_ad_units_sku (profile_id, seller_sku),
+      KEY idx_ads_ad_units_creation_status (creation_status),
+      CONSTRAINT fk_ads_ad_units_campaign FOREIGN KEY (campaign_id) REFERENCES ads_campaigns (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_performance_daily (
+      date DATE NOT NULL,
+      ad_unit_id BIGINT UNSIGNED NOT NULL,
+      impressions BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      clicks BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      spend DECIMAL(18, 6) NOT NULL DEFAULT 0,
+      orders_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      units_sold BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      sales DECIMAL(18, 6) NOT NULL DEFAULT 0,
+      synced_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (ad_unit_id, date),
+      KEY idx_ads_performance_daily_date (date),
+      CONSTRAINT fk_ads_performance_daily_ad_unit FOREIGN KEY (ad_unit_id) REFERENCES ads_ad_units (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_placement_performance_daily (
+      date DATE NOT NULL,
+      campaign_id BIGINT UNSIGNED NOT NULL,
+      placement VARCHAR(32) NOT NULL,
+      impressions BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      clicks BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      spend DECIMAL(18, 6) NOT NULL DEFAULT 0,
+      orders_count BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      units_sold BIGINT UNSIGNED NOT NULL DEFAULT 0,
+      sales DECIMAL(18, 6) NOT NULL DEFAULT 0,
+      synced_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (campaign_id, date, placement),
+      KEY idx_ads_placement_daily_date (date),
+      CONSTRAINT fk_ads_placement_daily_campaign FOREIGN KEY (campaign_id) REFERENCES ads_campaigns (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_sync_jobs (
+      id VARCHAR(64) NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      report_type VARCHAR(64) NOT NULL,
+      start_date DATE NOT NULL,
+      end_date DATE NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'QUEUED',
+      active_dedupe_key VARCHAR(255) NULL,
+      amazon_report_id VARCHAR(128) NULL,
+      attempts INT UNSIGNED NOT NULL DEFAULT 0,
+      next_retry_at DATETIME NULL,
+      started_at DATETIME NULL,
+      completed_at DATETIME NULL,
+      last_error TEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_sync_jobs_active (active_dedupe_key),
+      KEY idx_ads_sync_jobs_queue (status, next_retry_at),
+      KEY idx_ads_sync_jobs_profile_dates (profile_id, start_date, end_date)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_sync_dates (
+      profile_id VARCHAR(64) NOT NULL,
+      date DATE NOT NULL,
+      report_type VARCHAR(64) NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+      last_job_id VARCHAR(64) NULL,
+      synced_at DATETIME NULL,
+      last_error TEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (profile_id, date, report_type),
+      KEY idx_ads_sync_dates_status (profile_id, status, date),
+      CONSTRAINT fk_ads_sync_dates_job FOREIGN KEY (last_job_id) REFERENCES ads_sync_jobs (id) ON UPDATE RESTRICT ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_operations (
+      id VARCHAR(64) NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      operation_type VARCHAR(32) NOT NULL,
+      entity_type VARCHAR(32) NULL,
+      entity_id BIGINT UNSIGNED NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'PREVIEW',
+      current_step VARCHAR(64) NULL,
+      preview_hash CHAR(64) NULL,
+      confirmation_token_hash CHAR(64) NULL,
+      confirmation_expires_at DATETIME NULL,
+      request_payload JSON NOT NULL,
+      preview_payload JSON NULL,
+      last_error TEXT NULL,
+      confirmed_at DATETIME NULL,
+      started_at DATETIME NULL,
+      completed_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_ads_operations_profile_status (profile_id, status, created_at),
+      KEY idx_ads_operations_entity (entity_type, entity_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_operation_steps (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      operation_id VARCHAR(64) NOT NULL,
+      step_key VARCHAR(128) NOT NULL,
+      step_order INT UNSIGNED NOT NULL,
+      entity_type VARCHAR(32) NOT NULL,
+      local_entity_id BIGINT UNSIGNED NULL,
+      amazon_entity_id VARCHAR(64) NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+      attempts INT UNSIGNED NOT NULL DEFAULT 0,
+      request_payload JSON NULL,
+      response_payload JSON NULL,
+      last_error TEXT NULL,
+      started_at DATETIME NULL,
+      completed_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_operation_step (operation_id, step_key),
+      KEY idx_ads_operation_steps_resume (operation_id, status, step_order),
+      CONSTRAINT fk_ads_operation_steps_operation FOREIGN KEY (operation_id) REFERENCES ads_operations (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN amazon_campaign_name VARCHAR(255) NULL AFTER campaign_name").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE' AFTER desired_state").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN stopped_at DATETIME NULL AFTER lifecycle_status").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD COLUMN creation_batch VARCHAR(24) NOT NULL DEFAULT '' AFTER normalized_keyword").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD COLUMN active_scope_key VARCHAR(512) NULL AFTER creation_batch").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD COLUMN stopped_at DATETIME NULL AFTER lifecycle_status").catch(() => {});
+  await pool.query("UPDATE ads_keywords SET active_scope_key = CONCAT(profile_id, '|', parent_asin, '|', normalized_keyword) WHERE lifecycle_status = 'ACTIVE' AND active_scope_key IS NULL").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD UNIQUE KEY uq_ads_keywords_active_scope (active_scope_key)").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD KEY idx_ads_keywords_creation_batch (profile_id, creation_batch)").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords DROP INDEX uq_ads_keywords_scope").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN creation_batch VARCHAR(24) NOT NULL DEFAULT '' AFTER match_type").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN child_asin VARCHAR(32) NULL AFTER match_type").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN seller_sku VARCHAR(128) NULL AFTER child_asin").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns DROP INDEX uq_ads_campaign_match").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD KEY idx_ads_campaigns_keyword_match_asin (keyword_id, match_type, child_asin)").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN entity_key VARCHAR(255) NULL AFTER creation_batch").catch(() => {});
+  await pool.query("ALTER TABLE ads_creation_templates ADD COLUMN rest_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 0 AFTER top_of_search_adjustment").catch(() => {});
+  await pool.query("ALTER TABLE ads_creation_templates ADD COLUMN product_page_adjustment INT UNSIGNED NOT NULL DEFAULT 0 AFTER rest_of_search_adjustment").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN rest_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 0 AFTER top_of_search_adjustment").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD COLUMN product_page_adjustment INT UNSIGNED NOT NULL DEFAULT 0 AFTER rest_of_search_adjustment").catch(() => {});
+  await pool.query("ALTER TABLE ads_campaigns ADD UNIQUE KEY uq_ads_campaign_entity_key (profile_id, entity_key)").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD COLUMN amazon_ad_group_name VARCHAR(255) NULL AFTER ad_group_name").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD COLUMN creation_batch VARCHAR(24) NOT NULL DEFAULT '' AFTER seller_sku").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD COLUMN entity_key VARCHAR(255) NULL AFTER creation_batch").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD UNIQUE KEY uq_ads_ad_unit_entity_key (profile_id, entity_key)").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD COLUMN amazon_ad_group_state VARCHAR(16) NULL AFTER amazon_state").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD COLUMN amazon_product_ad_state VARCHAR(16) NULL AFTER amazon_ad_group_state").catch(() => {});
+  await pool.query("ALTER TABLE ads_ad_units ADD COLUMN amazon_target_state VARCHAR(16) NULL AFTER amazon_product_ad_state").catch(() => {});
+}
+
 async function ensureAppMysqlSchema() {
   if (!isMysqlEnabled()) {
     throw new Error("Database storage is required. Remove DB_DISABLED or configure DB_* in .env.");
@@ -214,11 +510,13 @@ async function ensureAppMysqlSchema() {
     CREATE TABLE IF NOT EXISTS parent_asin_metadata (
       parent_asin VARCHAR(32) NOT NULL,
       internal_name VARCHAR(255) NOT NULL DEFAULT '',
+      sort_order INT NOT NULL DEFAULT 0,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (parent_asin)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query("ALTER TABLE parent_asin_metadata ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER internal_name").catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_secrets (
       secret_key VARCHAR(128) NOT NULL,
@@ -228,6 +526,7 @@ async function ensureAppMysqlSchema() {
       PRIMARY KEY (secret_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await ensureAdsMysqlSchema(pool);
   appMysqlSchemaReady = true;
   return true;
 }
@@ -1455,6 +1754,42 @@ async function readParentAsinMetadataMap() {
     .map(row => [String(row.parent_asin || "").trim().toUpperCase(), String(row.internal_name || "").trim()])
     .filter(([parentAsin]) => parentAsin)
   );
+}
+
+async function readParentAsinMetadataRows() {
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT parent_asin, internal_name, sort_order FROM parent_asin_metadata");
+  return rows.map(row => ({
+    parentAsin: String(row.parent_asin || "").trim().toUpperCase(),
+    internalName: String(row.internal_name || "").trim(),
+    sortOrder: Number(row.sort_order || 0)
+  })).filter(row => row.parentAsin);
+}
+
+async function saveAdsParentAsinOrder(parentAsins) {
+  await ensureAppMysqlSchema();
+  const normalized = [...new Set((Array.isArray(parentAsins) ? parentAsins : [])
+    .map(value => String(value || "").trim().toUpperCase())
+    .filter(Boolean))];
+  if (!normalized.length) throw new Error("父 ASIN 顺序不能为空");
+  const pool = getMysqlPool();
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (let index = 0; index < normalized.length; index += 1) {
+      await connection.query(
+        "UPDATE parent_asin_metadata SET sort_order = ? WHERE parent_asin = ? AND internal_name <> ''",
+        [index + 1, normalized[index]]
+      );
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
 }
 
 async function upsertParentAsinMetadata(parentAsin, internalName) {
@@ -4852,6 +5187,1681 @@ async function adsStatus() {
   };
 }
 
+function adsArrayPayload(value, keys = []) {
+  if (Array.isArray(value)) return value;
+  for (const key of keys) {
+    if (Array.isArray(value?.[key])) return value[key];
+  }
+  return [];
+}
+
+function normalizeAdsPortfolio(item = {}) {
+  return {
+    portfolioId: String(item.portfolioId || item.portfolio?.portfolioId || ""),
+    name: String(item.name || item.portfolio?.name || ""),
+    state: String(item.state || item.portfolio?.state || ""),
+    budget: item.budget || item.portfolio?.budget || null
+  };
+}
+
+function normalizeAdsCampaignObject(item = {}) {
+  return {
+    campaignId: String(item.campaignId || item.campaign?.campaignId || ""),
+    portfolioId: String(item.portfolioId || item.campaign?.portfolioId || ""),
+    name: String(item.name || item.campaign?.name || ""),
+    state: String(item.state || item.campaign?.state || ""),
+    campaignType: String(item.campaignType || item.campaign?.campaignType || "")
+  };
+}
+
+async function requireSelectedAdsProfile() {
+  const profile = await readAdsProfileSelection();
+  if (!profile?.profileId) throw new Error("请先选择 Amazon Ads Profile");
+  return profile;
+}
+
+async function readManagedAdsPortfolio(profileId) {
+  await ensureAppMysqlSchema();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_managed_portfolios WHERE profile_id = ?", [String(profileId)]);
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    profileId: String(row.profile_id),
+    portfolioId: String(row.portfolio_id || ""),
+    name: String(row.portfolio_name || ADS_MANAGED_PORTFOLIO_NAME),
+    countryCode: String(row.country_code || ""),
+    currencyCode: String(row.currency_code || ""),
+    timezone: String(row.timezone || ""),
+    status: String(row.management_status || "UNVERIFIED"),
+    conflictingObjectCount: Number(row.conflicting_object_count || 0),
+    error: String(row.last_error || ""),
+    verifiedAt: row.verified_at || null
+  };
+}
+
+async function writeManagedAdsPortfolio(profile, portfolio, status, conflictCount = 0, error = "") {
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO ads_managed_portfolios (
+      profile_id, portfolio_id, portfolio_name, country_code, currency_code, timezone,
+      management_status, conflicting_object_count, last_error, verified_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    ON DUPLICATE KEY UPDATE
+      portfolio_id = VALUES(portfolio_id), portfolio_name = VALUES(portfolio_name),
+      country_code = VALUES(country_code), currency_code = VALUES(currency_code), timezone = VALUES(timezone),
+      management_status = VALUES(management_status), conflicting_object_count = VALUES(conflicting_object_count),
+      last_error = VALUES(last_error), verified_at = VALUES(verified_at)
+  `, [
+    String(profile.profileId), portfolio?.portfolioId || null, ADS_MANAGED_PORTFOLIO_NAME,
+    profile.countryCode || "", profile.currencyCode || "", profile.timezone || "",
+    status, Number(conflictCount || 0), error || null
+  ]);
+  return readManagedAdsPortfolio(profile.profileId);
+}
+
+async function listAdsPortfoliosForSelectedProfile() {
+  const attempts = [
+    () => adsFetch("/portfolios/list", {}, {
+      requireProfile: true,
+      method: "POST",
+      headers: {
+        accept: "application/vnd.portfolio.v3+json",
+        "content-type": "application/vnd.portfolio.v3+json"
+      },
+      body: { maxResults: 100 }
+    }),
+    () => adsFetch("/v2/portfolios", {}, { requireProfile: true }),
+    () => adsFetch("/portfolios", {}, { requireProfile: true })
+  ];
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const data = await attempt();
+      return adsArrayPayload(data, ["portfolios", "success"]).map(normalizeAdsPortfolio).filter(item => item.portfolioId);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Amazon Ads Portfolio 读取失败");
+}
+
+async function listPortfolioCampaigns(portfolioId) {
+  try {
+    const data = await adsFetch("/v2/sp/campaigns", {
+      portfolioIdFilter: portfolioId,
+      stateFilter: "enabled,paused,archived"
+    }, { requireProfile: true });
+    return adsArrayPayload(data, ["campaigns", "success"]).map(normalizeAdsCampaignObject)
+      .filter(item => item.campaignId && item.portfolioId === String(portfolioId));
+  } catch (legacyError) {
+    const data = await adsFetch("/sp/campaigns/list", {}, {
+      requireProfile: true,
+      method: "POST",
+      headers: {
+        accept: "application/vnd.spCampaign.v3+json",
+        "content-type": "application/vnd.spCampaign.v3+json"
+      },
+      body: { portfolioIdFilter: { include: [String(portfolioId)] }, maxResults: 100 }
+    });
+    const campaigns = adsArrayPayload(data, ["campaigns", "success"]).map(normalizeAdsCampaignObject)
+      .filter(item => item.campaignId && item.portfolioId === String(portfolioId));
+    if (!campaigns.length && data?.error) throw legacyError;
+    return campaigns;
+  }
+}
+
+async function refreshManagedAdsPortfolio() {
+  const profile = await requireSelectedAdsProfile();
+  const portfolios = await listAdsPortfoliosForSelectedProfile();
+  const exact = portfolios.filter(item => item.name === ADS_MANAGED_PORTFOLIO_NAME);
+  if (!exact.length) {
+    return writeManagedAdsPortfolio(profile, null, "MISSING", 0, "广告组合不存在，需要预览并确认后创建");
+  }
+  if (exact.length > 1) {
+    return writeManagedAdsPortfolio(profile, null, "CONFLICT", exact.length, `发现 ${exact.length} 个同名广告组合，请先在 Amazon 后台保留唯一的 ${ADS_MANAGED_PORTFOLIO_NAME}`);
+  }
+  const portfolio = exact[0];
+  const remoteCampaigns = await listPortfolioCampaigns(portfolio.portfolioId);
+  const pool = getMysqlPool();
+  const [knownRows] = await pool.query(
+    "SELECT amazon_campaign_id FROM ads_campaigns WHERE profile_id = ? AND portfolio_id = ? AND amazon_campaign_id IS NOT NULL",
+    [String(profile.profileId), String(portfolio.portfolioId)]
+  );
+  const known = new Set(knownRows.map(row => String(row.amazon_campaign_id)));
+  const unknown = remoteCampaigns.filter(item => !known.has(item.campaignId));
+  if (unknown.length) {
+    const preview = unknown.slice(0, 3).map(item => item.name || item.campaignId).join("、");
+    return writeManagedAdsPortfolio(
+      profile,
+      portfolio,
+      "MANUAL_OBJECTS_FOUND",
+      unknown.length,
+      `发现 ${unknown.length} 个非本系统创建的 Campaign：${preview}${unknown.length > 3 ? "…" : ""}。请先在 Amazon 后台删除后再刷新。`
+    );
+  }
+  return writeManagedAdsPortfolio(profile, portfolio, "READY", 0, "");
+}
+
+function normalizeAdsKeywordText(value) {
+  return String(value || "").trim().replace(/\s+/g, " ");
+}
+
+function adsKeywordGroup(value) {
+  const group = String(value || "NORMAL").toUpperCase();
+  return ["NORMAL", "PROMOTED", "STABLE"].includes(group) ? group : "NORMAL";
+}
+
+function safeAdsNamePart(value) {
+  return String(value || "").trim().replace(/__+/g, "_").replace(/[\r\n\t]+/g, " ");
+}
+
+function adsGroupNameLabel(group) {
+  return { NORMAL: "普通", PROMOTED: "主推", STABLE: "已稳定" }[adsKeywordGroup(group)];
+}
+
+function newAdsCreationBatch(date = new Date()) {
+  return date.toISOString().replace(/[-:.]/g, "").replace("Z", "").replace("T", "T").slice(0, 19) + "Z";
+}
+
+function adsActiveKeywordScopeKey(profileId, parentAsin, normalizedKeyword, childAsin = "") {
+  return `${String(profileId)}|${String(parentAsin).toUpperCase()}|${String(normalizedKeyword)}|${String(childAsin).toUpperCase()}`;
+}
+
+function adsCampaignEntityKey(parentAsin, childAsin, creationBatch, matchType) {
+  return `PARENT-${String(parentAsin).toUpperCase()}|ASIN-${String(childAsin).toUpperCase()}|TS-${creationBatch}|SP|${String(matchType).toUpperCase()}`;
+}
+
+function adsAdUnitEntityKey(childAsin, creationBatch, matchType) {
+  return `ASIN-${String(childAsin).toUpperCase()}|TS-${creationBatch}|SP|${String(matchType).toUpperCase()}`;
+}
+
+function buildAdsCampaignName(internalName, parentAsin, childAsin, keyword, group, matchType, creationBatch = "") {
+  const identity = creationBatch ? `__PARENT-${String(parentAsin).toUpperCase()}__ASIN-${String(childAsin).toUpperCase()}` : "";
+  const timestamp = creationBatch ? `__TS-${creationBatch}` : "";
+  const suffix = `__${adsGroupNameLabel(group)}__SP__${String(matchType).toUpperCase()}${timestamp}`;
+  const prefix = `ERP__${safeAdsNamePart(internalName) || "Product"}${identity}__`;
+  const available = Math.max(12, 255 - prefix.length - suffix.length);
+  return `${prefix}${safeAdsNamePart(keyword).slice(0, available)}${suffix}`;
+}
+
+function buildAdsAdGroupName(campaignName, childAsin, options = {}) {
+  if (options.creationBatch) {
+    const prefix = `ERP__${safeAdsNamePart(options.internalName) || "Product"}__PARENT-${String(options.parentAsin).toUpperCase()}__`;
+    const suffix = `__${adsGroupNameLabel(options.group)}__SP__${String(options.matchType).toUpperCase()}__ASIN-${String(childAsin || "").toUpperCase()}__TS-${options.creationBatch}`;
+    const available = Math.max(12, 255 - prefix.length - suffix.length);
+    return `${prefix}${safeAdsNamePart(options.keyword).slice(0, available)}${suffix}`;
+  }
+  const suffix = `__ASIN-${String(childAsin || "").toUpperCase()}`;
+  return `${String(campaignName).slice(0, Math.max(1, 255 - suffix.length))}${suffix}`;
+}
+
+async function readAdsProductCatalog() {
+  const endDate = formatDateInTimeZone();
+  const startDate = addDays(endDate, -29);
+  const view = await buildFbaInventoryView(startDate, endDate);
+  const parentMetadata = await readParentAsinMetadataRows();
+  const metadataByParent = new Map(parentMetadata.map(item => [item.parentAsin, item]));
+  const factoryInfoByAsin = buildFactoryInfoByAsin(await readDb());
+  const byParent = new Map();
+  for (const row of view.rows || []) {
+    if (!row.asin || !row.sellerSku) continue;
+    const parentAsin = String(row.parentAsin || row.asin).toUpperCase();
+    const metadata = metadataByParent.get(parentAsin);
+    const parentInternalName = String(metadata?.internalName || "").trim();
+    if (!parentInternalName) continue;
+    const childAsin = String(row.asin).toUpperCase();
+    const factoryInfo = factoryInfoByAsin.get(childAsin);
+    const latestInventory = row.latestRealtimeInventory && typeof row.latestRealtimeInventory === "object"
+      ? row.latestRealtimeInventory
+      : null;
+    const totalGoodsQuantity = latestInventory?.totalGoodsQuantity !== null && latestInventory?.totalGoodsQuantity !== undefined
+      ? Number(latestInventory.totalGoodsQuantity || 0)
+      : (row.totalGoodsQuantity === null || row.totalGoodsQuantity === undefined ? null : Number(row.totalGoodsQuantity || 0));
+    const item = byParent.get(parentAsin) || {
+      parentAsin,
+      internalName: parentInternalName,
+      sortOrder: Number(metadata?.sortOrder || 0),
+      children: []
+    };
+    item.children.push({
+      asin: childAsin,
+      sellerSku: String(row.sellerSku),
+      internalName: String(factoryInfo?.name || row.factoryName || "").trim(),
+      title: row.title || "",
+      imageUrl: row.imageUrl || "",
+      totalGoodsQuantity,
+      fulfillableQuantity: latestInventory
+        ? Number(latestInventory.fulfillableQuantity || 0)
+        : (row.inventoryCompleteness === "missing" ? null : Number(row.fulfillableQuantity || 0)),
+      inventoryDate: latestInventory?.date || row.inventoryDate || "",
+      dailySales: Number(row.dailySales || 0),
+      salesUnits: Number(row.salesUnits || 0),
+      recommended: false
+    });
+    byParent.set(parentAsin, item);
+  }
+  const metricValue = value => {
+    if (value === null || value === undefined || value === "") return null;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  };
+  const topByMetric = (rows, getter) => {
+    let maxValue = null;
+    const winners = [];
+    for (const row of rows) {
+      const value = metricValue(getter(row));
+      if (value === null) continue;
+      if (maxValue === null || value > maxValue) {
+        maxValue = value;
+        winners.length = 0;
+        winners.push(row);
+      } else if (value === maxValue) {
+        winners.push(row);
+      }
+    }
+    return { hasMetric: maxValue !== null, winners };
+  };
+  const pickSkuRowsForAsin = rows => {
+    if (rows.length <= 1) return rows;
+    const totalTop = topByMetric(rows, row => row.totalGoodsQuantity);
+    if (totalTop.hasMetric) {
+      if (totalTop.winners.length === 1) return totalTop.winners;
+      const salesTop = topByMetric(totalTop.winners, row => row.dailySales);
+      return salesTop.hasMetric && salesTop.winners.length === 1 ? salesTop.winners : totalTop.winners;
+    }
+    const salesTop = topByMetric(rows, row => row.dailySales);
+    return salesTop.hasMetric && salesTop.winners.length === 1 ? salesTop.winners : rows;
+  };
+  return [...byParent.values()].map(item => {
+    const childrenByAsin = new Map();
+    for (const child of item.children) {
+      if (!childrenByAsin.has(child.asin)) childrenByAsin.set(child.asin, []);
+      childrenByAsin.get(child.asin).push(child);
+    }
+    const children = [...childrenByAsin.values()]
+      .flatMap(rows => pickSkuRowsForAsin(rows).map(row => ({ ...row, recommended: true })))
+      .sort((a, b) => b.dailySales - a.dailySales || Number(b.totalGoodsQuantity || 0) - Number(a.totalGoodsQuantity || 0) || a.asin.localeCompare(b.asin));
+    return { ...item, children };
+  }).sort((a, b) => {
+    const aOrder = Number(a.sortOrder || 0);
+    const bOrder = Number(b.sortOrder || 0);
+    if (aOrder > 0 || bOrder > 0) {
+      if (aOrder <= 0) return 1;
+      if (bOrder <= 0) return -1;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+    }
+    return a.internalName.localeCompare(b.internalName, "zh-Hans-CN");
+  });
+}
+
+function adsDateValue(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value.slice(0, 10);
+  const date = new Date(value);
+  return `${String(date.getFullYear()).padStart(4, "0")}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+async function readAdsWorkspace(startDate = "", endDate = "") {
+  const profile = await requireSelectedAdsProfile();
+  const safeEnd = (endDate || formatDateInTimeZone()).slice(0, 10);
+  const safeStart = (startDate || addDays(safeEnd, -29)).slice(0, 10);
+  const pool = getMysqlPool();
+  const [keywordRows] = await pool.query("SELECT * FROM ads_keywords WHERE profile_id = ? AND lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING', 'STOPPED') ORDER BY updated_at DESC, id DESC", [String(profile.profileId)]);
+  const keywordIds = keywordRows.map(row => row.id);
+  let campaignRows = [];
+  let adUnitRows = [];
+  let performanceRows = [];
+  let placementRows = [];
+  if (keywordIds.length) {
+    [campaignRows] = await pool.query("SELECT * FROM ads_campaigns WHERE keyword_id IN (?) ORDER BY match_type", [keywordIds]);
+    const campaignIds = campaignRows.map(row => row.id);
+    if (campaignIds.length) {
+      [adUnitRows] = await pool.query("SELECT * FROM ads_ad_units WHERE campaign_id IN (?) ORDER BY child_asin", [campaignIds]);
+      [placementRows] = await pool.query(`
+        SELECT campaign_id, placement, SUM(impressions) impressions, SUM(clicks) clicks,
+          SUM(spend) spend, SUM(orders_count) orders_count, SUM(units_sold) units_sold, SUM(sales) sales
+        FROM ads_placement_performance_daily WHERE campaign_id IN (?) AND date BETWEEN ? AND ?
+        GROUP BY campaign_id, placement
+      `, [campaignIds, safeStart, safeEnd]);
+    }
+    const adUnitIds = adUnitRows.map(row => row.id);
+    if (adUnitIds.length) {
+      [performanceRows] = await pool.query(`
+        SELECT ad_unit_id, SUM(impressions) impressions, SUM(clicks) clicks, SUM(spend) spend,
+          SUM(orders_count) orders_count, SUM(units_sold) units_sold, SUM(sales) sales
+        FROM ads_performance_daily WHERE ad_unit_id IN (?) AND date BETWEEN ? AND ? GROUP BY ad_unit_id
+      `, [adUnitIds, safeStart, safeEnd]);
+    }
+  }
+  const metricsByAdUnit = new Map(performanceRows.map(row => [String(row.ad_unit_id), {
+    impressions: Number(row.impressions || 0), clicks: Number(row.clicks || 0), spend: Number(row.spend || 0),
+    orders: Number(row.orders_count || 0), units: Number(row.units_sold || 0), sales: Number(row.sales || 0)
+  }]));
+  const placementsByCampaign = new Map();
+  for (const row of placementRows) {
+    const key = String(row.campaign_id);
+    const list = placementsByCampaign.get(key) || [];
+    list.push({ placement: row.placement, impressions: Number(row.impressions || 0), clicks: Number(row.clicks || 0), spend: Number(row.spend || 0), orders: Number(row.orders_count || 0), units: Number(row.units_sold || 0), sales: Number(row.sales || 0) });
+    placementsByCampaign.set(key, list);
+  }
+  const unitsByCampaign = new Map();
+  for (const row of adUnitRows) {
+    const metrics = metricsByAdUnit.get(String(row.id)) || { impressions: 0, clicks: 0, spend: 0, orders: 0, units: 0, sales: 0 };
+    const unit = {
+      id: String(row.id), childAsin: row.child_asin, sellerSku: row.seller_sku,
+      creationBatch: row.creation_batch || "", entityKey: row.entity_key || "",
+      name: row.ad_group_name, amazonName: row.amazon_ad_group_name || "", bid: Number(row.bid || 0),
+      desiredState: row.desired_state, amazonState: row.amazon_state || "", lifecycleStatus: row.lifecycle_status,
+      creationStatus: row.creation_status, syncStatus: row.sync_status, failedStep: row.failed_step || "", error: row.last_error || "",
+      amazonAdGroupId: row.amazon_ad_group_id || "", amazonProductAdId: row.amazon_product_ad_id || "", amazonTargetId: row.amazon_target_id || "",
+      metrics: { ...metrics, acos: metrics.sales > 0 ? metrics.spend / metrics.sales : null }
+    };
+    const list = unitsByCampaign.get(String(row.campaign_id)) || [];
+    list.push(unit);
+    unitsByCampaign.set(String(row.campaign_id), list);
+  }
+  const campaignsByKeyword = new Map();
+  for (const row of campaignRows) {
+    const units = unitsByCampaign.get(String(row.id)) || [];
+    const metrics = units.reduce((acc, unit) => {
+      for (const key of ["impressions", "clicks", "spend", "orders", "units", "sales"]) acc[key] += Number(unit.metrics[key] || 0);
+      return acc;
+    }, { impressions: 0, clicks: 0, spend: 0, orders: 0, units: 0, sales: 0 });
+    metrics.acos = metrics.sales > 0 ? metrics.spend / metrics.sales : null;
+    const campaign = {
+      id: String(row.id), adType: row.ad_type, matchType: row.match_type, amazonCampaignId: row.amazon_campaign_id || "",
+      childAsin: row.child_asin || units[0]?.childAsin || "", sellerSku: row.seller_sku || units[0]?.sellerSku || "",
+      creationBatch: row.creation_batch || "", entityKey: row.entity_key || "",
+      name: row.campaign_name, amazonName: row.amazon_campaign_name || "", desiredState: row.desired_state, lifecycleStatus: row.lifecycle_status || "ACTIVE",
+      stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null),
+      amazonState: row.amazon_state || "", dailyBudget: Number(row.daily_budget || 0), biddingStrategy: row.bidding_strategy,
+      topOfSearchAdjustment: Number(row.top_of_search_adjustment || 0), restOfSearchAdjustment: Number(row.rest_of_search_adjustment || 0), productPageAdjustment: Number(row.product_page_adjustment || 0),
+      startDate: adsDateValue(row.start_date), endDate: adsDateValue(row.end_date),
+      creationStatus: row.creation_status, syncStatus: row.sync_status, failedStep: row.failed_step || "", error: row.last_error || "",
+      metrics, units, placements: placementsByCampaign.get(String(row.id)) || []
+    };
+    const list = campaignsByKeyword.get(String(row.keyword_id)) || [];
+    list.push(campaign);
+    campaignsByKeyword.set(String(row.keyword_id), list);
+  }
+  const keywords = keywordRows.map(row => {
+    const campaigns = campaignsByKeyword.get(String(row.id)) || [];
+    const metrics = campaigns.reduce((acc, campaign) => {
+      for (const key of ["impressions", "clicks", "spend", "orders", "units", "sales"]) acc[key] += Number(campaign.metrics[key] || 0);
+      return acc;
+    }, { impressions: 0, clicks: 0, spend: 0, orders: 0, units: 0, sales: 0 });
+    metrics.acos = metrics.sales > 0 ? metrics.spend / metrics.sales : null;
+    return { id: String(row.id), parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns };
+  });
+  return {
+    profile,
+    portfolio: await readManagedAdsPortfolio(profile.profileId),
+    range: { startDate: safeStart, endDate: safeEnd },
+    products: await readAdsProductCatalog(),
+    keywords
+  };
+}
+
+async function readAdsKeywordHistory(keywordId, filters = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [keywordRows] = await pool.query(`
+    SELECT id, parent_asin, keyword_text
+    FROM ads_keywords
+    WHERE id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE'
+  `, [keywordId, String(profile.profileId)]);
+  const keyword = keywordRows[0];
+  if (!keyword) throw new Error("关键词不存在");
+
+  const defaultEnd = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+  const endDate = /^\d{4}-\d{2}-\d{2}$/.test(String(filters.endDate || "")) ? String(filters.endDate) : defaultEnd;
+  const startDate = /^\d{4}-\d{2}-\d{2}$/.test(String(filters.startDate || "")) ? String(filters.startDate) : addDays(endDate, -29);
+  if (startDate > endDate) throw new Error("历史数据开始日期不能晚于结束日期");
+  const dates = dateRangeInclusive(startDate, endDate);
+  if (dates.length > 366) throw new Error("单次最多查询 366 天历史数据");
+
+  const [optionRows] = await pool.query(`
+    SELECT DISTINCT c.match_type, u.child_asin, u.seller_sku
+    FROM ads_campaigns c
+    JOIN ads_ad_units u ON u.campaign_id = c.id
+    WHERE c.keyword_id = ? AND c.profile_id = ?
+    ORDER BY u.child_asin, c.match_type
+  `, [keywordId, String(profile.profileId)]);
+  const availableAsins = [...new Map(optionRows.map(row => [row.child_asin, {
+    asin: row.child_asin,
+    sellerSku: row.seller_sku
+  }])).values()];
+  const availableMatchTypes = [...new Set(optionRows.map(row => row.match_type))]
+    .sort((a, b) => ["EXACT", "PHRASE", "BROAD"].indexOf(a) - ["EXACT", "PHRASE", "BROAD"].indexOf(b));
+  const childAsin = availableAsins.some(item => item.asin === String(filters.childAsin || "").toUpperCase())
+    ? String(filters.childAsin).toUpperCase() : "ALL";
+  const requestedMatchType = String(filters.matchType || "").toUpperCase();
+  const matchType = availableMatchTypes.includes(requestedMatchType) ? requestedMatchType : "ALL";
+  const where = ["c.keyword_id = ?", "c.profile_id = ?", "p.date BETWEEN ? AND ?"];
+  const params = [keywordId, String(profile.profileId), startDate, endDate];
+  if (childAsin !== "ALL") {
+    where.push("u.child_asin = ?");
+    params.push(childAsin);
+  }
+  if (matchType !== "ALL") {
+    where.push("c.match_type = ?");
+    params.push(matchType);
+  }
+  const [performanceRows] = await pool.query(`
+    SELECT p.date, SUM(p.impressions) impressions, SUM(p.clicks) clicks, SUM(p.spend) spend,
+      SUM(p.orders_count) orders_count, SUM(p.units_sold) units_sold, SUM(p.sales) sales
+    FROM ads_performance_daily p
+    JOIN ads_ad_units u ON u.id = p.ad_unit_id
+    JOIN ads_campaigns c ON c.id = u.campaign_id
+    WHERE ${where.join(" AND ")}
+    GROUP BY p.date
+    ORDER BY p.date
+  `, params);
+  // 展示位置是 Campaign 级日报表；按当前子 ASIN / 策略筛出对应 Campaign 后再汇总，
+  // 不与 Ad Group 联表，避免一个 Campaign 下多个商品时重复累计。
+  const placementWhere = ["c.keyword_id = ?", "c.profile_id = ?", "p.date BETWEEN ? AND ?"];
+  const placementParams = [keywordId, String(profile.profileId), startDate, endDate];
+  if (childAsin !== "ALL") {
+    placementWhere.push("EXISTS (SELECT 1 FROM ads_ad_units u WHERE u.campaign_id = c.id AND u.child_asin = ?)");
+    placementParams.push(childAsin);
+  }
+  if (matchType !== "ALL") {
+    placementWhere.push("c.match_type = ?");
+    placementParams.push(matchType);
+  }
+  const [placementPerformanceRows] = await pool.query(`
+    SELECT p.date, p.placement, SUM(p.impressions) impressions, SUM(p.clicks) clicks, SUM(p.spend) spend,
+      SUM(p.orders_count) orders_count, SUM(p.units_sold) units_sold, SUM(p.sales) sales
+    FROM ads_placement_performance_daily p
+    JOIN ads_campaigns c ON c.id = p.campaign_id
+    WHERE ${placementWhere.join(" AND ")}
+    GROUP BY p.date, p.placement
+    ORDER BY p.date
+  `, placementParams);
+  const settingWhere = ["c.keyword_id = ?", "c.profile_id = ?"];
+  const settingParams = [keywordId, String(profile.profileId)];
+  if (childAsin !== "ALL") {
+    settingWhere.push("u.child_asin = ?");
+    settingParams.push(childAsin);
+  }
+  if (matchType !== "ALL") {
+    settingWhere.push("c.match_type = ?");
+    settingParams.push(matchType);
+  }
+  const [bidRows] = await pool.query(`
+    SELECT AVG(u.bid) bid, MIN(c.start_date) effective_date
+    FROM ads_ad_units u
+    JOIN ads_campaigns c ON c.id = u.campaign_id
+    WHERE ${settingWhere.join(" AND ")}
+  `, settingParams);
+  const campaignWhere = ["c.keyword_id = ?", "c.profile_id = ?"];
+  const campaignParams = [keywordId, String(profile.profileId)];
+  if (matchType !== "ALL") {
+    campaignWhere.push("c.match_type = ?");
+    campaignParams.push(matchType);
+  }
+  if (childAsin !== "ALL") {
+    campaignWhere.push("EXISTS (SELECT 1 FROM ads_ad_units u WHERE u.campaign_id = c.id AND u.child_asin = ?)");
+    campaignParams.push(childAsin);
+  }
+  const [adjustmentRows] = await pool.query(`
+    SELECT AVG(c.top_of_search_adjustment) top_of_search_adjustment,
+      AVG(c.rest_of_search_adjustment) rest_of_search_adjustment,
+      AVG(c.product_page_adjustment) product_page_adjustment,
+      MIN(c.start_date) effective_date
+    FROM ads_campaigns c
+    WHERE ${campaignWhere.join(" AND ")}
+  `, campaignParams);
+  const currentBid = Number(bidRows[0]?.bid || 0);
+  const currentTopAdjustment = Number(adjustmentRows[0]?.top_of_search_adjustment || 0);
+  const currentRestOfSearchAdjustment = Number(adjustmentRows[0]?.rest_of_search_adjustment || 0);
+  const currentProductPageAdjustment = Number(adjustmentRows[0]?.product_page_adjustment || 0);
+  const bidEffectiveDate = adsDateValue(bidRows[0]?.effective_date);
+  const adjustmentEffectiveDate = adsDateValue(adjustmentRows[0]?.effective_date);
+  const performanceByDate = new Map(performanceRows.map(row => [adsDateValue(row.date), row]));
+  const placementKey = value => {
+    const placement = String(value || "").toUpperCase();
+    if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP"].includes(placement)) return "top";
+    if (["PLACEMENT_REST_OF_SEARCH", "REST_OF_SEARCH", "OTHER"].includes(placement)) return "rest";
+    if (["PLACEMENT_PRODUCT_PAGE", "PRODUCT_PAGE", "DETAIL_PAGE"].includes(placement)) return "product";
+    return null;
+  };
+  const placementByDate = new Map();
+  for (const row of placementPerformanceRows) {
+    const date = adsDateValue(row.date);
+    const key = placementKey(row.placement);
+    if (!key) continue;
+    const placements = placementByDate.get(date) || {};
+    placements[key] = row;
+    placementByDate.set(date, placements);
+  }
+  const points = dates.map(date => {
+    const row = performanceByDate.get(date);
+    const placements = placementByDate.get(date) || {};
+    const clicks = Number(row?.clicks || 0);
+    const spend = Number(row?.spend || 0);
+    const placementMetrics = prefix => {
+      const placement = placements[prefix];
+      if (!placement) return {
+        [`${prefix}ActualCpc`]: null, [`${prefix}Impressions`]: null, [`${prefix}Clicks`]: null,
+        [`${prefix}Spend`]: null, [`${prefix}Orders`]: null, [`${prefix}Units`]: null, [`${prefix}Sales`]: null
+      };
+      const placementClicks = Number(placement.clicks || 0);
+      const placementSpend = Number(placement.spend || 0);
+      return {
+        [`${prefix}ActualCpc`]: placementClicks > 0 ? placementSpend / placementClicks : null,
+        [`${prefix}Impressions`]: Number(placement.impressions || 0),
+        [`${prefix}Clicks`]: placementClicks,
+        [`${prefix}Spend`]: placementSpend,
+        [`${prefix}Orders`]: Number(placement.orders_count || 0),
+        [`${prefix}Units`]: Number(placement.units_sold || 0),
+        [`${prefix}Sales`]: Number(placement.sales || 0)
+      };
+    };
+    return {
+      date,
+      bid: bidEffectiveDate && date >= bidEffectiveDate ? currentBid : null,
+      topOfSearchAdjustment: adjustmentEffectiveDate && date >= adjustmentEffectiveDate ? currentTopAdjustment : null,
+      restOfSearchAdjustment: adjustmentEffectiveDate && date >= adjustmentEffectiveDate ? currentRestOfSearchAdjustment : null,
+      productPageAdjustment: adjustmentEffectiveDate && date >= adjustmentEffectiveDate ? currentProductPageAdjustment : null,
+      actualCpc: clicks > 0 ? spend / clicks : null,
+      impressions: Number(row?.impressions || 0),
+      clicks,
+      spend,
+      orders: Number(row?.orders_count || 0),
+      units: Number(row?.units_sold || 0),
+      sales: Number(row?.sales || 0),
+      ...placementMetrics("top"),
+      ...placementMetrics("rest"),
+      ...placementMetrics("product"),
+      naturalRank: null,
+      adRank: null
+    };
+  });
+  return {
+    keyword: { id: String(keyword.id), parentAsin: keyword.parent_asin, text: keyword.keyword_text },
+    range: { startDate, endDate },
+    filters: { childAsin, matchType },
+    options: { childAsins: availableAsins, matchTypes: availableMatchTypes },
+    points,
+    unavailableMetrics: ["naturalRank", "adRank"]
+  };
+}
+
+async function readAdsDateStatus() {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT date, report_type, status, synced_at, last_error
+    FROM ads_sync_dates
+    WHERE profile_id = ?
+    ORDER BY date
+  `, [String(profile.profileId)]);
+  const byDate = new Map();
+  for (const row of rows) {
+    const date = adsDateValue(row.date);
+    const item = byDate.get(date) || { date, reports: {}, errors: [] };
+    item.reports[row.report_type] = String(row.status || "").toUpperCase();
+    if (row.last_error) item.errors.push(String(row.last_error));
+    byDate.set(date, item);
+  }
+  return {
+    dates: [...byDate.values()].map(item => {
+      const adGroupComplete = item.reports.AD_GROUP === "COMPLETE";
+      const placementComplete = item.reports.PLACEMENT === "COMPLETE";
+      return {
+        date: item.date,
+        // 关键词、子 ASIN 与核心表现指标均由 Ad Group 日报表提供；展示位置为可选补充数据。
+        complete: adGroupComplete,
+        partial: !adGroupComplete && placementComplete,
+        adGroupComplete,
+        placementComplete,
+        error: item.errors.join("；")
+      };
+    })
+  };
+}
+
+async function ensureAdsCreationTemplate(profile) {
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO ads_creation_templates (profile_id, currency_code)
+    VALUES (?, ?)
+    ON DUPLICATE KEY UPDATE currency_code = VALUES(currency_code)
+  `, [String(profile.profileId), profile.currencyCode || ""]);
+  const [rows] = await pool.query("SELECT * FROM ads_creation_templates WHERE profile_id = ?", [String(profile.profileId)]);
+  const row = rows[0];
+  return {
+    profileId: String(row.profile_id), currencyCode: row.currency_code || profile.currencyCode || "USD",
+    dailyBudget: Number(row.daily_budget || 8), biddingStrategy: row.bidding_strategy || "FIXED_BIDS",
+    defaultBid: Number(row.default_bid || 0.2), topOfSearchAdjustment: Number(row.top_of_search_adjustment || 200),
+    restOfSearchAdjustment: Number(row.rest_of_search_adjustment || 0), productPageAdjustment: Number(row.product_page_adjustment || 0),
+    matches: { EXACT: Boolean(row.exact_enabled), PHRASE: Boolean(row.phrase_enabled), BROAD: Boolean(row.broad_enabled) },
+    initialState: row.initial_state || "ENABLED"
+  };
+}
+
+async function createAdsKeywordDraft(body = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const parentAsin = String(body.parentAsin || "").trim().toUpperCase();
+  const keywordText = normalizeAdsKeywordText(body.keyword);
+  const group = adsKeywordGroup(body.group);
+  const lifecycleStatus = body.lifecycleStatus === "CREATING" ? "CREATING" : "ACTIVE";
+  if (!/^B[A-Z0-9]{9}$/.test(parentAsin)) throw new Error("请选择有效的父 ASIN");
+  if (!keywordText) throw new Error("请输入关键词");
+  if (keywordText.length > 255) throw new Error("关键词不能超过 255 个字符");
+  const products = await readAdsProductCatalog();
+  const product = products.find(item => item.parentAsin === parentAsin);
+  if (!product) throw new Error("父 ASIN 不在 FBA 库存产品中");
+  const requestedUnits = Array.isArray(body.units) ? body.units : [];
+  const units = requestedUnits.map(unit => {
+    const childAsin = String(unit.childAsin || "").trim().toUpperCase();
+    const sellerSku = String(unit.sellerSku || "").trim();
+    const candidate = product.children.find(item => item.asin === childAsin && item.sellerSku === sellerSku);
+    if (!candidate) throw new Error(`子 ASIN ${childAsin || "-"} 与 Seller SKU ${sellerSku || "-"} 不属于所选父 ASIN`);
+    return { childAsin, sellerSku };
+  });
+  if (units.length !== 1) throw new Error("一个关键词只能对应一个子 ASIN 和 Seller SKU");
+  const template = await ensureAdsCreationTemplate(profile);
+  const matches = [...new Set((Array.isArray(body.matches) ? body.matches : ["EXACT"]).map(value => String(value).toUpperCase()))]
+    .filter(value => ["EXACT", "PHRASE", "BROAD"].includes(value));
+  if (!matches.length) matches.push("EXACT");
+  const dailyBudget = Number(body.dailyBudget ?? template.dailyBudget);
+  const defaultBid = Number(body.defaultBid ?? template.defaultBid);
+  const topAdjustment = Number(body.topOfSearchAdjustment ?? template.topOfSearchAdjustment);
+  const restAdjustment = Number(body.restOfSearchAdjustment ?? template.restOfSearchAdjustment);
+  const productPageAdjustment = Number(body.productPageAdjustment ?? template.productPageAdjustment);
+  const adjustments = [topAdjustment, restAdjustment, productPageAdjustment];
+  if (!(dailyBudget > 0) || !(defaultBid > 0) || adjustments.some(value => !Number.isInteger(value) || value > 900 || value < 0)) throw new Error("预算、出价或位置加价不合法");
+  const portfolio = await readManagedAdsPortfolio(profile.profileId);
+  const internalName = product.internalName || parentAsin;
+  const startDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+  const normalizedKeyword = keywordText.toLocaleLowerCase("en-US");
+  const creationBatch = newAdsCreationBatch();
+  const activeScopeKey = adsActiveKeywordScopeKey(profile.profileId, parentAsin, normalizedKeyword, units[0].childAsin);
+  const pool = getMysqlPool();
+  const [existingActive] = await pool.query("SELECT id FROM ads_keywords WHERE active_scope_key = ? AND lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING') LIMIT 1", [activeScopeKey]);
+  const [existingUnit] = await pool.query(`
+    SELECT k.id FROM ads_keywords k
+    JOIN ads_campaigns c ON c.keyword_id = k.id AND c.lifecycle_status <> 'STOPPED'
+    JOIN ads_ad_units u ON u.campaign_id = c.id
+    WHERE k.profile_id = ? AND k.parent_asin = ? AND k.normalized_keyword = ? AND k.lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING')
+      AND u.child_asin = ? LIMIT 1
+  `, [String(profile.profileId), parentAsin, normalizedKeyword, units[0].childAsin]);
+  if (existingActive.length || existingUnit.length) throw new Error(`子 ASIN ${units[0].childAsin} 已存在关键词“${keywordText}”；请选择其他子 ASIN，或停止现有投放后再添加`);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [keywordResult] = await connection.query(`
+      INSERT INTO ads_keywords (
+        profile_id, parent_asin, keyword_text, normalized_keyword, creation_batch, active_scope_key, keyword_group, lifecycle_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [String(profile.profileId), parentAsin, keywordText, normalizedKeyword, creationBatch, activeScopeKey, group, lifecycleStatus]);
+    const keywordId = keywordResult.insertId;
+    for (const matchType of matches) {
+      const unit = units[0];
+      const campaignName = buildAdsCampaignName(internalName, parentAsin, unit.childAsin, keywordText, group, matchType, creationBatch);
+      const campaignEntityKey = adsCampaignEntityKey(parentAsin, unit.childAsin, creationBatch, matchType);
+      const [campaignResult] = await connection.query(`
+        INSERT INTO ads_campaigns (
+          keyword_id, profile_id, portfolio_id, match_type, child_asin, seller_sku, creation_batch, entity_key, campaign_name, desired_state,
+          daily_budget, bidding_strategy, top_of_search_adjustment, rest_of_search_adjustment, product_page_adjustment, start_date
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ENABLED', ?, ?, ?, ?, ?, ?)
+      `, [keywordId, String(profile.profileId), portfolio?.portfolioId || "", matchType, unit.childAsin, unit.sellerSku, creationBatch, campaignEntityKey, campaignName, dailyBudget, template.biddingStrategy, topAdjustment, restAdjustment, productPageAdjustment, startDate]);
+      await connection.query(`
+        INSERT INTO ads_ad_units (
+          campaign_id, profile_id, child_asin, seller_sku, creation_batch, entity_key, ad_group_name, bid, desired_state
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ENABLED')
+      `, [
+        campaignResult.insertId, String(profile.profileId), unit.childAsin, unit.sellerSku, creationBatch,
+        adsAdUnitEntityKey(unit.childAsin, creationBatch, matchType), buildAdsAdGroupName(campaignName, unit.childAsin, {
+          internalName, parentAsin, keyword: keywordText, group, matchType, creationBatch
+        }), defaultBid
+      ]);
+    }
+    await connection.commit();
+    return { keywordId: String(keywordId), creationBatch };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    if (error?.code === "ER_DUP_ENTRY") throw new Error(`子 ASIN ${units[0].childAsin} 已存在或正在创建关键词“${keywordText}”`);
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function createAndStartAdsKeywordBatch(body = {}) {
+  const keywords = Array.isArray(body.keywords) ? body.keywords : [];
+  if (!keywords.length || keywords.length > 20) throw new Error("请添加 1 到 20 个关键词");
+  const profile = await requireSelectedAdsProfile();
+  const parentAsin = String(body.parentAsin || "").trim().toUpperCase();
+  const units = Array.isArray(body.units) ? body.units : [];
+  if (!units.length) throw new Error("请至少选择一个投放商品");
+  const planned = [];
+  const plannedKeys = new Set();
+  for (const item of keywords) {
+    const keyword = normalizeAdsKeywordText(item?.keyword);
+    if (!keyword) throw new Error("请填写每一行关键词");
+    for (const unit of units) {
+      const childAsin = String(unit?.childAsin || "").trim().toUpperCase();
+      const key = `${keyword.toLocaleLowerCase("en-US")}|${childAsin}`;
+      if (plannedKeys.has(key)) throw new Error(`添加列表重复：关键词“${keyword}”已选择子 ASIN ${childAsin}`);
+      plannedKeys.add(key);
+      planned.push({ keyword, childAsin });
+    }
+  }
+  const pool = getMysqlPool();
+  const [existing] = await pool.query(`
+    SELECT DISTINCT k.keyword_text, k.normalized_keyword, u.child_asin
+    FROM ads_keywords k
+    JOIN ads_campaigns c ON c.keyword_id = k.id AND c.lifecycle_status <> 'STOPPED'
+    JOIN ads_ad_units u ON u.campaign_id = c.id
+    WHERE k.profile_id = ? AND k.parent_asin = ? AND k.lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING')
+  `, [String(profile.profileId), parentAsin]);
+  const existingKeys = new Set(existing.map(row => `${String(row.normalized_keyword || "").toLocaleLowerCase("en-US")}|${String(row.child_asin || "").toUpperCase()}`));
+  const conflict = planned.find(item => existingKeys.has(`${item.keyword.toLocaleLowerCase("en-US")}|${item.childAsin}`));
+  if (conflict) throw new Error(`已存在或正在创建：关键词“${conflict.keyword}”对应子 ASIN ${conflict.childAsin}`);
+  const common = {
+    parentAsin: body.parentAsin,
+    dailyBudget: body.dailyBudget,
+    defaultBid: body.defaultBid,
+    topOfSearchAdjustment: body.topOfSearchAdjustment,
+    restOfSearchAdjustment: body.restOfSearchAdjustment,
+    productPageAdjustment: body.productPageAdjustment,
+    matches: body.matches,
+    lifecycleStatus: "CREATING"
+  };
+  const created = [];
+  for (const item of keywords) {
+    for (const unit of units) {
+      const result = await createAdsKeywordDraft({ ...common, keyword: item.keyword, group: item.group, units: [unit] });
+      created.push(result);
+    }
+  }
+  const operations = await Promise.all(created.map(async item => {
+    const preview = await buildAdsCreationPreview(item.keywordId);
+    return { keywordId: item.keywordId, operationId: preview.operationId, confirmationToken: preview.confirmationToken };
+  }));
+  for (const operation of operations) {
+    void confirmAdsCreationOperation(operation.operationId, operation.confirmationToken).catch(() => {});
+  }
+  return { keywordIds: created.map(item => item.keywordId), operations: operations.map(item => ({ keywordId: item.keywordId, operationId: item.operationId })) };
+}
+
+async function updateAdsKeywordGroup(keywordId, nextGroup) {
+  const profile = await requireSelectedAdsProfile();
+  const group = adsKeywordGroup(nextGroup);
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_keywords WHERE id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE'", [keywordId, String(profile.profileId)]);
+  const keyword = rows[0];
+  if (!keyword) throw new Error("关键词不存在");
+  const names = await readParentAsinMetadataMap();
+  const internalName = names.get(String(keyword.parent_asin).toUpperCase()) || keyword.parent_asin;
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    await connection.query("UPDATE ads_keywords SET keyword_group = ? WHERE id = ?", [group, keywordId]);
+    const [campaigns] = await connection.query("SELECT id, match_type FROM ads_campaigns WHERE keyword_id = ?", [keywordId]);
+    for (const campaign of campaigns) {
+      const campaignName = buildAdsCampaignName(
+        internalName, keyword.parent_asin, campaign.child_asin || "LEGACY", keyword.keyword_text, group, campaign.match_type, keyword.creation_batch || ""
+      );
+      await connection.query("UPDATE ads_campaigns SET campaign_name = ?, sync_status = IF(amazon_campaign_id IS NULL, 'LOCAL_ONLY', 'PENDING') WHERE id = ?", [campaignName, campaign.id]);
+      const [units] = await connection.query("SELECT id, child_asin FROM ads_ad_units WHERE campaign_id = ?", [campaign.id]);
+      for (const unit of units) {
+        await connection.query("UPDATE ads_ad_units SET ad_group_name = ?, sync_status = IF(amazon_ad_group_id IS NULL, 'LOCAL_ONLY', 'PENDING') WHERE id = ?", [buildAdsAdGroupName(campaignName, unit.child_asin, {
+          internalName, parentAsin: keyword.parent_asin, keyword: keyword.keyword_text, group,
+          matchType: campaign.match_type, creationBatch: keyword.creation_batch || ""
+        }), unit.id]);
+      }
+    }
+    await connection.commit();
+    await syncAdsKeywordNames(keywordId);
+    return { keywordId: String(keywordId), group };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function createAdsAdditionalMatchDraft(keywordId, rawMatchType) {
+  const profile = await requireSelectedAdsProfile();
+  const matchType = String(rawMatchType || "").toUpperCase();
+  if (!['EXACT', 'PHRASE', 'BROAD'].includes(matchType)) throw new Error("匹配方式不合法");
+  const pool = getMysqlPool();
+  const [keywordRows] = await pool.query("SELECT * FROM ads_keywords WHERE id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE'", [keywordId, String(profile.profileId)]);
+  const keyword = keywordRows[0];
+  if (!keyword) throw new Error("关键词不存在");
+  const [existingRows] = await pool.query("SELECT id FROM ads_campaigns WHERE keyword_id = ? AND profile_id = ? AND match_type = ? AND lifecycle_status <> 'STOPPED' LIMIT 1", [keyword.id, String(profile.profileId), matchType]);
+  const matchLabel = { EXACT: "精准", PHRASE: "词组", BROAD: "广泛" }[matchType];
+  if (existingRows.length) throw new Error(`${matchLabel}已添加，请直接预览并创建或继续处理`);
+  const [sourceRows] = await pool.query(`
+    SELECT * FROM ads_campaigns
+    WHERE keyword_id = ? AND profile_id = ?
+    ORDER BY FIELD(match_type, 'EXACT', 'PHRASE', 'BROAD'), id
+    LIMIT 1
+  `, [keyword.id, String(profile.profileId)]);
+  const source = sourceRows[0];
+  if (!source) throw new Error("没有可复制的现有投放设置");
+  const [sourceUnits] = await pool.query("SELECT * FROM ads_ad_units WHERE campaign_id = ? AND profile_id = ? ORDER BY id LIMIT 1", [source.id, String(profile.profileId)]);
+  if (!sourceUnits.length) throw new Error("现有匹配方式没有投放商品");
+  const sourceUnit = sourceUnits[0];
+  const names = await readParentAsinMetadataMap();
+  const internalName = names.get(String(keyword.parent_asin).toUpperCase()) || keyword.parent_asin;
+  const creationBatch = newAdsCreationBatch();
+  const campaignName = buildAdsCampaignName(internalName, keyword.parent_asin, sourceUnit.child_asin, keyword.keyword_text, keyword.keyword_group, matchType, creationBatch);
+  const startDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+  const portfolio = await readManagedAdsPortfolio(profile.profileId);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [lockedExisting] = await connection.query("SELECT id FROM ads_campaigns WHERE keyword_id = ? AND profile_id = ? AND match_type = ? AND lifecycle_status <> 'STOPPED' FOR UPDATE", [keyword.id, String(profile.profileId), matchType]);
+    if (lockedExisting.length) throw new Error(`${matchLabel}已在创建或已添加，不能重复添加`);
+    const [campaignResult] = await connection.query(`
+      INSERT INTO ads_campaigns (
+        keyword_id, profile_id, portfolio_id, match_type, child_asin, seller_sku, creation_batch, entity_key, campaign_name, desired_state,
+        daily_budget, bidding_strategy, top_of_search_adjustment, rest_of_search_adjustment, product_page_adjustment, start_date, creation_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CREATING')
+    `, [
+      keyword.id, String(profile.profileId), portfolio?.portfolioId || source.portfolio_id || "", matchType, sourceUnit.child_asin, sourceUnit.seller_sku, creationBatch,
+      adsCampaignEntityKey(keyword.parent_asin, sourceUnit.child_asin, creationBatch, matchType), campaignName, source.desired_state,
+      source.daily_budget, source.bidding_strategy, source.top_of_search_adjustment, source.rest_of_search_adjustment,
+      source.product_page_adjustment, startDate
+    ]);
+    {
+      const unit = sourceUnit;
+      await connection.query(`
+        INSERT INTO ads_ad_units (
+          campaign_id, profile_id, child_asin, seller_sku, creation_batch, entity_key, ad_group_name, bid, desired_state
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `, [
+        campaignResult.insertId, String(profile.profileId), unit.child_asin, unit.seller_sku, creationBatch,
+        adsAdUnitEntityKey(unit.child_asin, creationBatch, matchType), buildAdsAdGroupName(campaignName, unit.child_asin, {
+          internalName, parentAsin: keyword.parent_asin, keyword: keyword.keyword_text, group: keyword.keyword_group,
+          matchType, creationBatch
+        }), unit.bid, unit.desired_state
+      ]);
+    }
+    await connection.commit();
+    return buildAdsCreationPreview(String(keyword.id), { matchTypes: [matchType], preserveExistingKeyword: true });
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+function adsOperationTokenHash(token) {
+  return createHash("sha256").update(String(token || "")).digest("hex");
+}
+
+function stableJsonStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(item => stableJsonStringify(item)).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJsonStringify(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function adsPreviewHash(preview) {
+  return createHash("sha256").update(stableJsonStringify(preview)).digest("hex");
+}
+
+async function buildAdsCreationPreview(keywordId, options = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const portfolio = await readManagedAdsPortfolio(profile.profileId);
+  if (portfolio?.status && !["READY", "MISSING"].includes(portfolio.status)) throw new Error(portfolio.error || "广告组合隔离检查未通过");
+  const pool = getMysqlPool();
+  const [keywords] = await pool.query("SELECT * FROM ads_keywords WHERE id = ? AND profile_id = ? AND lifecycle_status IN ('ACTIVE', 'CREATING')", [keywordId, String(profile.profileId)]);
+  const keyword = keywords[0];
+  if (!keyword) throw new Error("关键词不存在");
+  const matchTypes = [...new Set(Array.isArray(options.matchTypes) ? options.matchTypes.map(value => String(value).toUpperCase()) : [])]
+    .filter(value => ['EXACT', 'PHRASE', 'BROAD'].includes(value));
+  const campaignWhere = ["keyword_id = ?", "profile_id = ?", "lifecycle_status <> 'STOPPED'"];
+  const campaignParams = [keywordId, String(profile.profileId)];
+  if (matchTypes.length) {
+    campaignWhere.push("match_type IN (?)");
+    campaignParams.push(matchTypes);
+  }
+  const [campaigns] = await pool.query(`SELECT * FROM ads_campaigns WHERE ${campaignWhere.join(" AND ")} ORDER BY FIELD(match_type, 'EXACT', 'PHRASE', 'BROAD')`, campaignParams);
+  if (!campaigns.length) throw new Error("这个关键词还没有待创建的匹配方式");
+  const campaignIds = campaigns.map(item => item.id);
+  const [units] = await pool.query("SELECT * FROM ads_ad_units WHERE campaign_id IN (?) ORDER BY child_asin", [campaignIds]);
+  const preview = {
+    profile: {
+      profileId: String(profile.profileId), countryCode: profile.countryCode || "", currencyCode: profile.currencyCode || "",
+      timezone: profile.timezone || "", accountName: profile.accountName || ""
+    },
+    portfolio: {
+      action: portfolio?.status === "READY" ? "USE_EXISTING" : "CREATE",
+      name: ADS_MANAGED_PORTFOLIO_NAME,
+      portfolioId: portfolio?.portfolioId || ""
+    },
+    keyword: {
+      id: String(keyword.id), parentAsin: keyword.parent_asin, text: keyword.keyword_text,
+      group: keyword.keyword_group, creationBatch: keyword.creation_batch || ""
+    },
+    preserveExistingKeyword: Boolean(options.preserveExistingKeyword),
+    campaigns: campaigns.map(campaign => ({
+      localId: String(campaign.id), action: campaign.amazon_campaign_id ? "REUSE" : "CREATE",
+      amazonCampaignId: campaign.amazon_campaign_id || "", name: campaign.campaign_name, adType: campaign.ad_type,
+      creationBatch: campaign.creation_batch || "", entityKey: campaign.entity_key || "",
+      matchType: campaign.match_type, state: campaign.desired_state, dailyBudget: Number(campaign.daily_budget),
+      biddingStrategy: campaign.bidding_strategy, topOfSearchAdjustment: Number(campaign.top_of_search_adjustment),
+      restOfSearchAdjustment: Number(campaign.rest_of_search_adjustment || 0), productPageAdjustment: Number(campaign.product_page_adjustment || 0),
+      startDate: adsDateValue(campaign.start_date), endDate: adsDateValue(campaign.end_date),
+      adGroups: units.filter(unit => String(unit.campaign_id) === String(campaign.id)).map(unit => ({
+        localId: String(unit.id), action: unit.amazon_ad_group_id ? "RESUME" : "CREATE",
+        name: unit.ad_group_name, childAsin: unit.child_asin, sellerSku: unit.seller_sku,
+        creationBatch: unit.creation_batch || "", entityKey: unit.entity_key || "",
+        bid: Number(unit.bid), state: unit.desired_state,
+        amazonAdGroupId: unit.amazon_ad_group_id || "", amazonProductAdId: unit.amazon_product_ad_id || "", amazonTargetId: unit.amazon_target_id || ""
+      }))
+    }))
+  };
+  const operationId = randomUUID();
+  const token = randomBytes(32).toString("base64url");
+  const previewHash = adsPreviewHash(preview);
+  const expiresAt = new Date(Date.now() + 15 * 60_000);
+  await pool.query(`
+    INSERT INTO ads_operations (
+      id, profile_id, operation_type, entity_type, entity_id, status, preview_hash,
+      confirmation_token_hash, confirmation_expires_at, request_payload, preview_payload
+    ) VALUES (?, ?, 'AD_CREATE', 'KEYWORD', ?, 'PREVIEW', ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON))
+  `, [operationId, String(profile.profileId), keyword.id, previewHash, adsOperationTokenHash(token), expiresAt, JSON.stringify({ keywordId: String(keyword.id) }), JSON.stringify(preview)]);
+  return { operationId, confirmationToken: token, expiresAt: expiresAt.toISOString(), preview };
+}
+
+function adsV3ResultId(data, resourceKey, idKey) {
+  const container = data?.[resourceKey] || data;
+  const success = adsArrayPayload(container, ["success", resourceKey]);
+  const item = success[0] || container?.success?.[0] || data?.success?.[0] || null;
+  const id = item?.[idKey] || item?.entityId || item?.id || "";
+  if (id) return String(id);
+  const errors = adsArrayPayload(container, ["error", "errors"]);
+  const detail = errors[0]?.errorValue?.message || errors[0]?.message || data?.message || "Amazon Ads 未返回对象 ID";
+  throw new Error(detail);
+}
+
+async function adsV3Create(pathname, mediaType, resourceKey, idKey, item) {
+  const data = await adsFetch(pathname, {}, {
+    requireProfile: true,
+    method: "POST",
+    headers: { accept: `application/vnd.${mediaType}.v3+json`, "content-type": `application/vnd.${mediaType}.v3+json` },
+    body: { [resourceKey]: [item] }
+  });
+  return { id: adsV3ResultId(data, resourceKey, idKey), response: data };
+}
+
+async function adsV3Update(pathname, mediaType, resourceKey, item) {
+  const data = await adsFetch(pathname, {}, {
+    requireProfile: true,
+    method: "PUT",
+    headers: { accept: `application/vnd.${mediaType}.v3+json`, "content-type": `application/vnd.${mediaType}.v3+json` },
+    body: { [resourceKey]: [item] }
+  });
+  const container = data?.[resourceKey] || data;
+  const errors = adsArrayPayload(container, ["error", "errors"]);
+  if (errors.length) throw new Error(errors[0]?.errorValue?.message || errors[0]?.message || "Amazon Ads 更新失败");
+  return data;
+}
+
+function adsPlacementBidding(campaign) {
+  return [
+    ["PLACEMENT_TOP", campaign.top_of_search_adjustment],
+    ["PLACEMENT_REST_OF_SEARCH", campaign.rest_of_search_adjustment],
+    ["PLACEMENT_PRODUCT_PAGE", campaign.product_page_adjustment]
+  ].map(([placement, percentage]) => ({ placement, percentage: Number(percentage || 0) }));
+}
+
+async function assertAdsWriteBoundary(profileId) {
+  const profile = await requireSelectedAdsProfile();
+  if (String(profile.profileId) !== String(profileId)) throw new Error("对象不属于当前 Profile");
+  const portfolio = await refreshManagedAdsPortfolio();
+  if (portfolio.status !== "READY" || !portfolio.portfolioId) throw new Error(portfolio.error || "AmzAllBlue_ERP 隔离检查未通过");
+  return { profile, portfolio };
+}
+
+async function syncAdsKeywordNames(keywordId) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [campaigns] = await pool.query("SELECT * FROM ads_campaigns WHERE keyword_id = ? AND profile_id = ?", [keywordId, String(profile.profileId)]);
+  if (!campaigns.some(item => item.amazon_campaign_id)) return;
+  await assertAdsWriteBoundary(profile.profileId);
+  for (const campaign of campaigns) {
+    if (campaign.amazon_campaign_id && campaign.amazon_campaign_name !== campaign.campaign_name) {
+      try {
+        await adsV3Update("/sp/campaigns", "spCampaign", "campaigns", { campaignId: String(campaign.amazon_campaign_id), name: campaign.campaign_name });
+        await pool.query("UPDATE ads_campaigns SET amazon_campaign_name = ?, sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [campaign.campaign_name, campaign.id]);
+      } catch (error) {
+        await pool.query("UPDATE ads_campaigns SET sync_status = 'INCOMPLETE', failed_step = 'RENAME_CAMPAIGN', last_error = ? WHERE id = ?", [error.message, campaign.id]);
+        throw error;
+      }
+    }
+    const [units] = await pool.query("SELECT * FROM ads_ad_units WHERE campaign_id = ?", [campaign.id]);
+    for (const unit of units) {
+      if (!unit.amazon_ad_group_id || unit.amazon_ad_group_name === unit.ad_group_name) continue;
+      try {
+        await adsV3Update("/sp/adGroups", "spAdGroup", "adGroups", { adGroupId: String(unit.amazon_ad_group_id), campaignId: String(campaign.amazon_campaign_id), name: unit.ad_group_name });
+        await pool.query("UPDATE ads_ad_units SET amazon_ad_group_name = ?, sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [unit.ad_group_name, unit.id]);
+      } catch (error) {
+        await pool.query("UPDATE ads_ad_units SET sync_status = 'INCOMPLETE', failed_step = 'RENAME_AD_GROUP', last_error = ? WHERE id = ?", [error.message, unit.id]);
+        throw error;
+      }
+    }
+  }
+}
+
+async function migrateLegacyAdsAsinNames(parentAsin, childAsin) {
+  const profile = await requireSelectedAdsProfile();
+  const parent = String(parentAsin || "").toUpperCase();
+  const child = String(childAsin || "").toUpperCase();
+  if (parent !== "B0GS752SQX" || child !== "B0GS6Y7LDG") throw new Error("本次仅允许修复已确认的 B0GS752SQX / B0GS6Y7LDG 历史命名");
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT c.*, k.parent_asin, k.keyword_text, k.keyword_group, u.id unit_id, u.child_asin unit_child_asin,
+      u.seller_sku unit_seller_sku, u.ad_group_name, u.amazon_ad_group_id, u.amazon_ad_group_name
+    FROM ads_campaigns c
+    JOIN ads_keywords k ON k.id = c.keyword_id
+    JOIN ads_ad_units u ON u.campaign_id = c.id
+    WHERE c.profile_id = ? AND k.parent_asin = ? AND u.child_asin = ?
+      AND (c.child_asin IS NULL OR c.child_asin <> ? OR c.campaign_name LIKE '%ASIN-LEGACY%')
+    ORDER BY c.id, u.id
+  `, [String(profile.profileId), parent, child, child]);
+  if (!rows.length) return { updated: 0, objects: [] };
+  await assertAdsWriteBoundary(profile.profileId);
+  const names = await readParentAsinMetadataMap();
+  const internalName = names.get(parent) || parent;
+  const objects = [];
+  for (const row of rows) {
+    const campaignName = buildAdsCampaignName(internalName, parent, child, row.keyword_text, row.keyword_group, row.match_type, row.creation_batch || "");
+    const adGroupName = buildAdsAdGroupName(campaignName, child, {
+      internalName, parentAsin: parent, keyword: row.keyword_text, group: row.keyword_group,
+      matchType: row.match_type, creationBatch: row.creation_batch || ""
+    });
+    await pool.query(`
+      UPDATE ads_campaigns SET child_asin = ?, seller_sku = ?, campaign_name = ?,
+        sync_status = IF(amazon_campaign_id IS NULL, 'LOCAL_ONLY', 'PENDING'), failed_step = NULL, last_error = NULL
+      WHERE id = ?
+    `, [child, row.unit_seller_sku, campaignName, row.id]);
+    await pool.query("UPDATE ads_ad_units SET ad_group_name = ?, sync_status = IF(amazon_ad_group_id IS NULL, 'LOCAL_ONLY', 'PENDING'), failed_step = NULL, last_error = NULL WHERE id = ?", [adGroupName, row.unit_id]);
+    try {
+      if (row.amazon_campaign_id && row.amazon_campaign_name !== campaignName) {
+        await adsV3Update("/sp/campaigns", "spCampaign", "campaigns", { campaignId: String(row.amazon_campaign_id), name: campaignName });
+        await pool.query("UPDATE ads_campaigns SET amazon_campaign_name = ?, sync_status = 'SYNCED' WHERE id = ?", [campaignName, row.id]);
+      }
+      if (row.amazon_ad_group_id && row.amazon_ad_group_name !== adGroupName) {
+        await adsV3Update("/sp/adGroups", "spAdGroup", "adGroups", { adGroupId: String(row.amazon_ad_group_id), campaignId: String(row.amazon_campaign_id), name: adGroupName });
+        await pool.query("UPDATE ads_ad_units SET amazon_ad_group_name = ?, sync_status = 'SYNCED' WHERE id = ?", [adGroupName, row.unit_id]);
+      }
+      objects.push({ campaignId: String(row.id), amazonCampaignId: row.amazon_campaign_id || "", campaignName, adGroupName, status: "SYNCED" });
+    } catch (error) {
+      await pool.query("UPDATE ads_campaigns SET sync_status = 'INCOMPLETE', failed_step = 'RENAME_LEGACY_ASIN', last_error = ? WHERE id = ?", [error.message, row.id]);
+      await pool.query("UPDATE ads_ad_units SET sync_status = 'INCOMPLETE', failed_step = 'RENAME_LEGACY_ASIN', last_error = ? WHERE id = ?", [error.message, row.unit_id]);
+      objects.push({ campaignId: String(row.id), amazonCampaignId: row.amazon_campaign_id || "", campaignName, adGroupName, status: "INCOMPLETE", error: error.message });
+    }
+  }
+  return { updated: objects.filter(item => item.status === "SYNCED").length, objects };
+}
+
+async function setAdsCampaignState(campaignLocalId, desiredState) {
+  const state = String(desiredState || "").toUpperCase();
+  if (!["ENABLED", "PAUSED"].includes(state)) throw new Error("广告状态不合法");
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_campaigns WHERE id = ? AND profile_id = ?", [campaignLocalId, String(profile.profileId)]);
+  const campaign = rows[0];
+  if (!campaign) throw new Error("Campaign 不存在");
+  await pool.query("UPDATE ads_campaigns SET desired_state = ?, sync_status = 'PENDING' WHERE id = ?", [state, campaign.id]);
+  if (!campaign.amazon_campaign_id) return { state, localOnly: true };
+  await assertAdsWriteBoundary(profile.profileId);
+  try {
+    await adsV3Update("/sp/campaigns", "spCampaign", "campaigns", { campaignId: String(campaign.amazon_campaign_id), state });
+    await pool.query("UPDATE ads_campaigns SET desired_state = ?, amazon_state = ?, sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [state, state, campaign.id]);
+    return { state };
+  } catch (error) {
+    await pool.query("UPDATE ads_campaigns SET sync_status = 'INCOMPLETE', failed_step = 'UPDATE_STATE', last_error = ? WHERE id = ?", [error.message, campaign.id]);
+    throw error;
+  }
+}
+
+async function setAdsKeywordState(keywordId, desiredState) {
+  const state = String(desiredState || "").toUpperCase();
+  if (!["ENABLED", "PAUSED"].includes(state)) throw new Error("关键词状态不合法");
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [keywords] = await pool.query("SELECT * FROM ads_keywords WHERE id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE'", [keywordId, String(profile.profileId)]);
+  if (!keywords[0]) throw new Error("关键词不存在或已停止");
+  const [campaigns] = await pool.query("SELECT id FROM ads_campaigns WHERE keyword_id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE' ORDER BY id", [keywordId, String(profile.profileId)]);
+  for (const campaign of campaigns) await setAdsCampaignState(campaign.id, state);
+  return { state, campaignCount: campaigns.length };
+}
+
+async function stopAdsCampaign(campaignLocalId) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_campaigns WHERE id = ? AND profile_id = ?", [campaignLocalId, String(profile.profileId)]);
+  const campaign = rows[0];
+  if (!campaign) throw new Error("Campaign 不存在");
+  if (campaign.lifecycle_status === "STOPPED") return { status: "STOPPED", alreadyStopped: true };
+  await pool.query("UPDATE ads_campaigns SET lifecycle_status = 'STOPPING', sync_status = 'PENDING', failed_step = NULL, last_error = NULL WHERE id = ?", [campaign.id]);
+  try {
+    await setAdsCampaignState(campaign.id, "PAUSED");
+    await pool.query("UPDATE ads_campaigns SET lifecycle_status = 'STOPPED', stopped_at = CURRENT_TIMESTAMP, sync_status = 'SYNCED' WHERE id = ?", [campaign.id]);
+    return { status: "STOPPED" };
+  } catch (error) {
+    await pool.query("UPDATE ads_campaigns SET lifecycle_status = 'ACTIVE', sync_status = 'INCOMPLETE', failed_step = 'STOP_CAMPAIGN', last_error = ? WHERE id = ?", [error.message, campaign.id]);
+    throw error;
+  }
+}
+
+async function stopAdsKeyword(keywordId) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [keywords] = await pool.query("SELECT * FROM ads_keywords WHERE id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE'", [keywordId, String(profile.profileId)]);
+  const keyword = keywords[0];
+  if (!keyword) throw new Error("关键词不存在或已停止");
+  await pool.query("UPDATE ads_keywords SET lifecycle_status = 'STOPPING' WHERE id = ?", [keyword.id]);
+  try {
+    const [campaigns] = await pool.query("SELECT id, lifecycle_status FROM ads_campaigns WHERE keyword_id = ? AND profile_id = ? ORDER BY id", [keyword.id, String(profile.profileId)]);
+    for (const campaign of campaigns) {
+      if (campaign.lifecycle_status !== 'STOPPED') await stopAdsCampaign(campaign.id);
+    }
+    await pool.query("UPDATE ads_keywords SET lifecycle_status = 'STOPPED', stopped_at = CURRENT_TIMESTAMP, active_scope_key = NULL WHERE id = ?", [keyword.id]);
+    return { status: 'STOPPED', campaignCount: campaigns.length };
+  } catch (error) {
+    await pool.query("UPDATE ads_keywords SET lifecycle_status = 'ACTIVE' WHERE id = ?", [keyword.id]);
+    throw error;
+  }
+}
+
+async function updateAdsCampaignSettings(campaignLocalId, body = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_campaigns WHERE id = ? AND profile_id = ?", [campaignLocalId, String(profile.profileId)]);
+  const campaign = rows[0];
+  if (!campaign) throw new Error("Campaign 不存在");
+  const dailyBudget = Number(body.dailyBudget);
+  const topAdjustment = Number(body.topOfSearchAdjustment);
+  const restAdjustment = Number(body.restOfSearchAdjustment);
+  const productPageAdjustment = Number(body.productPageAdjustment);
+  const adjustments = [topAdjustment, restAdjustment, productPageAdjustment];
+  if (!(dailyBudget > 0) || adjustments.some(value => !Number.isInteger(value) || value < 0 || value > 900)) throw new Error("预算或位置加价不合法");
+  await pool.query(`UPDATE ads_campaigns
+    SET daily_budget = ?, top_of_search_adjustment = ?, rest_of_search_adjustment = ?, product_page_adjustment = ?, sync_status = 'PENDING'
+    WHERE id = ?`, [dailyBudget, topAdjustment, restAdjustment, productPageAdjustment, campaign.id]);
+  const updated = { ...campaign, daily_budget: dailyBudget, top_of_search_adjustment: topAdjustment, rest_of_search_adjustment: restAdjustment, product_page_adjustment: productPageAdjustment };
+  if (!campaign.amazon_campaign_id) return { localOnly: true };
+  await assertAdsWriteBoundary(profile.profileId);
+  try {
+    await adsV3Update("/sp/campaigns", "spCampaign", "campaigns", {
+      campaignId: String(campaign.amazon_campaign_id),
+      budget: { budget: dailyBudget, budgetType: "DAILY" },
+      dynamicBidding: { strategy: "LEGACY_FOR_SALES", placementBidding: adsPlacementBidding(updated) }
+    });
+    await pool.query("UPDATE ads_campaigns SET sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [campaign.id]);
+    return { dailyBudget, topOfSearchAdjustment: topAdjustment, restOfSearchAdjustment: restAdjustment, productPageAdjustment };
+  } catch (error) {
+    await pool.query("UPDATE ads_campaigns SET sync_status = 'INCOMPLETE', failed_step = 'UPDATE_SETTINGS', last_error = ? WHERE id = ?", [error.message, campaign.id]);
+    throw error;
+  }
+}
+
+async function updateAdsAdUnitBid(unitLocalId, body = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`SELECT u.*, c.amazon_campaign_id
+    FROM ads_ad_units u JOIN ads_campaigns c ON c.id = u.campaign_id
+    WHERE u.id = ? AND u.profile_id = ?`, [unitLocalId, String(profile.profileId)]);
+  const unit = rows[0];
+  if (!unit) throw new Error("投放单元不存在");
+  const bid = Number(body.bid);
+  if (!(bid > 0)) throw new Error("出价必须大于 0");
+  await pool.query("UPDATE ads_ad_units SET bid = ?, sync_status = 'PENDING' WHERE id = ?", [bid, unit.id]);
+  if (!unit.amazon_ad_group_id || !unit.amazon_target_id) return { bid, localOnly: true };
+  await assertAdsWriteBoundary(profile.profileId);
+  try {
+    await adsV3Update("/sp/adGroups", "spAdGroup", "adGroups", {
+      adGroupId: String(unit.amazon_ad_group_id), campaignId: String(unit.amazon_campaign_id), defaultBid: bid
+    });
+    await adsV3Update("/sp/keywords", "spKeyword", "keywords", {
+      keywordId: String(unit.amazon_target_id), campaignId: String(unit.amazon_campaign_id), adGroupId: String(unit.amazon_ad_group_id), bid
+    });
+    await pool.query("UPDATE ads_ad_units SET sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [unit.id]);
+    return { bid };
+  } catch (error) {
+    await pool.query("UPDATE ads_ad_units SET sync_status = 'INCOMPLETE', failed_step = 'UPDATE_BID', last_error = ? WHERE id = ?", [error.message, unit.id]);
+    throw error;
+  }
+}
+
+async function setAdsAdUnitState(unitLocalId, desiredState) {
+  const state = String(desiredState || "").toUpperCase();
+  if (!["ENABLED", "PAUSED"].includes(state)) throw new Error("广告状态不合法");
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT u.*, c.amazon_campaign_id FROM ads_ad_units u
+    JOIN ads_campaigns c ON c.id = u.campaign_id
+    WHERE u.id = ? AND u.profile_id = ?
+  `, [unitLocalId, String(profile.profileId)]);
+  const unit = rows[0];
+  if (!unit) throw new Error("投放单元不存在");
+  await pool.query("UPDATE ads_ad_units SET desired_state = ?, lifecycle_status = ?, sync_status = 'PENDING' WHERE id = ?", [state, state === "PAUSED" ? "PAUSED" : "ACTIVE", unit.id]);
+  if (!unit.amazon_ad_group_id) return { state, localOnly: true };
+  await assertAdsWriteBoundary(profile.profileId);
+  const steps = [
+    ["AD_GROUP", "/sp/adGroups", "spAdGroup", "adGroups", { adGroupId: String(unit.amazon_ad_group_id), campaignId: String(unit.amazon_campaign_id), state }, "amazon_ad_group_state"],
+    ["PRODUCT_AD", "/sp/productAds", "spProductAd", "productAds", { adId: String(unit.amazon_product_ad_id), campaignId: String(unit.amazon_campaign_id), adGroupId: String(unit.amazon_ad_group_id), state }, "amazon_product_ad_state"],
+    ["KEYWORD_TARGET", "/sp/keywords", "spKeyword", "keywords", { keywordId: String(unit.amazon_target_id), campaignId: String(unit.amazon_campaign_id), adGroupId: String(unit.amazon_ad_group_id), state }, "amazon_target_state"]
+  ];
+  for (const [step, path, media, key, payload, stateColumn] of steps) {
+    if (Object.values(payload).some(value => !value)) continue;
+    try {
+      await adsV3Update(path, media, key, payload);
+      await pool.query(`UPDATE ads_ad_units SET ${stateColumn} = ?, amazon_state = ?, sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?`, [state, state, unit.id]);
+    } catch (error) {
+      await pool.query("UPDATE ads_ad_units SET sync_status = 'INCOMPLETE', failed_step = ?, last_error = ? WHERE id = ?", [`PAUSE_${step}`, error.message, unit.id]);
+      throw error;
+    }
+  }
+  return { state };
+}
+
+async function rememberAdsOperationStep(operationId, stepKey, stepOrder, entityType, localEntityId, status, values = {}) {
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO ads_operation_steps (
+      operation_id, step_key, step_order, entity_type, local_entity_id, amazon_entity_id,
+      status, attempts, request_payload, response_payload, last_error, started_at, completed_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, CAST(? AS JSON), CAST(? AS JSON), ?, NOW(), ?)
+    ON DUPLICATE KEY UPDATE amazon_entity_id = VALUES(amazon_entity_id), status = VALUES(status),
+      attempts = attempts + 1, request_payload = VALUES(request_payload), response_payload = VALUES(response_payload),
+      last_error = VALUES(last_error), started_at = COALESCE(started_at, NOW()), completed_at = VALUES(completed_at)
+  `, [
+    operationId, stepKey, stepOrder, entityType, localEntityId || null, values.amazonEntityId || null, status,
+    JSON.stringify(values.request || null), JSON.stringify(values.response || null), values.error || null,
+    status === "COMPLETE" ? new Date() : null
+  ]);
+}
+
+async function executeAdsCreationOperation(operationId, preview) {
+  const profile = await requireSelectedAdsProfile();
+  if (String(profile.profileId) !== String(preview.profile.profileId)) throw new Error("当前 Profile 已变化，请重新预览");
+  let portfolio = await refreshManagedAdsPortfolio();
+  const pool = getMysqlPool();
+  let stepOrder = 0;
+  if (portfolio.status === "MISSING") {
+    const request = { name: ADS_MANAGED_PORTFOLIO_NAME, state: "enabled" };
+    try {
+      const created = await adsV3Create("/portfolios", "portfolio", "portfolios", "portfolioId", request);
+      await writeManagedAdsPortfolio(profile, { portfolioId: created.id }, "READY", 0, "");
+      await rememberAdsOperationStep(operationId, "portfolio:create", ++stepOrder, "PORTFOLIO", null, "COMPLETE", { amazonEntityId: created.id, request, response: created.response });
+      portfolio = await readManagedAdsPortfolio(profile.profileId);
+    } catch (error) {
+      await rememberAdsOperationStep(operationId, "portfolio:create", ++stepOrder, "PORTFOLIO", null, "FAILED", { request, error: error.message });
+      throw error;
+    }
+  }
+  if (portfolio.status !== "READY" || !portfolio.portfolioId) throw new Error(portfolio.error || "AmzAllBlue_ERP 尚未就绪");
+  for (const campaignPreview of preview.campaigns) {
+    const [campaignRows] = await pool.query("SELECT * FROM ads_campaigns WHERE id = ? AND profile_id = ?", [campaignPreview.localId, String(profile.profileId)]);
+    const campaign = campaignRows[0];
+    if (!campaign) throw new Error("本地 Campaign 不存在");
+    let campaignId = campaign.amazon_campaign_id ? String(campaign.amazon_campaign_id) : "";
+    if (!campaignId) {
+      const request = {
+        name: campaign.campaign_name, state: String(campaign.desired_state).toUpperCase(), targetingType: "MANUAL",
+        budget: { budget: Number(campaign.daily_budget), budgetType: "DAILY" },
+        startDate: adsDateValue(campaign.start_date),
+        dynamicBidding: {
+          strategy: "LEGACY_FOR_SALES",
+          placementBidding: adsPlacementBidding(campaign)
+        },
+        portfolioId: portfolio.portfolioId
+      };
+      try {
+        const created = await adsV3Create("/sp/campaigns", "spCampaign", "campaigns", "campaignId", request);
+        campaignId = created.id;
+        await pool.query(`UPDATE ads_campaigns SET portfolio_id = ?, amazon_campaign_id = ?, amazon_campaign_name = ?, amazon_state = ?, creation_status = 'CAMPAIGN_CREATED', sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?`, [portfolio.portfolioId, campaignId, campaign.campaign_name, campaign.desired_state, campaign.id]);
+        await rememberAdsOperationStep(operationId, `campaign:${campaign.id}`, ++stepOrder, "CAMPAIGN", campaign.id, "COMPLETE", { amazonEntityId: campaignId, request, response: created.response });
+      } catch (error) {
+        await pool.query("UPDATE ads_campaigns SET creation_status = 'INCOMPLETE', failed_step = 'CAMPAIGN', last_error = ? WHERE id = ?", [error.message, campaign.id]);
+        await rememberAdsOperationStep(operationId, `campaign:${campaign.id}`, ++stepOrder, "CAMPAIGN", campaign.id, "FAILED", { request, error: error.message });
+        throw error;
+      }
+    }
+    const [units] = await pool.query("SELECT * FROM ads_ad_units WHERE campaign_id = ? ORDER BY id", [campaign.id]);
+    for (const unit of units) {
+      let adGroupId = unit.amazon_ad_group_id ? String(unit.amazon_ad_group_id) : "";
+      if (!adGroupId) {
+        const request = { campaignId, name: unit.ad_group_name, state: unit.desired_state, defaultBid: Number(unit.bid) };
+        try {
+          const created = await adsV3Create("/sp/adGroups", "spAdGroup", "adGroups", "adGroupId", request);
+          adGroupId = created.id;
+          await pool.query("UPDATE ads_ad_units SET amazon_ad_group_id = ?, amazon_ad_group_name = ?, amazon_ad_group_state = ?, creation_status = 'AD_GROUP_CREATED', failed_step = NULL, last_error = NULL WHERE id = ?", [adGroupId, unit.ad_group_name, unit.desired_state, unit.id]);
+          await rememberAdsOperationStep(operationId, `ad-group:${unit.id}`, ++stepOrder, "AD_GROUP", unit.id, "COMPLETE", { amazonEntityId: adGroupId, request, response: created.response });
+        } catch (error) {
+          await pool.query("UPDATE ads_ad_units SET creation_status = 'INCOMPLETE', failed_step = 'AD_GROUP', last_error = ? WHERE id = ?", [error.message, unit.id]);
+          await rememberAdsOperationStep(operationId, `ad-group:${unit.id}`, ++stepOrder, "AD_GROUP", unit.id, "FAILED", { request, error: error.message });
+          throw error;
+        }
+      }
+      let productAdId = unit.amazon_product_ad_id ? String(unit.amazon_product_ad_id) : "";
+      if (!productAdId) {
+        const request = { campaignId, adGroupId, sku: unit.seller_sku, state: unit.desired_state };
+        try {
+          const created = await adsV3Create("/sp/productAds", "spProductAd", "productAds", "adId", request);
+          productAdId = created.id;
+          await pool.query("UPDATE ads_ad_units SET amazon_product_ad_id = ?, amazon_product_ad_state = ?, creation_status = 'PRODUCT_AD_CREATED', failed_step = NULL, last_error = NULL WHERE id = ?", [productAdId, unit.desired_state, unit.id]);
+          await rememberAdsOperationStep(operationId, `product-ad:${unit.id}`, ++stepOrder, "PRODUCT_AD", unit.id, "COMPLETE", { amazonEntityId: productAdId, request, response: created.response });
+        } catch (error) {
+          await pool.query("UPDATE ads_ad_units SET creation_status = 'INCOMPLETE', failed_step = 'PRODUCT_AD', last_error = ? WHERE id = ?", [error.message, unit.id]);
+          await rememberAdsOperationStep(operationId, `product-ad:${unit.id}`, ++stepOrder, "PRODUCT_AD", unit.id, "FAILED", { request, error: error.message });
+          throw error;
+        }
+      }
+      if (!unit.amazon_target_id) {
+        const request = { campaignId, adGroupId, keywordText: preview.keyword.text, matchType: campaign.match_type, bid: Number(unit.bid), state: unit.desired_state };
+        try {
+          const created = await adsV3Create("/sp/keywords", "spKeyword", "keywords", "keywordId", request);
+          await pool.query("UPDATE ads_ad_units SET amazon_target_id = ?, amazon_target_state = ?, amazon_state = ?, creation_status = 'COMPLETE', sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [created.id, unit.desired_state, unit.desired_state, unit.id]);
+          await rememberAdsOperationStep(operationId, `keyword-target:${unit.id}`, ++stepOrder, "KEYWORD_TARGET", unit.id, "COMPLETE", { amazonEntityId: created.id, request, response: created.response });
+        } catch (error) {
+          await pool.query("UPDATE ads_ad_units SET creation_status = 'INCOMPLETE', failed_step = 'KEYWORD_TARGET', last_error = ? WHERE id = ?", [error.message, unit.id]);
+          await rememberAdsOperationStep(operationId, `keyword-target:${unit.id}`, ++stepOrder, "KEYWORD_TARGET", unit.id, "FAILED", { request, error: error.message });
+          throw error;
+        }
+      }
+    }
+    await pool.query("UPDATE ads_campaigns SET creation_status = 'COMPLETE', sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [campaign.id]);
+  }
+  return { status: "COMPLETE" };
+}
+
+async function confirmAdsCreationOperation(operationId, token, options = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_operations WHERE id = ? AND profile_id = ?", [operationId, String(profile.profileId)]);
+  const operation = rows[0];
+  if (!operation) throw new Error("创建预览不存在");
+  if (!["PREVIEW", "FAILED"].includes(operation.status)) throw new Error(`该操作当前状态为 ${operation.status}`);
+  if (!operation.confirmation_expires_at || new Date(operation.confirmation_expires_at).getTime() < Date.now()) throw new Error("确认预览已过期，请重新生成");
+  if (operation.confirmation_token_hash !== adsOperationTokenHash(token)) throw new Error("确认凭证无效");
+  const preview = parseMysqlJson(operation.preview_payload);
+  const previewHash = adsPreviewHash(preview);
+  if (previewHash !== operation.preview_hash) throw new Error("预览参数已变化，请重新生成");
+  await pool.query("UPDATE ads_operations SET status = 'RUNNING', confirmed_at = NOW(), started_at = NOW(), last_error = NULL WHERE id = ?", [operationId]);
+  const run = async () => {
+    try {
+    const result = await executeAdsCreationOperation(operationId, preview);
+    await pool.query("UPDATE ads_operations SET status = 'COMPLETE', completed_at = NOW(), current_step = NULL WHERE id = ?", [operationId]);
+    await pool.query("UPDATE ads_keywords SET lifecycle_status = 'ACTIVE' WHERE id = ? AND profile_id = ? AND lifecycle_status = 'CREATING'", [preview.keyword.id, String(profile.profileId)]);
+    await pool.query(`
+      UPDATE ads_creation_templates t
+      JOIN ads_campaigns c ON c.profile_id = t.profile_id
+      JOIN ads_ad_units u ON u.campaign_id = c.id
+      SET t.daily_budget = c.daily_budget, t.default_bid = u.bid, t.top_of_search_adjustment = c.top_of_search_adjustment,
+        t.rest_of_search_adjustment = c.rest_of_search_adjustment, t.product_page_adjustment = c.product_page_adjustment
+      WHERE t.profile_id = ? AND c.keyword_id = ?
+    `, [String(profile.profileId), preview.keyword.id]);
+      return result;
+    } catch (error) {
+    await pool.query("UPDATE ads_operations SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, operationId]);
+    await pool.query("UPDATE ads_keywords SET lifecycle_status = 'ACTIVE' WHERE id = ? AND profile_id = ? AND lifecycle_status = 'CREATING'", [preview.keyword.id, String(profile.profileId)]);
+      throw error;
+    }
+  };
+  if (options.background) {
+    void run().catch(() => {});
+    return { status: "RUNNING" };
+  }
+  return run();
+}
+
+async function readAdsCreationOperationStatus(operationId) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT id, entity_id, status, current_step, last_error, confirmation_expires_at,
+      confirmed_at, started_at, completed_at, created_at, updated_at
+    FROM ads_operations
+    WHERE id = ? AND profile_id = ? AND operation_type = 'AD_CREATE'
+  `, [operationId, String(profile.profileId)]);
+  const operation = rows[0];
+  if (!operation) throw new Error("创建操作不存在");
+  const [steps] = await pool.query(`
+    SELECT step_key, step_order, entity_type, local_entity_id, amazon_entity_id,
+      status, attempts, last_error, started_at, completed_at
+    FROM ads_operation_steps
+    WHERE operation_id = ?
+    ORDER BY step_order, id
+  `, [operationId]);
+  return {
+    operationId: operation.id,
+    keywordId: String(operation.entity_id || ""),
+    status: operation.status,
+    currentStep: operation.current_step || "",
+    error: operation.last_error || "",
+    confirmationExpiresAt: operation.confirmation_expires_at,
+    confirmedAt: operation.confirmed_at,
+    startedAt: operation.started_at,
+    completedAt: operation.completed_at,
+    createdAt: operation.created_at,
+    updatedAt: operation.updated_at,
+    steps: steps.map(step => ({
+      key: step.step_key,
+      order: Number(step.step_order),
+      entityType: step.entity_type,
+      localEntityId: step.local_entity_id ? String(step.local_entity_id) : "",
+      amazonEntityId: step.amazon_entity_id || "",
+      status: step.status,
+      attempts: Number(step.attempts || 0),
+      error: step.last_error || "",
+      startedAt: step.started_at,
+      completedAt: step.completed_at
+    }))
+  };
+}
+
+function adsReportMetric(row, keys) {
+  for (const key of keys) {
+    if (row[key] !== undefined && row[key] !== null && row[key] !== "") return Number(row[key]) || 0;
+  }
+  return 0;
+}
+
+function adsReportConfiguration(kind) {
+  if (kind === "PLACEMENT") {
+    return {
+      adProduct: "SPONSORED_PRODUCTS",
+      groupBy: ["campaignPlacement"],
+      columns: ["date", "campaignId", "impressions", "clicks", "cost", "purchases7d", "unitsSoldClicks7d", "sales7d"],
+      reportTypeId: "spCampaigns",
+      timeUnit: "DAILY",
+      format: "GZIP_JSON"
+    };
+  }
+  return {
+    adProduct: "SPONSORED_PRODUCTS",
+    groupBy: ["adGroup"],
+    columns: ["date", "adGroupId", "impressions", "clicks", "cost", "purchases7d", "unitsSoldClicks7d", "sales7d"],
+    reportTypeId: "spCampaigns",
+    timeUnit: "DAILY",
+    format: "GZIP_JSON"
+  };
+}
+
+async function downloadAdsReportRows(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`广告报表下载失败 ${response.status}`);
+  let buffer = Buffer.from(await response.arrayBuffer());
+  if (buffer[0] === 0x1f && buffer[1] === 0x8b) buffer = gunzipSync(buffer);
+  const parsed = JSON.parse(buffer.toString("utf8") || "[]");
+  return Array.isArray(parsed) ? parsed : adsArrayPayload(parsed, ["rows", "data"]);
+}
+
+async function saveAdsReportRows(profileId, kind, rows) {
+  const pool = getMysqlPool();
+  if (kind === "PLACEMENT") {
+    const [campaignRows] = await pool.query("SELECT id, amazon_campaign_id FROM ads_campaigns WHERE profile_id = ? AND amazon_campaign_id IS NOT NULL", [String(profileId)]);
+    const campaignByAmazonId = new Map(campaignRows.map(row => [String(row.amazon_campaign_id), row.id]));
+    for (const row of rows) {
+      const campaignId = campaignByAmazonId.get(String(row.campaignId || ""));
+      const date = String(row.date || "").slice(0, 10);
+      const placement = String(row.placementClassification || row.placement || "OTHER");
+      if (!campaignId || !date) continue;
+      await pool.query(`
+        INSERT INTO ads_placement_performance_daily (
+          date, campaign_id, placement, impressions, clicks, spend, orders_count, units_sold, sales, synced_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+        ON DUPLICATE KEY UPDATE impressions = VALUES(impressions), clicks = VALUES(clicks), spend = VALUES(spend),
+          orders_count = VALUES(orders_count), units_sold = VALUES(units_sold), sales = VALUES(sales), synced_at = VALUES(synced_at)
+      `, [date, campaignId, placement, adsReportMetric(row, ["impressions"]), adsReportMetric(row, ["clicks"]), adsReportMetric(row, ["cost", "spend"]), adsReportMetric(row, ["purchases7d", "orders7d"]), adsReportMetric(row, ["unitsSoldClicks7d", "unitsSold7d"]), adsReportMetric(row, ["sales7d", "sales"])]);
+    }
+    return;
+  }
+  const [unitRows] = await pool.query("SELECT id, amazon_ad_group_id FROM ads_ad_units WHERE profile_id = ? AND amazon_ad_group_id IS NOT NULL", [String(profileId)]);
+  const unitByAdGroup = new Map(unitRows.map(row => [String(row.amazon_ad_group_id), row.id]));
+  for (const row of rows) {
+    const unitId = unitByAdGroup.get(String(row.adGroupId || ""));
+    const date = String(row.date || "").slice(0, 10);
+    if (!unitId || !date) continue;
+    await pool.query(`
+      INSERT INTO ads_performance_daily (
+        date, ad_unit_id, impressions, clicks, spend, orders_count, units_sold, sales, synced_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())
+      ON DUPLICATE KEY UPDATE impressions = VALUES(impressions), clicks = VALUES(clicks), spend = VALUES(spend),
+        orders_count = VALUES(orders_count), units_sold = VALUES(units_sold), sales = VALUES(sales), synced_at = VALUES(synced_at)
+    `, [date, unitId, adsReportMetric(row, ["impressions"]), adsReportMetric(row, ["clicks"]), adsReportMetric(row, ["cost", "spend"]), adsReportMetric(row, ["purchases7d", "orders7d"]), adsReportMetric(row, ["unitsSoldClicks7d", "unitsSold7d"]), adsReportMetric(row, ["sales7d", "sales"])]);
+  }
+}
+
+async function runAdsSyncJob(jobId) {
+  const pool = getMysqlPool();
+  const [rows] = await pool.query("SELECT * FROM ads_sync_jobs WHERE id = ?", [jobId]);
+  const job = rows[0];
+  if (!job) return;
+  await pool.query("UPDATE ads_sync_jobs SET status = 'RUNNING', started_at = NOW(), attempts = attempts + 1 WHERE id = ?", [jobId]);
+  try {
+    const configuration = adsReportConfiguration(job.report_type);
+    const created = await adsFetch("/reporting/reports", {}, {
+      requireProfile: true,
+      profileId: job.profile_id,
+      method: "POST",
+      headers: {
+        accept: "application/vnd.createasyncreportrequest.v3+json",
+        "content-type": "application/vnd.createasyncreportrequest.v3+json"
+      },
+      body: {
+        name: `AmzAllBlue ERP ${job.report_type} ${adsDateValue(job.start_date)} ${adsDateValue(job.end_date)}`,
+        startDate: adsDateValue(job.start_date), endDate: adsDateValue(job.end_date), configuration
+      }
+    });
+    const reportId = String(created.reportId || created.report?.reportId || "");
+    if (!reportId) throw new Error("Amazon Ads 未返回 reportId");
+    await pool.query("UPDATE ads_sync_jobs SET amazon_report_id = ? WHERE id = ?", [reportId, jobId]);
+    let report = null;
+    for (let attempt = 0; attempt < 60; attempt += 1) {
+      report = await adsFetch(`/reporting/reports/${encodeURIComponent(reportId)}`, {}, { requireProfile: true, profileId: job.profile_id });
+      const status = String(report.status || "").toUpperCase();
+      if (["COMPLETED", "SUCCESS"].includes(status) && report.url) break;
+      if (["FAILURE", "FAILED", "CANCELLED"].includes(status)) throw new Error(report.failureReason || `广告报表状态 ${status}`);
+      await wait(Math.min(30_000, 3000 + attempt * 1000));
+    }
+    if (!report?.url) throw new Error("等待广告报表完成超时");
+    const reportRows = await downloadAdsReportRows(report.url);
+    await saveAdsReportRows(job.profile_id, job.report_type, reportRows);
+    const dates = dateRangeInclusive(adsDateValue(job.start_date), adsDateValue(job.end_date));
+    for (const date of dates) {
+      await pool.query(`
+        INSERT INTO ads_sync_dates (profile_id, date, report_type, status, last_job_id, synced_at)
+        VALUES (?, ?, ?, 'COMPLETE', ?, NOW())
+        ON DUPLICATE KEY UPDATE status = 'COMPLETE', last_job_id = VALUES(last_job_id), synced_at = NOW(), last_error = NULL
+      `, [String(job.profile_id), date, job.report_type, jobId]);
+    }
+    await pool.query("UPDATE ads_sync_jobs SET status = 'COMPLETE', active_dedupe_key = NULL, completed_at = NOW(), last_error = NULL WHERE id = ?", [jobId]);
+  } catch (error) {
+    await pool.query("UPDATE ads_sync_jobs SET status = 'FAILED', active_dedupe_key = NULL, completed_at = NOW(), last_error = ? WHERE id = ?", [error.message, jobId]);
+  }
+}
+
+async function enqueueAdsSync(startDate, endDate) {
+  const profile = await requireSelectedAdsProfile();
+  const portfolio = await readManagedAdsPortfolio(profile.profileId);
+  if (portfolio?.status !== "READY") throw new Error(portfolio?.error || "AmzAllBlue_ERP 尚未就绪");
+  const pool = getMysqlPool();
+  const [managedRows] = await pool.query("SELECT COUNT(*) count FROM ads_ad_units WHERE profile_id = ? AND amazon_ad_group_id IS NOT NULL", [String(profile.profileId)]);
+  if (!Number(managedRows[0]?.count || 0)) return { jobs: [], message: "还没有已创建的受管广告，无需同步" };
+  const safeEnd = String(endDate || formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE)).slice(0, 10);
+  const safeStart = String(startDate || addDays(safeEnd, -29)).slice(0, 10);
+  const jobs = [];
+  // 关键词历史图只依赖 Ad Group 的每日表现；一个报表覆盖当前 Profile 内所有受管 Ad Group，
+  // 再由本地 ID 映射汇总到子 ASIN 和关键词。展示位置数据改为后续单独同步，避免每次同步多等一份报表。
+  for (const kind of ["AD_GROUP"]) {
+    const id = randomUUID();
+    const dedupeKey = `${profile.profileId}|${kind}|${safeStart}|${safeEnd}`;
+    try {
+      await pool.query(`
+        INSERT INTO ads_sync_jobs (id, profile_id, report_type, start_date, end_date, active_dedupe_key)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `, [id, String(profile.profileId), kind, safeStart, safeEnd, dedupeKey]);
+      jobs.push({ id, kind, status: "QUEUED" });
+      runAdsSyncJob(id).catch(() => {});
+    } catch (error) {
+      if (error?.code !== "ER_DUP_ENTRY") throw error;
+      const [existing] = await pool.query("SELECT id, report_type, status FROM ads_sync_jobs WHERE active_dedupe_key = ?", [dedupeKey]);
+      if (existing[0]) jobs.push({ id: existing[0].id, kind: existing[0].report_type, status: existing[0].status });
+    }
+  }
+  return { jobs, range: { startDate: safeStart, endDate: safeEnd } };
+}
+
+async function adsSyncStatus() {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [jobs] = await pool.query("SELECT id, report_type, start_date, end_date, status, attempts, last_error, created_at, completed_at FROM ads_sync_jobs WHERE profile_id = ? ORDER BY created_at DESC LIMIT 20", [String(profile.profileId)]);
+  const [dates] = await pool.query("SELECT date, report_type, status, synced_at FROM ads_sync_dates WHERE profile_id = ? ORDER BY date DESC LIMIT 180", [String(profile.profileId)]);
+  return {
+    jobs: jobs.map(row => ({ id: row.id, kind: row.report_type, startDate: adsDateValue(row.start_date), endDate: adsDateValue(row.end_date), status: row.status, attempts: Number(row.attempts || 0), error: row.last_error || "", createdAt: row.created_at, completedAt: row.completed_at })),
+    dates: dates.map(row => ({ date: adsDateValue(row.date), kind: row.report_type, status: row.status, syncedAt: row.synced_at }))
+  };
+}
+
+function startAdsPerformanceSchedule() {
+  if (adsHourlySyncTimer || adsRollingSyncTimer) return;
+  const hourlyMs = Math.max(5 * 60_000, Number(process.env.AMZ_ADS_HOURLY_SYNC_MS || 60 * 60_000));
+  const dailyMs = Math.max(60 * 60_000, Number(process.env.AMZ_ADS_ROLLING_SYNC_MS || 24 * 60 * 60_000));
+  const runToday = async () => {
+    try {
+      const profile = await readAdsProfileSelection();
+      if (!profile?.profileId) return;
+      const today = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+      await enqueueAdsSync(today, today);
+    } catch (error) {
+      console.error(`Amazon Ads hourly sync failed: ${error.message}`);
+    }
+  };
+  const runRolling = async () => {
+    try {
+      const profile = await readAdsProfileSelection();
+      if (!profile?.profileId) return;
+      const endDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+      await enqueueAdsSync(addDays(endDate, -29), endDate);
+    } catch (error) {
+      console.error(`Amazon Ads rolling sync failed: ${error.message}`);
+    }
+  };
+  adsHourlySyncTimer = setInterval(runToday, hourlyMs);
+  adsRollingSyncTimer = setInterval(runRolling, dailyMs);
+  setTimeout(runToday, Number(process.env.AMZ_ADS_STARTUP_SYNC_DELAY_MS || 90_000));
+  setTimeout(runRolling, Number(process.env.AMZ_ADS_STARTUP_ROLLING_DELAY_MS || 180_000));
+}
+
 async function markGmailMessagesRead(messageIds = []) {
   const ids = messageIds.filter(Boolean);
   if (!ids.length) return null;
@@ -5037,6 +7047,165 @@ async function handleApi(req, res, url) {
     if (!profile) return sendJson(res, { error: "Profile not found" }, 404);
     await writeAdsProfileSelection(profile);
     return sendJson(res, { profile });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/managed-portfolio") {
+    const profile = await requireSelectedAdsProfile();
+    const refresh = url.searchParams.get("refresh") === "1";
+    const portfolio = refresh ? await refreshManagedAdsPortfolio() : await readManagedAdsPortfolio(profile.profileId);
+    return sendJson(res, { portfolio });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/workspace") {
+    return sendJson(res, await readAdsWorkspace(url.searchParams.get("startDate") || "", url.searchParams.get("endDate") || ""));
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/dates") {
+    return sendJson(res, await readAdsDateStatus());
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/products/reorder") {
+    await requireSelectedAdsProfile();
+    const body = await parseBody(req);
+    await saveAdsParentAsinOrder(body.parentAsins);
+    return sendJson(res, { products: await readAdsProductCatalog() });
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/template") {
+    const profile = await requireSelectedAdsProfile();
+    return sendJson(res, { template: await ensureAdsCreationTemplate(profile) });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/keywords") {
+    const result = await createAdsKeywordDraft(await parseBody(req));
+    return sendJson(res, result, 201);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/keywords/create-now") {
+    return sendJson(res, await createAndStartAdsKeywordBatch(await parseBody(req)), 202);
+  }
+
+  const adsKeywordHistoryMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/history$/);
+  if (req.method === "GET" && adsKeywordHistoryMatch) {
+    return sendJson(res, await readAdsKeywordHistory(adsKeywordHistoryMatch[1], {
+      startDate: url.searchParams.get("startDate") || "",
+      endDate: url.searchParams.get("endDate") || "",
+      childAsin: url.searchParams.get("childAsin") || "",
+      matchType: url.searchParams.get("matchType") || ""
+    }));
+  }
+
+  const adsKeywordGroupMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/group$/);
+  if (req.method === "PUT" && adsKeywordGroupMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await updateAdsKeywordGroup(adsKeywordGroupMatch[1], body.group));
+  }
+
+  const adsKeywordStateMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/state$/);
+  if (req.method === "PUT" && adsKeywordStateMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await setAdsKeywordState(adsKeywordStateMatch[1], body.state));
+  }
+
+  const adsKeywordStopMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/stop$/);
+  if (req.method === "POST" && adsKeywordStopMatch) {
+    return sendJson(res, await stopAdsKeyword(adsKeywordStopMatch[1]));
+  }
+
+  const adsKeywordMatchAdd = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/matches$/);
+  if (req.method === "POST" && adsKeywordMatchAdd) {
+    const body = await parseBody(req);
+    return sendJson(res, await createAdsAdditionalMatchDraft(adsKeywordMatchAdd[1], body.matchType), 201);
+  }
+
+  const adsKeywordDraftMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)$/);
+  if (req.method === "DELETE" && adsKeywordDraftMatch) {
+    const profile = await requireSelectedAdsProfile();
+    const pool = getMysqlPool();
+    const [remoteRows] = await pool.query(`
+      SELECT COUNT(*) count FROM ads_campaigns c LEFT JOIN ads_ad_units u ON u.campaign_id = c.id
+      WHERE c.keyword_id = ? AND c.profile_id = ? AND (c.amazon_campaign_id IS NOT NULL OR u.amazon_ad_group_id IS NOT NULL OR u.amazon_product_ad_id IS NOT NULL OR u.amazon_target_id IS NOT NULL)
+    `, [adsKeywordDraftMatch[1], String(profile.profileId)]);
+    if (Number(remoteRows[0]?.count || 0)) return sendJson(res, { error: "已创建 Amazon 对象的关键词不能删除，只能暂停" }, 409);
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.query("DELETE s FROM ads_operation_steps s JOIN ads_operations o ON o.id = s.operation_id WHERE o.entity_type = 'KEYWORD' AND o.entity_id = ? AND o.profile_id = ?", [adsKeywordDraftMatch[1], String(profile.profileId)]);
+      await connection.query("DELETE FROM ads_operations WHERE entity_type = 'KEYWORD' AND entity_id = ? AND profile_id = ?", [adsKeywordDraftMatch[1], String(profile.profileId)]);
+      await connection.query("DELETE u FROM ads_ad_units u JOIN ads_campaigns c ON c.id = u.campaign_id WHERE c.keyword_id = ? AND c.profile_id = ?", [adsKeywordDraftMatch[1], String(profile.profileId)]);
+      await connection.query("DELETE FROM ads_campaigns WHERE keyword_id = ? AND profile_id = ?", [adsKeywordDraftMatch[1], String(profile.profileId)]);
+      const [result] = await connection.query("DELETE FROM ads_keywords WHERE id = ? AND profile_id = ?", [adsKeywordDraftMatch[1], String(profile.profileId)]);
+      await connection.commit();
+      return sendJson(res, { deleted: Number(result.affectedRows || 0) });
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      connection.release();
+    }
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/operations/preview") {
+    const body = await parseBody(req);
+    return sendJson(res, await buildAdsCreationPreview(String(body.keywordId || "")), 201);
+  }
+
+  const adsOperationStatusMatch = url.pathname.match(/^\/api\/ads\/operations\/([^/]+)$/);
+  if (req.method === "GET" && adsOperationStatusMatch) {
+    return sendJson(res, await readAdsCreationOperationStatus(adsOperationStatusMatch[1]));
+  }
+
+  const adsOperationConfirmMatch = url.pathname.match(/^\/api\/ads\/operations\/([^/]+)\/confirm$/);
+  if (req.method === "POST" && adsOperationConfirmMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await confirmAdsCreationOperation(adsOperationConfirmMatch[1], body.confirmationToken));
+  }
+
+  const adsOperationStartMatch = url.pathname.match(/^\/api\/ads\/operations\/([^/]+)\/start$/);
+  if (req.method === "POST" && adsOperationStartMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await confirmAdsCreationOperation(adsOperationStartMatch[1], body.confirmationToken, { background: true }), 202);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/sync") {
+    const body = await parseBody(req);
+    return sendJson(res, await enqueueAdsSync(body.startDate, body.endDate), 202);
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/maintenance/legacy-asin-names") {
+    const body = await parseBody(req);
+    return sendJson(res, await migrateLegacyAdsAsinNames(body.parentAsin, body.childAsin));
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/ads/sync") {
+    return sendJson(res, await adsSyncStatus());
+  }
+
+  const adsCampaignStateMatch = url.pathname.match(/^\/api\/ads\/campaigns\/(\d+)\/state$/);
+  if (req.method === "PUT" && adsCampaignStateMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await setAdsCampaignState(adsCampaignStateMatch[1], body.state));
+  }
+
+  const adsCampaignStopMatch = url.pathname.match(/^\/api\/ads\/campaigns\/(\d+)\/stop$/);
+  if (req.method === "POST" && adsCampaignStopMatch) {
+    return sendJson(res, await stopAdsCampaign(adsCampaignStopMatch[1]));
+  }
+
+  const adsCampaignSettingsMatch = url.pathname.match(/^\/api\/ads\/campaigns\/(\d+)\/settings$/);
+  if (req.method === "PUT" && adsCampaignSettingsMatch) {
+    return sendJson(res, await updateAdsCampaignSettings(adsCampaignSettingsMatch[1], await parseBody(req)));
+  }
+
+  const adsUnitStateMatch = url.pathname.match(/^\/api\/ads\/ad-units\/(\d+)\/state$/);
+  if (req.method === "PUT" && adsUnitStateMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await setAdsAdUnitState(adsUnitStateMatch[1], body.state));
+  }
+
+  const adsUnitBidMatch = url.pathname.match(/^\/api\/ads\/ad-units\/(\d+)\/bid$/);
+  if (req.method === "PUT" && adsUnitBidMatch) {
+    return sendJson(res, await updateAdsAdUnitBid(adsUnitBidMatch[1], await parseBody(req)));
   }
 
   if (req.method === "GET" && url.pathname === "/api/gmail/messages") {
@@ -5682,6 +7851,8 @@ await ensureDataDir();
 await ensureAppMysqlSchema();
 server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
+  if (process.env.AMZ_ADS_SYNC_ENABLED !== "0" && process.env.AMZ_ADS_SYNC_ENABLED !== "false") startAdsPerformanceSchedule();
+  const scheduledFbaSyncEnabled = process.env.AMZ_FBA_SCHEDULE_ENABLED !== "0" && process.env.AMZ_FBA_SCHEDULE_ENABLED !== "false";
   if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
     setTimeout(async () => {
       try {
@@ -5689,10 +7860,10 @@ server.listen(PORT, () => {
       } catch (error) {
         console.error(`FBA startup sync failed: ${error.message}`);
       } finally {
-        scheduleNextFbaSync();
+        if (scheduledFbaSyncEnabled) scheduleNextFbaSync();
       }
     }, Number(process.env.AMZ_FBA_STARTUP_SYNC_DELAY_MS || 15000));
-  } else {
+  } else if (scheduledFbaSyncEnabled) {
     scheduleNextFbaSync();
   }
 });

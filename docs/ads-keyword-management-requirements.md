@@ -47,7 +47,7 @@ AmzAllBlue_ERP
 
 第一版只创建和管理 SP 关键词广告。
 
-每个关键词可以创建三套独立 Campaign：
+每个“关键词 × 子 ASIN × 匹配方式”创建一套独立 Campaign：
 
 ```text
 SP 精准：EXACT
@@ -81,19 +81,33 @@ PHRASE 和 BROAD：默认不勾选，勾选后才创建
 
 系统按 Profile 分别保存上一次创建广告时使用的设置。下一次创建时自动套用为模板，所有值仍可修改；用户修改并成功创建后，更新该 Profile 的模板。
 
+### 已确认的安全与对象处理规则
+
+- 如果当前 Profile 中不存在 `AmzAllBlue_ERP`，页面只显示缺失，不自动创建。用户查看 Portfolio 名称、Profile 和创建参数并明确确认后，系统才允许创建。
+- 广告模块只列出已经设置父 ASIN 内部名的产品组；未设置内部名的父 ASIN 不显示。
+- 广告模块中的父 ASIN 标签支持拖拽排序，顺序保存到本地数据库，刷新页面后保持不变。
+- 创建表单允许多选子 ASIN；系统将其拆成多个“关键词 × 子 ASIN”的独立投放对象。每种已选匹配方式为每个子 ASIN 创建独立 Campaign、一个 Ad Group、Product Ad 和 Keyword Target。同一个父 ASIN 下，相同关键词不得重复投放到同一子 ASIN；选择其他子 ASIN 可以继续添加。
+- 一个子 ASIN 对应多个 Seller SKU 时，沿用 FBA 库存页面的规则：先选择最新实时总货物数最高的 SKU，并列时再按默认最近 30 天的日销量选择；仍并列时保留多个选项，但同一子 ASIN 最终只能选择一个 Seller SKU。创建表单用商品卡片展示图片、子 ASIN 内部名、ASIN 和 Seller SKU，不展示库存数与销量，也不会在未展示 SKU 的情况下自动提交。
+- 用户从关键词中移除子 ASIN 时，系统暂停对应的 Ad Group、Product Ad 和 Keyword Target，不删除 Amazon 对象，也不删除历史表现。
+- 如果 `AmzAllBlue_ERP` 中存在数据库未记录的人工广告对象，系统不导入、不接管，并显示冲突错误，提示用户先在 Amazon 后台删除人工广告。
+- 修改关键词分组后，本地保存目标分组。Campaign 或 Ad Group 部分改名失败时显示 `同步未完成`、失败对象和原因，重试时只继续尚未成功的对象。
+- 创建任何真实 Portfolio 或广告前，必须先展示 Profile、Portfolio、Campaign、Ad Group、子 ASIN、Seller SKU、Product Ad、Keyword Target、预算、出价、顶部加价、日期和状态等完整参数，并由用户明确确认。
+- 创建计划尚未产生任何 Amazon ID 时，用户可以“关闭创建计划”。系统删除该计划的本地关键词草稿、Campaign、Ad Group 投放单元、操作预览和步骤记录；如果已经创建了任一 Amazon 对象，则禁止删除计划，只允许暂停或从失败步骤续传。
+- 用户确认创建后，界面必须持续展示操作的真实状态：等待确认、正在创建、创建成功或创建失败。网络中断时通过操作状态接口核对数据库记录，不得无提示恢复为初始确认按钮；失败时展示错误并允许从未完成步骤重试。创建成功后自动关闭确认弹窗并刷新关键词详情。
+
 ## 广告结构
 
 第一版采用以下结构：
 
 ```text
 Portfolio: AmzAllBlue_ERP
-  Campaign: 一个关键词的一种匹配方式
-    Ad Group: 一个子 ASIN 一个广告组
+  Campaign: 一个关键词、一个子 ASIN的一种匹配方式
+    Ad Group: 该子 ASIN 的一个广告组
       Product Ad: 只投放该广告组对应的子 ASIN
       Keyword Target: 对应关键词和匹配方式
 ```
 
-例如关键词 `wall organizer` 同时开启三种匹配方式，会创建三个 Campaign；如果需要投放多个子 ASIN，每个 Campaign 内为每个子 ASIN 分别创建 Ad Group：
+例如关键词 `wall organizer` 同时开启三种匹配方式，会为每个子 ASIN 创建三个 Campaign；投放两个子 ASIN 时共创建六个 Campaign：
 
 ```text
 wall organizer / EXACT
@@ -101,9 +115,9 @@ wall organizer / PHRASE
 wall organizer / BROAD
 ```
 
-这样可以分别控制三种匹配方式的顶部加价和预算，也可以在 Keyword Target 层为不同子 ASIN 设置不同出价。
+这样可分别控制每个子 ASIN、每种匹配方式的预算、位置加价和出价。
 
-同一 Campaign 内的多个 Ad Group 共享 Campaign 日预算、竞价策略和顶部加价。如果将来需要让不同子 ASIN 使用不同的顶部加价，则需要为该子 ASIN 单独创建 Campaign。
+每个 Campaign 只对应一个子 ASIN，因此预算、竞价策略和位置加价均可精准控制。需注意：多个子 ASIN 会相应增加日预算上限。
 
 ## 命名规则
 
@@ -112,15 +126,15 @@ wall organizer / BROAD
 格式：
 
 ```text
-ERP__产品名__关键词__分组__SP__匹配方式
+ERP__产品名__PARENT-父ASIN__ASIN-子ASIN__关键词__分组__SP__匹配方式__TS-创建批次
 ```
 
 示例：
 
 ```text
-ERP__WallBag__wall organizer__普通__SP__EXACT
-ERP__WallBag__wall organizer__主推__SP__PHRASE
-ERP__WallBag__wall organizer__已稳定__SP__BROAD
+ERP__WallBag__PARENT-B0B723ZTBD__wall organizer__普通__SP__EXACT__TS-20260713T093015123Z
+ERP__WallBag__PARENT-B0B723ZTBD__wall organizer__主推__SP__PHRASE__TS-20260713T093015123Z
+ERP__WallBag__PARENT-B0B723ZTBD__wall organizer__已稳定__SP__BROAD__TS-20260713T093015123Z
 ```
 
 字段含义：
@@ -129,10 +143,12 @@ ERP__WallBag__wall organizer__已稳定__SP__BROAD
 | --- | --- | --- |
 | 系统标识 | `ERP` | 表示由本系统管理 |
 | 产品名 | `WallBag` | 产品的系统简称 |
+| 父 ASIN | `B0B723ZTBD` | 广告所属父产品 |
 | 关键词 | `wall organizer` | 实际投放关键词 |
 | 分组 | `普通` | `普通`、`主推`、`已稳定` |
 | 广告类型 | `SP` | 第一版固定为 SP |
 | 匹配方式 | `EXACT` | `EXACT`、`PHRASE`、`BROAD` |
+| 创建批次 | `20260713T093015123Z` | 创建计划时生成一次，预览、创建和失败续传保持不变 |
 
 字段之间统一使用双下划线 `__` 分隔。
 
@@ -141,7 +157,7 @@ ERP__WallBag__wall organizer__已稳定__SP__BROAD
 Ad Group 使用 Campaign 名称，并在末尾增加投放的子 ASIN：
 
 ```text
-ERP__WallBag__wall organizer__主推__SP__EXACT__ASIN-B0B37GZ7MM
+ERP__WallBag__PARENT-B0B723ZTBD__wall organizer__主推__SP__EXACT__TS-20260713T093015123Z__ASIN-B0B37GZ7MM
 ```
 
 一个 Ad Group 只投放一个子 ASIN，因此 Ad Group 名称必须包含该子 ASIN。
@@ -153,13 +169,13 @@ ERP__WallBag__wall organizer__主推__SP__EXACT__ASIN-B0B37GZ7MM
 修改前：
 
 ```text
-ERP__WallBag__wall organizer__普通__SP__EXACT
+ERP__WallBag__PARENT-B0B723ZTBD__wall organizer__普通__SP__EXACT__TS-20260713T093015123Z
 ```
 
 修改后：
 
 ```text
-ERP__WallBag__wall organizer__主推__SP__EXACT
+ERP__WallBag__PARENT-B0B723ZTBD__wall organizer__主推__SP__EXACT__TS-20260713T093015123Z
 ```
 
 只修改名称中的分组，不重新创建广告，不丢失历史数据。
@@ -170,6 +186,7 @@ ERP__WallBag__wall organizer__主推__SP__EXACT
 - 关键词保留原文，方便在 Amazon 后台识别。
 - 如果名称超过 Amazon 限制，系统自动缩短产品名或关键词显示部分。
 - 系统在数据库保存 Amazon 返回的 Campaign ID、Ad Group ID 和 Target ID，名称主要用于查看和管理，不作为唯一识别依据。
+- `creation_batch` 同时保存到关键词、Campaign 和 Ad Group 投放单元。Campaign 使用 `父 ASIN + 子 ASIN + creation_batch + 广告类型 + 匹配方式` 形成稳定本地对象键；归档旧批次后重新创建会生成新的时间戳，名称和对象键都不会冲突。
 
 ## 分组规则
 
@@ -286,6 +303,8 @@ TACOS
 
 广告表现按天保存，方便查询任意日期范围、比较趋势和后续进行 AI 分析。
 
+关键词完成创建后，右侧详情区切换为历史数据面板，不再显示“预览并创建”。历史面板支持按子 ASIN 和匹配策略（全部、精准、词组、广泛）筛选，日期范围可调整；折线图横轴为日期，最多同时选择两个纵轴指标。第一版可选出价、顶部加价、实际 CPC、曝光、点击、花费、订单、销量和销售额。关键词自然位和广告位必须在接入独立排名数据源后启用，不得用广告报表数据推测或伪造。
+
 前端的一行仍然代表一个父 ASIN 下的一个关键词；数据库不要把产品配置和每天的表现数据全部重复写在一张表里。
 
 ### 关键词
@@ -302,7 +321,7 @@ TACOS
 
 ### 子 ASIN
 
-一个关键词可以推广一个或多个子 ASIN，一般只有一个。
+同一关键词可投放多个子 ASIN，但每条“关键词投放对象”只对应一个子 ASIN；相同父 ASIN、关键词、子 ASIN 的活动投放对象唯一。
 
 每个子 ASIN 使用独立 Ad Group，不直接保存为数组。关联记录包括：
 
@@ -320,7 +339,7 @@ Amazon Product Ad ID
 
 ### Campaign 与投放单元
 
-每种匹配方式保存一条 Campaign 记录：
+每个子 ASIN、每种匹配方式保存一条 Campaign 记录：
 
 ```text
 广告类型：SP / SB / SD
@@ -345,7 +364,7 @@ Target ID
 
 第一版只使用 `SP` 和三种关键词匹配方式。
 
-Campaign 代表一个关键词的一种匹配方式；Campaign 下的每个 Ad Group 投放单元代表一个被投放的子 ASIN。
+Campaign 代表一个关键词、一个子 ASIN的一种匹配方式；Campaign 下仅保留该子 ASIN 的一个 Ad Group 投放单元。
 
 ### 每日表现
 
@@ -382,8 +401,9 @@ ROAS = 销售额 / 花费
 ### 同步规则
 
 - 所有日期按当前 Amazon Ads Profile 的时区计算。
-- 系统每小时尝试同步一次今天的数据；同一同步任务尚未结束时，不重复启动。
-- 每天另外同步并覆盖最近 30 天的数据，用于补齐延迟归因的订单和销售额。
+- 系统每小时尝试同步一次今天的 Ad Group 日报表；一份报表覆盖当前 Profile 内全部受管 Ad Group，并由本地 ID 映射到子 ASIN 和关键词。同一同步任务尚未结束时，不重复启动。
+- 每天另外同步并覆盖最近 30 天的 Ad Group 日报表，用于补齐延迟归因的订单和销售额。
+- 展示位置（顶部搜索等）报表作为补充数据单独同步，不阻塞关键词历史图和核心表现数据入库。
 - 同步通过 Amazon Ads 报表异步完成，遇到 API 限流时排队重试，不并发重复申请相同报表。
 - 页面日期弹窗参考 FBA 库存模块：已经成功请求并保存的日期显示绿点。
 - 最近两天的数据仍可能变化，即使已经请求，也不显示绿点。
@@ -424,6 +444,17 @@ Windows 数据盘建议为数据库、备份和运行空间预留约 `150 GB`。
 
 ## 第一版功能
 
+### 关键词详情交互
+
+- 关键词标题与运营分组放在同一行；运营分组使用紧凑选择器。打开下拉菜单并悬停普通、主推或稳定时，显示对应的运营定义；此定义也作为后续 AI 分析建议的优先级语义，不直接触发广告操作。
+- 普通：用于常规测试和稳定维护，AI 主要从效率、趋势和异常角度给出建议，不因该分组自动调价、启停或改变预算。
+- 主推：用于当前需要更多流量和销售的重点关键词，AI 更关注展示份额、顶部搜索、排名、增量订单、可承受 ACOS 与预算消耗，但所有操作仍需人工确认。
+- 稳定：用于已验证转化与成本表现、暂不需要频繁调整的关键词，AI 重点观察 ACOS、销量与曝光异常，并提示是否需要复盘或恢复测试。
+- 历史数据筛选器使用紧凑的子 ASIN、策略、指标一、指标二控件。
+- 日期范围沿用 FBA 库存的单一日期弹窗交互，支持今天、昨天、最近 7 天、最近 30 天、最近 30 天（不含近 2 天）。
+- 已完整同步广告表现的日期标记绿色，已选日期范围标记浅绿色；部分同步日期显示橙色状态。
+- Campaign 卡片头部显示该子 ASIN 的图片、内部名、创建状态和启停操作；暂停、开始、停止只作用于该子 ASIN 的 Campaign。
+
 第一版只实现：
 
 1. 识别并使用 `AmzAllBlue_ERP` 广告组合。
@@ -431,14 +462,16 @@ Windows 数据盘建议为数据库、备份和运行空间预留约 `150 GB`。
 3. 设置关键词为 `普通`、`主推` 或 `已稳定`。
 4. 创建 SP 精准、词组、广泛广告。
 5. 默认只勾选 EXACT，并使用可编辑、可记忆的创建模板。
-6. 一个 Campaign 支持多个子 ASIN Ad Group，每个 Ad Group 只投放一个子 ASIN。
-7. 分别开启或暂停三种匹配方式及其子 ASIN Ad Group。
-8. 修改关键词分组并同步 Campaign 和 Ad Group 名称。
-9. 表格显示曝光、点击、花费、订单、销售额和 ACOS。
-10. 点击关键词查看三种匹配方式及各子 ASIN 的详细数据。
-11. 每小时同步今天，每天滚动覆盖最近 30 天的广告表现。
-12. 日期弹窗标记已请求数据，最近两天不显示完成绿点。
-13. 创建中途失败后可以从失败步骤继续，不重复创建对象。
+6. 一个 Campaign 只支持一个子 ASIN Ad Group；多个子 ASIN 自动拆成多个 Campaign。
+7. 分别开启、暂停或停止每个子 ASIN、每种匹配方式的 Campaign；卡片作为对应投放对象的唯一启停入口。
+8. Campaign 可设置日预算，以及顶部搜索、其余搜索结果、商品页面三类位置加价（0～900%）；新增关键词时其余搜索与商品页面默认 0%。
+9. 子 ASIN 投放单元可设置默认出价，并同步更新其对应 Keyword Target 出价。
+10. 修改关键词分组并同步 Campaign 和 Ad Group 名称。
+11. 表格显示曝光、点击、花费、订单、销售额和 ACOS。
+12. 点击已创建关键词查看可按子 ASIN、匹配策略和日期筛选的双指标历史图表，并可折叠查看投放对象与启停管理。
+13. 每小时同步今天，每天滚动覆盖最近 30 天的广告表现。
+14. 日期弹窗标记已请求数据，最近两天不显示完成绿点。
+15. 创建中途失败后可以从失败步骤继续，不重复创建对象。
 
 第一版暂不实现：
 

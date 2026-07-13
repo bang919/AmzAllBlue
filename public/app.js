@@ -47,6 +47,23 @@ let adsProfiles = [];
 let selectedId = "";
 let selectedProductAsin = "";
 let selectedAdsProfileId = "";
+let adsWorkspace = { products: [], keywords: [], portfolio: null, range: null };
+let adsCreationTemplate = null;
+let selectedAdsParentAsin = "";
+let selectedAdsKeywordId = "";
+let selectedAdsGroup = "ALL";
+let pendingAdsOperation = null;
+let adsHistoryState = {
+  keywordId: "",
+  childAsin: "ALL",
+  matchType: "ALL",
+  startDate: "",
+  endDate: "",
+  metricA: "impressions",
+  metricB: "clicks"
+};
+let adsHistoryRequestSequence = 0;
+let draggedAdsParentAsin = "";
 let activeModule = "dashboard";
 let productsLoaded = false;
 let factoryLoaded = false;
@@ -62,6 +79,9 @@ const FACTORY_COLUMN_WIDTH_KEY = "amazonAggregator.factoryColumnWidth.v1";
 const fbaDateStatus = new Map();
 let dateRangePickerOpen = false;
 let datePickerMonth = "";
+const adsHistoryDateStatus = new Map();
+let adsHistoryDatePickerOpen = false;
+let adsHistoryDatePickerMonth = "";
 let fbaVisibleColumns = new Set();
 let fbaSort = { key: "totalGoodsQuantity", direction: "desc" };
 let fbaColumnFilters = {};
@@ -96,11 +116,11 @@ const fbaReplenishmentColumns = [
 const fbaColumns = [
   { key: "replenishmentGrade", label: "商品等级", type: "static", always: true, render: product => renderFbaGradeCell(product) },
   { key: "image", label: "图片", type: "static", always: true, render: product => product.imageUrl ? `<img class="fba-thumb" src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.title || product.asin)}">` : `<div class="fba-thumb placeholder">无图</div>` },
+  { key: "factoryName", label: "内部名", type: "text", value: product => getFbaProductFactoryName(product), render: product => renderFbaFactoryNameCell(product) },
   { key: "asinSku", label: "ASIN/MSKU", type: "text", always: true, value: product => `${product.asin || ""} ${product.sellerSku || ""}`, render: product => `<a href="https://www.amazon.com/dp/${escapeHtml(product.asin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.asin || "-")}</a><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "parentAsin", label: "父ASIN", type: "text", value: product => product.parentAsin || "", render: product => product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : "-" },
   { key: "fnSku", label: "FNSKU/SKU", type: "text", value: product => `${product.fnSku || ""} ${product.sellerSku || ""}`, render: product => `<strong>${escapeHtml(product.fnSku || "-")}</strong><span>${escapeHtml(product.sellerSku || "-")}</span>` },
   { key: "title", label: "标题", type: "text", value: product => `${product.title || ""} ${product.brand || ""} ${product.condition || ""}`, render: product => `${escapeHtml(product.title || "-")}<span>${escapeHtml(product.brand || product.condition || "")}</span>` },
-  { key: "factoryName", label: "内部名", type: "text", value: product => getFbaProductFactoryName(product), render: product => renderFbaFactoryNameCell(product) },
   { key: "factoryFbaTotalQuantity", label: "工厂+FBA\n总库存", type: "number", value: product => getProductFactoryFbaTotalQuantity(product), render: product => formatInventoryNumber(getProductFactoryFbaTotalQuantity(product)) },
   { key: "factoryQuantity", label: "工厂总库存", type: "number", value: product => getProductFactoryQuantity(product), render: product => formatInventoryNumber(getProductFactoryQuantity(product)) },
   { key: "totalGoodsQuantity", label: "FBA总库存", type: "number", value: product => getProductTotalGoods(product), render: product => formatInventoryNumber(getProductTotalGoods(product)) },
@@ -166,8 +186,8 @@ function renderFbaColumnWidths(visibleColumns = getVisibleFbaColumns()) {
   ).join("");
   table.style.width = `${widths.reduce((sum, width) => sum + width, 0)}px`;
   const stickyKeys = new Set(fbaReplenishmentOpen
-    ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "asinSku", "fnSku"]
-    : ["replenishmentGrade", "image", "asinSku", "fnSku"]);
+    ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "factoryName", "asinSku"]
+    : ["replenishmentGrade", "image", "factoryName", "asinSku"]);
   let stickyLeft = 0;
   visibleColumns.forEach((column, index) => {
     if (!stickyKeys.has(column.key)) return;
@@ -1553,7 +1573,7 @@ function productMatches(product) {
 
 function getVisibleFbaColumns() {
   const selectedBaseColumns = fbaColumns.filter(column => column.always || fbaVisibleColumns.has(column.key));
-  const pinnedOrder = ["replenishmentGrade", "image", "asinSku", "fnSku"];
+  const pinnedOrder = ["replenishmentGrade", "image", "factoryName", "asinSku"];
   const baseColumns = [
     ...pinnedOrder
       .map(key => selectedBaseColumns.find(column => column.key === key))
@@ -1856,8 +1876,8 @@ function renderProducts() {
   const visibleColumns = getVisibleFbaColumns();
   renderFbaColumnWidths(visibleColumns);
   const stickyKeys = new Set(fbaReplenishmentOpen
-    ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "asinSku", "fnSku"]
-    : ["image", "asinSku", "fnSku"]);
+    ? ["replenishmentGrade", "replenishmentDailySales", "replenishmentBoxQty", "replenishmentShippingQty", "replenishmentReplenishQty", "image", "factoryName", "asinSku"]
+    : ["replenishmentGrade", "image", "factoryName", "asinSku"]);
   const stickyOffsets = [];
   let stickyLeft = 0;
   for (const column of visibleColumns) {
@@ -2910,6 +2930,85 @@ function closeDatePicker() {
   dateRangePickerOpen = false;
 }
 
+function updateAdsHistoryDateRangeInput() {
+  const input = $("#adsHistoryDateRange");
+  if (!input) return;
+  const { startDate, endDate } = adsHistoryState;
+  input.value = startDate && endDate ? `${startDate} 至 ${endDate}` : (startDate ? `${startDate} 至 ...` : "");
+}
+
+function isAdsHistoryDateInRange(value) {
+  return isValidDateValue(adsHistoryState.startDate) && isValidDateValue(adsHistoryState.endDate) &&
+    value >= adsHistoryState.startDate && value <= adsHistoryState.endDate;
+}
+
+async function loadAdsHistoryDateStatus() {
+  try {
+    const data = await api("/api/ads/dates");
+    adsHistoryDateStatus.clear();
+    for (const item of data.dates || []) adsHistoryDateStatus.set(item.date, item);
+  } catch {
+    // Date markers should not block history browsing.
+  }
+}
+
+function renderAdsHistoryDatePicker() {
+  const picker = $("#adsHistoryDatePicker");
+  if (!picker || !adsHistoryDatePickerOpen) return;
+  const selectedDate = adsHistoryState.endDate || adsHistoryState.startDate || marketplaceToday();
+  if (!adsHistoryDatePickerMonth) adsHistoryDatePickerMonth = selectedDate.slice(0, 7);
+  const [year, month] = adsHistoryDatePickerMonth.split("-").map(Number);
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const start = new Date(Date.UTC(year, month - 1, 1 - first.getUTCDay()));
+  const days = Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(start.getTime() + index * 86400000);
+    const value = date.toISOString().slice(0, 10);
+    const inMonth = date.getUTCMonth() === month - 1;
+    const dateStatus = adsHistoryDateStatus.get(value);
+    const hasCompleteData = Boolean(dateStatus?.complete);
+    const hasPartialData = Boolean(dateStatus?.partial && !dateStatus.complete);
+    const inRange = isAdsHistoryDateInRange(value);
+    const endpoint = value === adsHistoryState.startDate || value === adsHistoryState.endDate;
+    const disabled = isDateDisabled(value);
+    const dataLabel = hasCompleteData ? "广告组与广告位表现均已同步" : hasPartialData ? "部分广告表现已同步" : "";
+    return `<button type="button" class="date-picker-day ${inMonth ? "" : "other-month"} ${hasCompleteData ? "has-data" : ""} ${hasPartialData ? "partial-data" : ""} ${inRange ? "in-range" : ""} ${endpoint ? "selected" : ""}" data-ads-history-date="${value}" title="${escapeHtml(disabled ? "未来日期不可选" : dataLabel)}" ${disabled ? "disabled" : ""}><span>${date.getUTCDate()}</span></button>`;
+  }).join("");
+  picker.innerHTML = `
+    <div class="date-picker-head"><button type="button" data-ads-history-date-nav="-1">‹</button><div class="date-picker-title">${year}-${String(month).padStart(2, "0")}</div><button type="button" data-ads-history-date-nav="1">›</button></div>
+    <div class="date-picker-week"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div>
+    <div class="date-picker-grid">${days}</div>
+    <div class="date-picker-quick">
+      <button type="button" data-ads-history-date-quick="today">今天</button><button type="button" data-ads-history-date-quick="yesterday">昨天</button>
+      <button type="button" data-ads-history-date-quick="last7">最近7天</button><button type="button" data-ads-history-date-quick="last30">最近30天</button>
+      <button type="button" data-ads-history-date-quick="last30Exclude2">最近30天（不含近2天）</button>
+    </div>
+    <div class="date-picker-legend"><span class="date-data-dot"></span> 广告表现同步成功 <span class="date-range-swatch"></span> 已选范围</div>`;
+}
+
+async function openAdsHistoryDatePicker() {
+  const input = $("#adsHistoryDateRange");
+  const picker = $("#adsHistoryDatePicker");
+  if (!input || !picker) return;
+  adsHistoryDatePickerOpen = true;
+  adsHistoryDatePickerMonth = (adsHistoryState.endDate || adsHistoryState.startDate || marketplaceToday()).slice(0, 7);
+  await loadAdsHistoryDateStatus();
+  const rect = input.getBoundingClientRect();
+  picker.hidden = false;
+  renderAdsHistoryDatePicker();
+  const pickerRect = picker.getBoundingClientRect();
+  const margin = 8;
+  picker.style.left = `${Math.min(Math.max(margin, rect.left), Math.max(margin, window.innerWidth - pickerRect.width - margin))}px`;
+  const belowTop = rect.bottom + 6;
+  const aboveTop = rect.top - pickerRect.height - 6;
+  picker.style.top = `${belowTop + pickerRect.height + margin <= window.innerHeight ? belowTop : Math.max(margin, aboveTop)}px`;
+}
+
+function closeAdsHistoryDatePicker() {
+  const picker = $("#adsHistoryDatePicker");
+  if (picker) picker.hidden = true;
+  adsHistoryDatePickerOpen = false;
+}
+
 async function loadProducts({ mode = "" } = {}) {
   const range = defaultDateRange();
   const startDate = $("#salesStartDate")?.value || range.startDate;
@@ -3114,6 +3213,9 @@ async function refreshAds() {
       }
     }
   }
+  if (status.authorized && (selectedAdsProfileId || preferredAdsProfileId())) {
+    await loadAdsWorkspace({ refreshPortfolio: true });
+  }
 }
 
 async function authorizeAds() {
@@ -3143,6 +3245,794 @@ async function selectAdsProfile(profileId) {
   };
   renderAdsStatus(window.adsStatusMeta);
   renderAdsProfiles();
+  selectedAdsParentAsin = "";
+  selectedAdsKeywordId = "";
+  await loadAdsWorkspace({ refreshPortfolio: true });
+}
+
+function adsGroupLabel(group) {
+  return { NORMAL: "普通", PROMOTED: "主推", STABLE: "已稳定", STOPPED: "停止" }[group] || "普通";
+}
+
+const ADS_GROUP_DESCRIPTIONS = {
+  NORMAL: "普通用于常规测试和稳定维护。它代表没有明确增长或收缩目标的关键词，系统会保留完整的曝光、点击、转化、ACOS 与出价历史；后续 AI 会以效率、趋势和异常为主提供建议，不会因归入普通而自动调价、启停或改变预算。",
+  PROMOTED: "主推用于当前需要获得更多流量和销售的重点关键词。后续 AI 分析会更重视展示份额、顶部搜索加价、排名与增量订单，并把可承受 ACOS 与预算消耗一并评估；它只影响建议优先级，任何调价、加预算或启停仍必须由你确认。",
+  STABLE: "稳定用于已验证转化与成本表现、暂不需要频繁调整的关键词。后续 AI 会优先观察 ACOS、销量和曝光是否出现异常波动，并提示是否需要复盘或恢复测试；稳定并不等于永久不动，所有建议仍以数据变化和你的确认作为执行前提。"
+};
+
+function renderAdsGroupPicker(keyword) {
+  const options = ["NORMAL", "PROMOTED", "STABLE"];
+  return `<div class="ads-group-picker" data-ads-group-picker="${keyword.id}">
+    <button class="ads-group-picker-toggle" type="button" data-ads-group-toggle="${keyword.id}" aria-expanded="false">${adsGroupLabel(keyword.group)}<span aria-hidden="true">⌄</span></button>
+    <div class="ads-group-picker-menu" data-ads-group-menu="${keyword.id}" hidden>
+      <div class="ads-group-picker-options" role="listbox" aria-label="运营分组">
+        ${options.map(group => `<button type="button" role="option" aria-selected="${group === keyword.group}" data-ads-group-option="${group}" data-ads-keyword-id="${keyword.id}" class="${group === keyword.group ? "selected" : ""}">${adsGroupLabel(group)}</button>`).join("")}
+      </div>
+      <p data-ads-group-help>${escapeHtml(ADS_GROUP_DESCRIPTIONS[keyword.group])}</p>
+    </div>
+  </div>`;
+}
+
+function adsMatchLabel(matchType) {
+  return { EXACT: "精准", PHRASE: "词组", BROAD: "广泛" }[matchType] || matchType;
+}
+
+function adsStateLabel(value) {
+  return { ENABLED: "已开始", PAUSED: "已暂停", STOPPED: "已停止", NOT_CREATED: "待创建", INCOMPLETE: "创建未完成", SUCCESS: "已同步" }[value] || value || "待创建";
+}
+
+function adsCampaignStatusLabel(campaign) {
+  if (campaign.lifecycleStatus === "STOPPED") return "已停止";
+  if (campaign.creationStatus === "CREATING") return "创建中";
+  if (campaign.creationStatus === "COMPLETE") return campaign.desiredState === "ENABLED" ? "已开始" : "已暂停";
+  if (campaign.creationStatus === "NOT_CREATED") return "创建中";
+  return "创建未完成";
+}
+
+function adsPercent(value) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "-";
+  return `${(Number(value) * 100).toFixed(1)}%`;
+}
+
+function adsStopTimeLabel(value) {
+  if (!value) return "停止时间未记录";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(0, 19);
+  return date.toLocaleString("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false
+  }).replace(/\//g, "-");
+}
+
+const ADS_HISTORY_METRICS = {
+  bid: { label: "出价", unit: "money", color: "#2563eb" },
+  topOfSearchAdjustment: { label: "顶部加价", unit: "percent", color: "#7c3aed" },
+  restOfSearchAdjustment: { label: "其余搜索加价", unit: "percent", color: "#0ea5e9" },
+  productPageAdjustment: { label: "商品页加价", unit: "percent", color: "#ec4899" },
+  actualCpc: { label: "CPC", unit: "money", color: "#0891b2" },
+  impressions: { label: "曝光", unit: "integer", color: "#2563eb" },
+  clicks: { label: "点击", unit: "integer", color: "#f97316" },
+  spend: { label: "花费", unit: "money", color: "#dc2626" },
+  orders: { label: "订单数", unit: "integer", color: "#16a34a" },
+  units: { label: "销量", unit: "integer", color: "#0f766e" },
+  sales: { label: "销售额", unit: "money", color: "#9333ea" },
+  naturalRank: { label: "关键词自然位（待接数据源）", unit: "rank", color: "#64748b", unavailable: true },
+  adRank: { label: "关键词广告位（待接数据源）", unit: "rank", color: "#475569", unavailable: true }
+};
+
+const ADS_HISTORY_POSITION_METRICS = [
+  ["ActualCpc", "CPC", "money"],
+  ["Impressions", "曝光", "integer"],
+  ["Clicks", "点击", "integer"],
+  ["Spend", "花费", "money"],
+  ["Orders", "订单数", "integer"],
+  ["Units", "销量", "integer"],
+  ["Sales", "销售额", "money"]
+];
+
+for (const [prefix, label, color] of [["top", "顶部搜索", "#2563eb"], ["rest", "其余搜索", "#0ea5e9"], ["product", "商品页面", "#ec4899"]]) {
+  for (const [suffix, metricLabel, unit] of ADS_HISTORY_POSITION_METRICS) {
+    ADS_HISTORY_METRICS[`${prefix}${suffix}`] = { label: `${label} · ${metricLabel}`, unit, color };
+  }
+}
+
+function isAdsKeywordComplete(keyword) {
+  return Boolean(keyword?.campaigns?.length) && keyword.campaigns.every(campaign =>
+    campaign.creationStatus === "COMPLETE" && Boolean(campaign.amazonCampaignId) && campaign.units.length > 0 &&
+    campaign.units.every(unit => unit.creationStatus === "COMPLETE" && unit.amazonAdGroupId && unit.amazonProductAdId && unit.amazonTargetId)
+  );
+}
+
+function resetAdsHistoryState(keyword) {
+  if (adsHistoryState.keywordId === keyword.id) return;
+  adsHistoryState = {
+    keywordId: keyword.id,
+    childAsin: "ALL",
+    matchType: "ALL",
+    startDate: adsWorkspace.range?.startDate || "",
+    endDate: adsWorkspace.range?.endDate || "",
+    metricA: "impressions",
+    metricB: "clicks"
+  };
+}
+
+function adsHistoryMetricOptions(selected) {
+  const option = ([key, metric]) => `<option value="${key}" ${key === selected ? "selected" : ""} ${metric.unavailable ? "disabled" : ""}>${escapeHtml(metric.label)}</option>`;
+  const overall = ["bid", "topOfSearchAdjustment", "restOfSearchAdjustment", "productPageAdjustment", "actualCpc", "impressions", "clicks", "spend", "orders", "units", "sales", "naturalRank", "adRank"]
+    .map(key => [key, ADS_HISTORY_METRICS[key]]);
+  const positionGroup = (label, prefix) => ADS_HISTORY_POSITION_METRICS.map(([suffix]) => [`${prefix}${suffix}`, ADS_HISTORY_METRICS[`${prefix}${suffix}`]]);
+  return `<optgroup label="综合">${overall.map(option).join("")}</optgroup>`
+    + `<optgroup label="顶部搜索">${positionGroup("顶部搜索", "top").map(option).join("")}</optgroup>`
+    + `<optgroup label="其余搜索">${positionGroup("其余搜索", "rest").map(option).join("")}</optgroup>`
+    + `<optgroup label="商品页面">${positionGroup("商品页面", "product").map(option).join("")}</optgroup>`;
+}
+
+function formatAdsHistoryValue(value, metricKey, currency = "USD") {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "-";
+  const metric = ADS_HISTORY_METRICS[metricKey] || {};
+  if (metric.unit === "money") return asMoney(Number(value), currency);
+  if (metric.unit === "percent") return `${Number(value).toFixed(0)}%`;
+  if (metric.unit === "rank") return Number(value).toFixed(0);
+  return formatNumber(Number(value));
+}
+
+function currentAdsProduct() {
+  return adsWorkspace.products.find(item => item.parentAsin === selectedAdsParentAsin) || adsWorkspace.products[0] || null;
+}
+
+function currentAdsKeyword() {
+  return adsWorkspace.keywords.find(item => item.id === selectedAdsKeywordId) || null;
+}
+
+function renderAdsPortfolioGuard() {
+  const node = $("#adsPortfolioGuard");
+  if (!node) return;
+  const portfolio = adsWorkspace.portfolio;
+  node.className = "ads-portfolio-guard";
+  if (!portfolio) {
+    node.classList.add("missing");
+    node.innerHTML = `<strong>尚未检查 ${escapeHtml("AmzAllBlue_ERP")}</strong><span>点击刷新重新验证</span>`;
+    return;
+  }
+  if (portfolio.status === "READY") {
+    node.classList.add("ready");
+    node.innerHTML = `<strong>仅管理 ${escapeHtml(portfolio.name)}</strong><span>Portfolio ID ${escapeHtml(portfolio.portfolioId)} · 已通过隔离检查</span>`;
+    return;
+  }
+  const label = portfolio.status === "MISSING" ? "广告组合不存在" : "广告组合已锁定";
+  node.classList.add(portfolio.status === "MISSING" ? "missing" : "blocked");
+  node.innerHTML = `<strong>${escapeHtml(label)}</strong><span>${escapeHtml(portfolio.error || "请刷新检查")}</span>`;
+}
+
+function renderAdsProductTabs() {
+  const container = $("#adsProductTabs");
+  if (!container) return;
+  if (!adsWorkspace.products.length) {
+    container.innerHTML = `<div class="ads-empty-inline">FBA库存中还没有可用于广告的父 ASIN / SKU</div>`;
+    return;
+  }
+  if (!selectedAdsParentAsin || !adsWorkspace.products.some(item => item.parentAsin === selectedAdsParentAsin)) {
+    selectedAdsParentAsin = adsWorkspace.products[0].parentAsin;
+  }
+  container.innerHTML = adsWorkspace.products.map(product => {
+    const count = adsWorkspace.keywords.filter(item => item.parentAsin === product.parentAsin).length;
+    return `<button class="ads-product-tab ${product.parentAsin === selectedAdsParentAsin ? "active" : ""}" data-ads-parent="${escapeHtml(product.parentAsin)}" draggable="true" title="拖动调整父 ASIN 顺序">
+      <span class="ads-product-drag" aria-hidden="true">⋮⋮</span>
+      <span class="ads-product-copy"><strong>${escapeHtml(product.internalName || product.parentAsin)}</strong><small>${escapeHtml(product.parentAsin)} · ${count} 词</small></span>
+    </button>`;
+  }).join("");
+}
+
+async function saveAdsProductOrder() {
+  try {
+    const result = await api("/api/ads/products/reorder", {
+      method: "POST",
+      body: { parentAsins: adsWorkspace.products.map(product => product.parentAsin) }
+    });
+    adsWorkspace.products = result.products || adsWorkspace.products;
+    renderAdsProductTabs();
+  } catch (error) {
+    alert(error.message);
+    await loadAdsWorkspace().catch(() => {});
+  }
+}
+
+function moveAdsParentTab(targetParentAsin) {
+  if (!draggedAdsParentAsin || !targetParentAsin || draggedAdsParentAsin === targetParentAsin) return;
+  const fromIndex = adsWorkspace.products.findIndex(product => product.parentAsin === draggedAdsParentAsin);
+  const toIndex = adsWorkspace.products.findIndex(product => product.parentAsin === targetParentAsin);
+  if (fromIndex < 0 || toIndex < 0) return;
+  const next = [...adsWorkspace.products];
+  const [moved] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, moved);
+  adsWorkspace.products = next;
+  renderAdsProductTabs();
+  saveAdsProductOrder();
+}
+
+function filteredAdsKeywords() {
+  const query = ($("#adsKeywordSearch")?.value || "").trim().toLowerCase();
+  return adsWorkspace.keywords.filter(item => {
+    if (item.parentAsin !== selectedAdsParentAsin) return false;
+    if (selectedAdsGroup === "STOPPED") {
+      if (item.lifecycleStatus !== "STOPPED") return false;
+    } else {
+      if (!["ACTIVE", "CREATING", "STOPPING"].includes(item.lifecycleStatus)) return false;
+      if (selectedAdsGroup !== "ALL" && item.group !== selectedAdsGroup) return false;
+    }
+    if (!query) return true;
+    return [item.keyword, ...item.campaigns.flatMap(campaign => campaign.units.flatMap(unit => [unit.childAsin, unit.sellerSku]))]
+      .join(" ").toLowerCase().includes(query);
+  });
+}
+
+function adsCampaignsFor(keyword, matchType, { includeStopped = false } = {}) {
+  return keyword.campaigns.filter(item => item.matchType === matchType && (includeStopped || item.lifecycleStatus !== "STOPPED"));
+}
+
+function adsCampaignFor(keyword, matchType) {
+  return adsCampaignsFor(keyword, matchType)[0] || null;
+}
+
+function adsCampaignProduct(keyword, campaign) {
+  const product = adsWorkspace.products.find(item => item.parentAsin === keyword.parentAsin);
+  return product?.children?.find(item => item.asin === campaign.childAsin && (!campaign.sellerSku || item.sellerSku === campaign.sellerSku)) || null;
+}
+
+function renderAdsMatchCell(keyword, matchType) {
+  const campaigns = adsCampaignsFor(keyword, matchType);
+  if (!campaigns.length) return `<span class="ads-match-pill off">未添加</span>`;
+  if (campaigns.some(campaign => campaign.creationStatus === "CREATING")) return `<span class="ads-match-pill draft">创建中</span>`;
+  if (campaigns.some(campaign => campaign.creationStatus === "NOT_CREATED")) return `<span class="ads-match-pill draft">创建中</span>`;
+  if (campaigns.some(campaign => campaign.creationStatus !== "COMPLETE")) return `<span class="ads-match-pill error">未完成</span>`;
+  if (campaigns.some(campaign => campaign.desiredState === "ENABLED")) return `<span class="ads-match-pill on">已开始</span>`;
+  return `<span class="ads-match-pill paused">已暂停</span>`;
+}
+
+function renderAdsKeywordRows() {
+  const product = currentAdsProduct();
+  const rows = filteredAdsKeywords();
+  const allForProduct = adsWorkspace.keywords.filter(item => item.parentAsin === selectedAdsParentAsin && item.lifecycleStatus !== "STOPPED");
+  const archivedForProduct = adsWorkspace.keywords.filter(item => item.parentAsin === selectedAdsParentAsin && item.lifecycleStatus === "STOPPED");
+  $("#adsCurrentProductName").textContent = product?.internalName || "选择产品";
+  $("#adsCurrentParentAsin").textContent = product?.parentAsin || "";
+  $("#adsKeywordCount").textContent = `${allForProduct.length} 个关键词`;
+  $("#adsGroupCountAll").textContent = allForProduct.length;
+  $("#adsGroupCountStable").textContent = allForProduct.filter(item => item.group === "STABLE").length;
+  $("#adsGroupCountPromoted").textContent = allForProduct.filter(item => item.group === "PROMOTED").length;
+  $("#adsGroupCountNormal").textContent = allForProduct.filter(item => item.group === "NORMAL").length;
+  $("#adsGroupCountArchived").textContent = archivedForProduct.length;
+  const tbody = $("#adsKeywordRows");
+  if (!rows.length) {
+    tbody.innerHTML = `<tr><td colspan="9"><div class="ads-table-empty"><strong>还没有关键词</strong><span>点击“添加关键词”创建第一条广告计划</span></div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = rows.map(keyword => {
+    const childAsins = [...new Set(keyword.campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)))];
+    const keywordSubline = keyword.lifecycleStatus === "STOPPED"
+      ? `停止时间：${adsStopTimeLabel(keyword.stoppedAt)}`
+      : `${formatNumber(keyword.metrics.impressions)} 曝光 · ${formatNumber(keyword.metrics.clicks)} 点击`;
+    return `<tr class="${keyword.id === selectedAdsKeywordId ? "selected" : ""}" data-ads-keyword-id="${keyword.id}">
+      <td><strong>${escapeHtml(keyword.keyword)}</strong><span>${escapeHtml(keywordSubline)}</span></td>
+      <td>${childAsins.length ? childAsins.map(asin => `<span class="ads-asin-chip">${escapeHtml(asin)}</span>`).join("") : "-"}</td>
+      <td><span class="ads-group-badge ${keyword.group.toLowerCase()}">${adsGroupLabel(keyword.group)}</span></td>
+      <td>${renderAdsMatchCell(keyword, "EXACT")}</td><td>${renderAdsMatchCell(keyword, "PHRASE")}</td><td>${renderAdsMatchCell(keyword, "BROAD")}</td>
+      <td>${asMoney(keyword.metrics.spend, adsWorkspace.profile?.currencyCode || "USD")}</td>
+      <td>${asMoney(keyword.metrics.sales, adsWorkspace.profile?.currencyCode || "USD")}</td>
+      <td>${adsPercent(keyword.metrics.acos)}</td>
+    </tr>`;
+  }).join("");
+}
+
+function renderAdsHistoryPanel(keyword) {
+  resetAdsHistoryState(keyword);
+  const childAsins = [...new Set(keyword.campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)))];
+  const matchTypes = keyword.campaigns.map(campaign => campaign.matchType);
+  return `<section class="ads-history-panel">
+    <div class="ads-history-title"><div><strong>关键词历史数据</strong><span>选择子 ASIN、策略和两个指标进行对比</span></div></div>
+    <div class="ads-history-filters">
+      <label class="asin">子 ASIN<select id="adsHistoryAsin"><option value="ALL">全部</option>${childAsins.map(asin => `<option value="${escapeHtml(asin)}" ${adsHistoryState.childAsin === asin ? "selected" : ""}>${escapeHtml(asin)}</option>`).join("")}</select></label>
+      <label class="strategy">策略<select id="adsHistoryMatch"><option value="ALL">全部</option>${matchTypes.map(match => `<option value="${match}" ${adsHistoryState.matchType === match ? "selected" : ""}>${adsMatchLabel(match)}</option>`).join("")}</select></label>
+      <label class="metric"><span><i class="ads-series-dot primary"></i>指标一</span><select id="adsHistoryMetricA">${adsHistoryMetricOptions(adsHistoryState.metricA)}</select></label>
+      <label class="metric"><span><i class="ads-series-dot secondary"></i>指标二</span><select id="adsHistoryMetricB">${adsHistoryMetricOptions(adsHistoryState.metricB)}</select></label>
+      <label class="date-range">日期范围<input id="adsHistoryDateRange" type="text" readonly value="${escapeHtml(adsHistoryState.startDate && adsHistoryState.endDate ? `${adsHistoryState.startDate} 至 ${adsHistoryState.endDate}` : "")}"></label>
+      <button id="adsHistoryQueryBtn" class="primary" type="button">查询</button>
+      <small>最多显示 2 个指标；自然位和广告位待接排名数据源。</small>
+    </div>
+    <div id="adsHistoryChart" class="ads-history-chart"><div class="ads-history-loading">正在读取历史数据…</div></div>
+  </section>`;
+}
+
+function adsPlacementLabel(value) {
+  const placement = String(value || "").toUpperCase();
+  if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP"].includes(placement)) return "顶部搜索";
+  if (["PLACEMENT_REST_OF_SEARCH", "REST_OF_SEARCH", "OTHER"].includes(placement)) return "其余搜索";
+  if (["PLACEMENT_PRODUCT_PAGE", "PRODUCT_PAGE", "DETAIL_PAGE"].includes(placement)) return "商品页面";
+  return value || "未知位置";
+}
+
+function adsCampaignPerformanceTable(campaign, currency) {
+  const rows = [
+    { label: "综合", metrics: campaign.metrics, complete: true },
+    ...["顶部搜索", "其余搜索", "商品页面"].map(label => ({
+      label,
+      metrics: campaign.placements.find(item => adsPlacementLabel(item.placement) === label) || null,
+      complete: false
+    }))
+  ];
+  const value = (metrics, field, formatter = formatNumber) => metrics ? formatter(metrics[field] || 0) : "-";
+  return `<div class="ads-performance-section"><div class="ads-card-section-title"><strong>所选日期表现</strong><span>${escapeHtml(adsWorkspace.range?.startDate || "-")} 至 ${escapeHtml(adsWorkspace.range?.endDate || "-")}</span></div><div class="ads-performance-table-wrap"><table class="ads-performance-table"><thead><tr><th>位置</th><th>CPC</th><th>曝光</th><th>点击</th><th>花费</th><th>订单</th><th>销量</th><th>销售额</th><th>ACOS</th></tr></thead><tbody>${rows.map(row => { const metrics = row.metrics; const clicks = Number(metrics?.clicks || 0); const spend = Number(metrics?.spend || 0); const sales = Number(metrics?.sales || 0); return `<tr class="${row.complete ? "total" : ""}"><td>${row.label}</td><td>${metrics ? (clicks ? asMoney(spend / clicks, currency) : "-") : "-"}</td><td>${value(metrics, "impressions")}</td><td>${value(metrics, "clicks")}</td><td>${metrics ? asMoney(spend, currency) : "-"}</td><td>${value(metrics, "orders")}</td><td>${value(metrics, "units")}</td><td>${metrics ? asMoney(sales, currency) : "-"}</td><td>${metrics ? adsPercent(sales > 0 ? spend / sales : null) : "-"}</td></tr>`; }).join("")}</tbody></table></div></div>`;
+}
+
+function renderAdsCampaignCard(keyword, campaign, currency) {
+  return `<article class="ads-campaign-card">
+    <header><div><div class="ads-campaign-title-row"><strong>${adsMatchLabel(campaign.matchType)}</strong><span class="ads-object-state ${campaign.creationStatus === "COMPLETE" ? (campaign.desiredState === "ENABLED" ? "ready" : "draft") : "draft"}">${adsCampaignStatusLabel(campaign)}</span></div><span>${escapeHtml(campaign.name)}</span></div><div class="ads-object-actions">${campaign.creationStatus === "COMPLETE" ? `<button type="button" data-ads-campaign-state="${campaign.id}" data-next-state="${campaign.desiredState === "ENABLED" ? "PAUSED" : "ENABLED"}">${campaign.desiredState === "ENABLED" ? "暂停" : "开始"}</button><button class="danger" type="button" data-ads-campaign-stop="${campaign.id}">停止</button>` : ""}</div></header>
+    ${adsCampaignPerformanceTable(campaign, currency)}
+    <div class="ads-campaign-settings"><div class="ads-card-section-title"><strong>可设置</strong><span>保存后将更新 Amazon Ads</span></div><div class="ads-campaign-settings-fields"><label>日预算<input data-ads-campaign-budget type="number" min="0.01" step="0.01" value="${campaign.dailyBudget}"></label><label>顶部搜索 %<input data-ads-campaign-top type="number" min="0" max="900" step="1" value="${campaign.topOfSearchAdjustment}"></label><label>其余搜索 %<input data-ads-campaign-rest type="number" min="0" max="900" step="1" value="${campaign.restOfSearchAdjustment}"></label><label>商品页面 %<input data-ads-campaign-product type="number" min="0" max="900" step="1" value="${campaign.productPageAdjustment}"></label><button type="button" data-ads-save-campaign-settings="${campaign.id}">保存设置</button></div><div class="ads-unit-list">${campaign.units.map(unitRow => `<div class="ads-unit-row"><div><strong>${escapeHtml(unitRow.childAsin)}</strong><span>${escapeHtml(unitRow.sellerSku)}</span></div><label class="ads-unit-bid">出价 <input data-ads-unit-bid type="number" min="0.01" step="0.01" value="${unitRow.bid}"><button type="button" data-ads-save-unit-bid="${unitRow.id}">保存</button></label></div>`).join("")}</div></div>
+    ${campaign.error ? `<div class="ads-inline-error">${escapeHtml(campaign.failedStep)}：${escapeHtml(campaign.error)}</div>` : ""}
+  </article>`;
+}
+
+function renderAdsDetailProducts(keyword) {
+  const identities = [...new Map(keyword.campaigns.map(campaign => {
+    const unit = campaign.units[0] || {};
+    const childAsin = campaign.childAsin || unit.childAsin || "";
+    const sellerSku = campaign.sellerSku || unit.sellerSku || "";
+    return [`${childAsin}|${sellerSku}`, { childAsin, sellerSku, product: adsCampaignProduct(keyword, campaign) }];
+  })).values()];
+  if (!identities.length) return "";
+  return `<div class="ads-detail-products">${identities.map(({ childAsin, sellerSku, product }) => `<div class="ads-detail-product">${product?.imageUrl ? `<img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.internalName || childAsin)}" loading="lazy">` : `<span class="ads-detail-product-placeholder">无图</span>`}<div><strong>${escapeHtml(product?.internalName || "未设置内部名")}</strong><span>${escapeHtml(childAsin || "-")} · ${escapeHtml(sellerSku || "-")}</span></div></div>`).join("")}</div>`;
+}
+
+function renderAdsDetail() {
+  const panel = $("#adsDetailPanel");
+  const keyword = currentAdsKeyword();
+  if (!keyword) {
+    panel.innerHTML = `<div class="ads-empty-detail"><strong>选择一个关键词</strong><span>查看匹配方式、子 ASIN、出价和表现明细</span></div>`;
+    return;
+  }
+  if (keyword.lifecycleStatus === "CREATING") {
+    panel.innerHTML = `<div class="ads-detail-head"><div class="ads-detail-identity"><span>${escapeHtml(keyword.parentAsin)}</span><div class="ads-detail-title-row"><strong>${escapeHtml(keyword.keyword)}</strong><div class="ads-inline-group"><span>运营分组</span><span class="ads-group-badge ${keyword.group.toLowerCase()}">${adsGroupLabel(keyword.group)}</span></div></div></div><span class="ads-object-state draft">创建中</span></div><div class="ads-creation-progress"><strong>正在创建 Amazon Ads</strong><span>后台正依次创建 Campaign、Ad Group、Product Ad 与 Keyword Target。稍后刷新或重新点击该关键词即可查看进度和结果。</span></div>`;
+    return;
+  }
+  const currency = adsWorkspace.profile?.currencyCode || "USD";
+  const canDiscardPlan = keyword.campaigns.every(campaign => !campaign.amazonCampaignId && campaign.units.every(unit =>
+    !unit.amazonAdGroupId && !unit.amazonProductAdId && !unit.amazonTargetId
+  ));
+  const archivedCampaigns = keyword.campaigns.filter(campaign => campaign.lifecycleStatus === "STOPPED");
+  const activeCampaigns = keyword.campaigns.filter(campaign => campaign.lifecycleStatus !== "STOPPED");
+  const creationComplete = activeCampaigns.length > 0 && activeCampaigns.every(campaign =>
+    campaign.creationStatus === "COMPLETE" && Boolean(campaign.amazonCampaignId) && campaign.units.length > 0 &&
+    campaign.units.every(unit => unit.creationStatus === "COMPLETE" && unit.amazonAdGroupId && unit.amazonProductAdId && unit.amazonTargetId)
+  );
+  const keywordCanOperate = keyword.lifecycleStatus === "ACTIVE";
+  const keywordStateAction = activeCampaigns.some(campaign => campaign.desiredState === "ENABLED") ? "PAUSED" : "ENABLED";
+  const stoppedAt = keyword.stoppedAt || archivedCampaigns.map(campaign => campaign.stoppedAt).filter(Boolean).sort().at(-1) || "";
+  const keywordStatus = keyword.lifecycleStatus === "STOPPED"
+    ? `<span class="ads-object-state archived">已停止</span>`
+    : keyword.lifecycleStatus === "STOPPING"
+      ? `<span class="ads-object-state draft">停止中</span>`
+      : creationComplete
+        ? `<span class="ads-object-state ${keywordStateAction === "PAUSED" ? "ready" : "draft"}">${keywordStateAction === "PAUSED" ? "已开始" : "已暂停"}</span>`
+        : "";
+  panel.innerHTML = `
+    <div class="ads-detail-head">
+      <div class="ads-detail-identity"><span>${escapeHtml(keyword.parentAsin)}</span><div class="ads-detail-title-row"><strong>${escapeHtml(keyword.keyword)}</strong><div class="ads-inline-group"><span>运营分组</span>${keyword.lifecycleStatus === "ACTIVE" ? renderAdsGroupPicker(keyword) : `<span class="ads-group-badge ${keyword.group.toLowerCase()}">${adsGroupLabel(keyword.group)}</span>`}</div>${keywordStatus}</div>${renderAdsDetailProducts(keyword)}</div>
+      <div class="ads-detail-actions">
+        ${keyword.lifecycleStatus === "STOPPED" ? `<span class="ads-stop-time">停止时间：${escapeHtml(adsStopTimeLabel(stoppedAt))}</span>` : ""}
+        ${!creationComplete && keyword.lifecycleStatus !== "STOPPED" && keyword.lifecycleStatus !== "STOPPING" ? `${canDiscardPlan ? `<button class="danger" type="button" data-discard-ads-plan="${keyword.id}">关闭创建计划</button>` : ""}<button class="primary" type="button" data-preview-keyword="${keyword.id}">${canDiscardPlan ? "预览并创建" : "预览并续传"}</button>` : ""}
+        ${keywordCanOperate && activeCampaigns.length ? `<button type="button" data-ads-keyword-state="${keyword.id}" data-next-state="${keywordStateAction}">${keywordStateAction === "PAUSED" ? "暂停" : "开始"}</button><button class="danger" type="button" data-ads-keyword-stop="${keyword.id}">停止</button>` : ""}
+      </div>
+    </div>
+    <div class="ads-detail-summary">
+      <div><span>花费</span><strong>${asMoney(keyword.metrics.spend, currency)}</strong></div>
+      <div><span>销售额</span><strong>${asMoney(keyword.metrics.sales, currency)}</strong></div>
+      <div><span>订单</span><strong>${formatNumber(keyword.metrics.orders)}</strong></div>
+      <div><span>ACOS</span><strong>${adsPercent(keyword.metrics.acos)}</strong></div>
+    </div>
+    ${creationComplete ? renderAdsHistoryPanel(keyword) : ""}
+    ${creationComplete ? `<details class="ads-object-details" open><summary>投放对象与启停管理</summary>` : ""}
+    <div class="ads-campaign-stack ${creationComplete ? "compact" : ""}">
+      ${["EXACT", "PHRASE", "BROAD"].map(matchType => {
+        const campaigns = adsCampaignsFor(keyword, matchType);
+        if (!campaigns.length) return `<article class="ads-campaign-card empty"><div><strong>${adsMatchLabel(matchType)}</strong><span>尚未添加</span></div>${keyword.lifecycleStatus === "STOPPED" ? "" : `<button type="button" data-add-ads-match="${matchType}" data-keyword-id="${keyword.id}">添加</button>`}</article>`;
+        return campaigns.map(campaign => renderAdsCampaignCard(keyword, campaign, currency)).join("");
+      }).join("")}
+    </div>${creationComplete ? `</details>` : ""}
+    ${archivedCampaigns.length ? `<details class="ads-object-details ads-archived-object-details"><summary>已停止投放对象（${archivedCampaigns.length}）</summary><div class="ads-campaign-stack compact">${archivedCampaigns.map(campaign => `<article class="ads-campaign-card archived"><header><div><strong>${adsMatchLabel(campaign.matchType)}</strong><span>${escapeHtml(campaign.name)}</span></div><span class="ads-object-state archived">已停止</span></header><div class="ads-archived-campaign-note">该 Campaign 已暂停，并从当前投放管理中隐藏。</div></article>`).join("")}</div></details>` : ""}`;
+  if (creationComplete) queueMicrotask(() => loadAdsKeywordHistory(keyword.id));
+}
+
+function adsHistorySeriesPath(points, metricKey, bounds, maxValue) {
+  if (!points.length || !(maxValue >= 0)) return "";
+  const denominator = Math.max(1, points.length - 1);
+  return points.map((point, index) => {
+    const value = point[metricKey];
+    if (value === null || value === undefined || !Number.isFinite(Number(value))) return null;
+    const x = bounds.left + (index / denominator) * bounds.width;
+    const y = bounds.top + bounds.height - (Number(value) / Math.max(maxValue, 1e-9)) * bounds.height;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).filter(Boolean).join(" ");
+}
+
+function renderAdsHistoryChart(data) {
+  const chart = $("#adsHistoryChart");
+  if (!chart || currentAdsKeyword()?.id !== data.keyword.id) return;
+  const points = Array.isArray(data.points) ? data.points : [];
+  const metricA = adsHistoryState.metricA;
+  const metricB = adsHistoryState.metricB;
+  const configA = ADS_HISTORY_METRICS[metricA];
+  const configB = ADS_HISTORY_METRICS[metricB];
+  const numericA = points.map(point => point[metricA]).filter(value => value !== null && Number.isFinite(Number(value))).map(Number);
+  const numericB = points.map(point => point[metricB]).filter(value => value !== null && Number.isFinite(Number(value))).map(Number);
+  const maxA = Math.max(0, ...numericA);
+  const maxB = Math.max(0, ...numericB);
+  const bounds = { left: 66, top: 24, width: 688, height: 226 };
+  const pathA = adsHistorySeriesPath(points, metricA, bounds, maxA || 1);
+  const pathB = adsHistorySeriesPath(points, metricB, bounds, maxB || 1);
+  const currency = adsWorkspace.profile?.currencyCode || "USD";
+  const ticks = [0, 0.25, 0.5, 0.75, 1];
+  const xIndexes = [...new Set([0, Math.round((points.length - 1) * 0.25), Math.round((points.length - 1) * 0.5), Math.round((points.length - 1) * 0.75), points.length - 1])].filter(index => index >= 0);
+  chart.innerHTML = `<div class="ads-history-legend"><span><i class="primary"></i>${escapeHtml(configA.label)}</span><span><i class="secondary"></i>${escapeHtml(configB.label)}</span></div>
+    <svg class="ads-history-svg" viewBox="0 0 820 290" role="img" aria-label="关键词历史数据折线图">
+      ${ticks.map(ratio => {
+        const y = bounds.top + bounds.height - ratio * bounds.height;
+        return `<line x1="${bounds.left}" y1="${y}" x2="${bounds.left + bounds.width}" y2="${y}" class="ads-chart-grid"></line>
+          <text x="${bounds.left - 8}" y="${y + 4}" text-anchor="end" class="ads-chart-axis primary">${escapeHtml(formatAdsHistoryValue(maxA * ratio, metricA, currency))}</text>
+          <text x="${bounds.left + bounds.width + 8}" y="${y + 4}" class="ads-chart-axis secondary">${escapeHtml(formatAdsHistoryValue(maxB * ratio, metricB, currency))}</text>`;
+      }).join("")}
+      ${xIndexes.map(index => {
+        const x = bounds.left + (index / Math.max(1, points.length - 1)) * bounds.width;
+        return `<text x="${x}" y="${bounds.top + bounds.height + 24}" text-anchor="middle" class="ads-chart-date">${escapeHtml(points[index]?.date?.slice(5) || "")}</text>`;
+      }).join("")}
+      ${pathA ? `<polyline points="${pathA}" class="ads-chart-line primary"></polyline>` : ""}
+      ${pathB ? `<polyline points="${pathB}" class="ads-chart-line secondary"></polyline>` : ""}
+      ${points.map((point, index) => {
+        const x = bounds.left + (index / Math.max(1, points.length - 1)) * bounds.width;
+        const circles = [];
+        for (const [key, value, max, className] of [[metricA, point[metricA], maxA || 1, "primary"], [metricB, point[metricB], maxB || 1, "secondary"]]) {
+          if (value === null || value === undefined || !Number.isFinite(Number(value))) continue;
+          const y = bounds.top + bounds.height - (Number(value) / Math.max(max, 1e-9)) * bounds.height;
+          circles.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6" class="ads-chart-point ${className}"><title>${escapeHtml(point.date)} · ${escapeHtml(ADS_HISTORY_METRICS[key].label)} ${escapeHtml(formatAdsHistoryValue(value, key, currency))}</title></circle>`);
+        }
+        return circles.join("");
+      }).join("")}
+    </svg>
+    ${!numericA.length && !numericB.length ? `<div class="ads-history-empty">所选时间范围还没有数据，请先同步广告表现。</div>` : ""}`;
+}
+
+async function loadAdsKeywordHistory(keywordId) {
+  const chart = $("#adsHistoryChart");
+  if (!chart || !keywordId) return;
+  if (!isValidDateValue(adsHistoryState.startDate) || !isValidDateValue(adsHistoryState.endDate)) {
+    chart.innerHTML = `<div class="ads-inline-error">请选择完整的开始和结束日期</div>`;
+    return;
+  }
+  adsHistoryState = {
+    ...adsHistoryState,
+    keywordId,
+    childAsin: $("#adsHistoryAsin")?.value || "ALL",
+    matchType: $("#adsHistoryMatch")?.value || "ALL",
+    startDate: adsHistoryState.startDate || adsWorkspace.range?.startDate || "",
+    endDate: adsHistoryState.endDate || adsWorkspace.range?.endDate || "",
+    metricA: $("#adsHistoryMetricA")?.value || adsHistoryState.metricA,
+    metricB: $("#adsHistoryMetricB")?.value || adsHistoryState.metricB
+  };
+  chart.innerHTML = `<div class="ads-history-loading">正在读取历史数据…</div>`;
+  const query = new URLSearchParams({
+    startDate: adsHistoryState.startDate,
+    endDate: adsHistoryState.endDate,
+    childAsin: adsHistoryState.childAsin,
+    matchType: adsHistoryState.matchType
+  });
+  const requestSequence = ++adsHistoryRequestSequence;
+  try {
+    const data = await api(`/api/ads/keywords/${keywordId}/history?${query}`);
+    if (requestSequence !== adsHistoryRequestSequence || currentAdsKeyword()?.id !== keywordId) return;
+    renderAdsHistoryChart(data);
+  } catch (error) {
+    if (requestSequence === adsHistoryRequestSequence && chart.isConnected) chart.innerHTML = `<div class="ads-inline-error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function renderAdsWorkspace() {
+  renderAdsPortfolioGuard();
+  renderAdsProductTabs();
+  document.querySelectorAll(".ads-group-filter").forEach(button => button.classList.toggle("active", button.dataset.adsGroup === selectedAdsGroup));
+  renderAdsKeywordRows();
+  renderAdsDetail();
+}
+
+async function loadAdsWorkspace(options = {}) {
+  if (!selectedAdsProfileId) return;
+  if (options.refreshPortfolio) {
+    const result = await api("/api/ads/managed-portfolio?refresh=1");
+    adsWorkspace.portfolio = result.portfolio;
+  }
+  const startDate = $("#adsStartDate")?.value || "";
+  const endDate = $("#adsEndDate")?.value || "";
+  const query = new URLSearchParams({ ...(startDate ? { startDate } : {}), ...(endDate ? { endDate } : {}) });
+  const [workspaceData, templateData] = await Promise.all([
+    api(`/api/ads/workspace${query.toString() ? `?${query}` : ""}`),
+    api("/api/ads/template")
+  ]);
+  adsWorkspace = { ...workspaceData, portfolio: adsWorkspace.portfolio || workspaceData.portfolio };
+  adsCreationTemplate = templateData.template;
+  if (workspaceData.range) {
+    if ($("#adsStartDate") && !$("#adsStartDate").value) $("#adsStartDate").value = workspaceData.range.startDate;
+    if ($("#adsEndDate") && !$("#adsEndDate").value) $("#adsEndDate").value = workspaceData.range.endDate;
+  }
+  renderAdsWorkspace();
+}
+
+function adsKeywordFormRow(value = "", group = "NORMAL", removable = false) {
+  const labels = removable
+    ? { keyword: "", group: "" }
+    : { keyword: "关键词", group: "运营分组" };
+  return `<div class="ads-keyword-form-row ${removable ? "compact" : ""}"><label aria-label="关键词">${labels.keyword}<input class="ads-form-keyword" required maxlength="255" value="${escapeHtml(value)}" placeholder="例如 wall organizer"></label><label aria-label="运营分组">${labels.group}<select class="ads-form-keyword-group"><option value="NORMAL" ${group === "NORMAL" ? "selected" : ""}>普通</option><option value="PROMOTED" ${group === "PROMOTED" ? "selected" : ""}>主推</option><option value="STABLE" ${group === "STABLE" ? "selected" : ""}>已稳定</option></select></label>${removable ? `<button type="button" class="secondary-button ads-remove-keyword-row" aria-label="移除此关键词">−</button>` : `<span class="ads-keyword-row-spacer"></span>`}</div>`;
+}
+
+function renderAdsKeywordForm(parentAsin = selectedAdsParentAsin) {
+  const body = $("#adsKeywordFormBody");
+  const template = adsCreationTemplate || { dailyBudget: 8, defaultBid: 0.2, topOfSearchAdjustment: 200, restOfSearchAdjustment: 0, productPageAdjustment: 0, matches: { EXACT: true } };
+  const selectedProduct = adsWorkspace.products.find(item => item.parentAsin === parentAsin) || adsWorkspace.products[0];
+  if (!selectedProduct) {
+    body.innerHTML = `<div class="ads-inline-error">FBA库存中没有可选商品</div>`;
+    return;
+  }
+  const selectableChildren = selectedProduct.children;
+  const recommended = selectableChildren[0];
+  body.innerHTML = `
+    <div class="ads-form-grid">
+      <label class="full">父 ASIN / 内部名<select id="adsFormParentAsin">${adsWorkspace.products.map(product => `<option value="${escapeHtml(product.parentAsin)}" ${product.parentAsin === selectedProduct.parentAsin ? "selected" : ""}>${escapeHtml(product.internalName)} / ${escapeHtml(product.parentAsin)}</option>`).join("")}</select></label>
+      <div class="ads-keyword-batch full"><div class="ads-keyword-batch-head"><span>关键词与运营分组</span><button type="button" class="secondary-button" data-add-ads-keyword-row>＋ 添加关键词</button></div><div id="adsKeywordInputRows">${adsKeywordFormRow()}</div></div>
+      <div class="ads-placement-fields full"><label>Campaign 日预算<input id="adsFormBudget" type="number" min="0.01" step="0.01" value="${template.dailyBudget}"></label><label>默认出价<input id="adsFormBid" type="number" min="0.01" step="0.01" value="${template.defaultBid}"></label><label>顶部搜索加价 %<input id="adsFormTopAdjustment" type="number" min="0" max="900" step="1" value="${template.topOfSearchAdjustment}"></label><label>其余搜索加价 %<input id="adsFormRestAdjustment" type="number" min="0" max="900" step="1" value="${template.restOfSearchAdjustment || 0}"></label><label>商品页面加价 %<input id="adsFormProductAdjustment" type="number" min="0" max="900" step="1" value="${template.productPageAdjustment || 0}"></label></div>
+    </div>
+    <fieldset class="ads-form-section ads-match-section"><legend>匹配方式</legend><div class="ads-match-options">
+      ${["EXACT", "PHRASE", "BROAD"].map(match => `<label><input type="checkbox" name="adsMatch" value="${match}" ${template.matches?.[match] ? "checked" : ""}><span class="ads-match-check" aria-hidden="true">✓</span><strong>${adsMatchLabel(match)}</strong></label>`).join("")}
+    </div></fieldset>
+    <fieldset class="ads-form-section ads-sku-section"><legend>选择投放商品（可多选）</legend><p class="ads-form-hint">每个“关键词 × 子 ASIN × 匹配方式”都会创建独立 Campaign；同一关键词不能重复投放到同一子 ASIN。</p><div class="ads-sku-options">
+      ${selectableChildren.map(child => `<label class="ads-sku-card">
+        <input class="ads-sku-checkbox" type="checkbox" name="adsSku" data-child-asin="${escapeHtml(child.asin)}" value="${escapeHtml(`${child.asin}|${child.sellerSku}`)}" ${child === recommended ? "checked" : ""}>
+        <span class="ads-sku-visual">${child.imageUrl ? `<img src="${escapeHtml(child.imageUrl)}" alt="${escapeHtml(child.internalName || child.asin)}" loading="lazy">` : `<b>无图</b>`}</span>
+        <span class="ads-sku-copy">
+          <strong title="${escapeHtml(child.internalName || "未设置内部名")}">${escapeHtml(child.internalName || "未设置内部名")}</strong>
+          <span class="ads-sku-identifiers"><small><b>ASIN</b>${escapeHtml(child.asin)}</small><small><b>SKU</b>${escapeHtml(child.sellerSku)}</small></span>
+        </span>
+        <span class="ads-sku-check" aria-hidden="true">✓</span>
+      </label>`).join("")}
+    </div></fieldset>`;
+}
+
+function openAdsKeywordDialog() {
+  renderAdsKeywordForm();
+  $("#adsKeywordDialog").showModal();
+}
+
+async function saveAdsKeywordDraft(event) {
+  event.preventDefault();
+  const units = [...document.querySelectorAll('input[name="adsSku"]:checked')].map(input => {
+    const [childAsin, ...sellerSku] = input.value.split("|");
+    return { childAsin, sellerSku: sellerSku.join("|") };
+  });
+  const matches = [...document.querySelectorAll('input[name="adsMatch"]:checked')].map(input => input.value);
+  const keywords = [...document.querySelectorAll(".ads-keyword-form-row")].map(row => ({
+    keyword: row.querySelector(".ads-form-keyword")?.value.trim() || "",
+    group: row.querySelector(".ads-form-keyword-group")?.value || "NORMAL"
+  }));
+  if (!keywords.length || keywords.some(item => !item.keyword)) {
+    alert("请填写每一行关键词");
+    return;
+  }
+  if (!matches.length || !units.length) {
+    alert("请至少选择一种匹配方式和一个投放商品");
+    return;
+  }
+  const duplicateKeyword = keywords
+    .map(item => item.keyword.trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US"))
+    .find((value, index, values) => values.indexOf(value) !== index);
+  if (duplicateKeyword) {
+    alert(`添加列表中有重复关键词：“${duplicateKeyword}”。请保留一行后再添加。`);
+    return;
+  }
+  const campaignCount = keywords.length * units.length * matches.length;
+  if (!confirm(`确认添加 ${keywords.length} 个关键词、${units.length} 个子 ASIN，并创建 ${campaignCount} 个 Campaign？\n\n每个关键词只对应一个子 ASIN；若某个子 ASIN 已有相同关键词，系统会拒绝重复添加。创建期间可在关键词详情查看“创建中”状态。`)) return;
+  const button = $("#adsSaveKeywordBtn");
+  setBusy(button, true, "添加中");
+  try {
+    const result = await api("/api/ads/keywords/create-now", { method: "POST", body: {
+      parentAsin: $("#adsFormParentAsin").value, keywords,
+      dailyBudget: $("#adsFormBudget").value, defaultBid: $("#adsFormBid").value, topOfSearchAdjustment: $("#adsFormTopAdjustment").value,
+      restOfSearchAdjustment: $("#adsFormRestAdjustment").value, productPageAdjustment: $("#adsFormProductAdjustment").value,
+      matches, units
+    }});
+    selectedAdsParentAsin = $("#adsFormParentAsin").value;
+    selectedAdsKeywordId = result.keywordIds?.[0] || "";
+    $("#adsKeywordDialog").close();
+    await loadAdsWorkspace();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    setBusy(button, false, "添加");
+  }
+}
+
+function renderAdsOperationPreview(data) {
+  const preview = data.preview;
+  const currency = preview.profile.currencyCode || "USD";
+  const discardButton = $("#adsDiscardPlanPreviewBtn");
+  if (discardButton) {
+    discardButton.hidden = Boolean(preview.preserveExistingKeyword) || preview.campaigns.some(campaign => campaign.amazonCampaignId || campaign.adGroups.some(unit =>
+      unit.amazonAdGroupId || unit.amazonProductAdId || unit.amazonTargetId
+    ));
+    discardButton.dataset.keywordId = preview.keyword.id;
+  }
+  $("#adsPreviewBody").innerHTML = `
+    <div id="adsOperationStatus" class="ads-operation-status" data-status="PREVIEW"><strong>等待确认</strong><span>尚未调用 Amazon Ads 创建接口</span></div>
+    <div class="ads-preview-warning"><strong>即将执行真实 Amazon Ads 创建</strong><span>请逐项核对；关闭窗口不会创建任何对象。</span></div>
+    <div class="ads-preview-context">
+      <div><span>Profile</span><strong>${escapeHtml(preview.profile.countryCode)} / ${escapeHtml(currency)} / ${escapeHtml(preview.profile.accountName)}</strong><small>${escapeHtml(preview.profile.profileId)}</small></div>
+      <div><span>Portfolio</span><strong>${escapeHtml(preview.portfolio.name)}</strong><small>${preview.portfolio.action === "CREATE" ? "将创建新的 Portfolio" : `使用 ${escapeHtml(preview.portfolio.portfolioId)}`}</small></div>
+      <div><span>父 ASIN</span><strong>${escapeHtml(preview.keyword.parentAsin)}</strong><small>${escapeHtml(preview.keyword.text)} · ${adsGroupLabel(preview.keyword.group)}${preview.keyword.creationBatch ? ` · TS ${escapeHtml(preview.keyword.creationBatch)}` : ""}</small></div>
+    </div>
+    <div class="ads-preview-object-list">
+      ${preview.campaigns.map(campaign => `<article>
+        <header><div><strong>${adsMatchLabel(campaign.matchType)} Campaign</strong><span>${escapeHtml(campaign.name)}</span></div><b>${campaign.action === "CREATE" ? "新建" : "续传"}</b></header>
+        <div class="ads-preview-params"><span>预算 <strong>${asMoney(campaign.dailyBudget, currency)}</strong></span><span>顶部加价 <strong>${campaign.topOfSearchAdjustment}%</strong></span><span>其余搜索 <strong>${campaign.restOfSearchAdjustment || 0}%</strong></span><span>商品页面 <strong>${campaign.productPageAdjustment || 0}%</strong></span><span>状态 <strong>${adsStateLabel(campaign.state)}</strong></span><span>开始日期 <strong>${escapeHtml(campaign.startDate)}</strong></span></div>
+        ${campaign.adGroups.map(unit => `<div class="ads-preview-unit"><div><strong>Ad Group</strong><span>${escapeHtml(unit.name)}</span></div><div><span>子 ASIN</span><b>${escapeHtml(unit.childAsin)}</b></div><div><span>Seller SKU</span><b>${escapeHtml(unit.sellerSku)}</b></div><div><span>Keyword Target</span><b>${escapeHtml(preview.keyword.text)} / ${campaign.matchType}</b></div><div><span>出价</span><b>${asMoney(unit.bid, currency)}</b></div></div>`).join("")}
+      </article>`).join("")}
+    </div>
+    <div class="ads-preview-total">将处理 <strong>${preview.campaigns.length}</strong> 个 Campaign、<strong>${preview.campaigns.reduce((sum, item) => sum + item.adGroups.length, 0)}</strong> 个 Ad Group，并为每个投放单元创建或续传 Product Ad 与 Keyword Target。</div>`;
+}
+
+function renderAdsOperationStatus(status, message = "") {
+  const node = $("#adsOperationStatus");
+  if (!node) return;
+  const normalized = String(status || "PREVIEW").toUpperCase();
+  const labels = {
+    PREVIEW: ["等待确认", "尚未调用 Amazon Ads 创建接口"],
+    RUNNING: ["正在创建", "请求已经到达服务器，正在调用 Amazon Ads API，请勿重复操作"],
+    COMPLETE: ["创建成功", "Amazon Ads 对象已经创建并记录到数据库"],
+    FAILED: ["创建失败", "创建过程已停止，可根据错误继续处理"]
+  };
+  const [title, fallback] = labels[normalized] || [normalized, ""];
+  node.dataset.status = normalized;
+  node.innerHTML = `<strong>${escapeHtml(title)}</strong><span>${escapeHtml(message || fallback)}</span>`;
+}
+
+async function settleAdsOperationUi(operationId, fallbackError = "") {
+  let statusData = null;
+  try {
+    statusData = await api(`/api/ads/operations/${operationId}`);
+  } catch {
+    // Keep the original error when the status endpoint is unavailable too.
+  }
+  const button = $("#adsConfirmOperationBtn");
+  const status = String(statusData?.status || "FAILED").toUpperCase();
+  if (status === "COMPLETE") {
+    if ($("#adsPreviewDialog")?.open) $("#adsPreviewDialog").close();
+    button.disabled = false;
+    button.textContent = "我已核对，确认创建";
+    pendingAdsOperation = null;
+    await loadAdsWorkspace({ refreshPortfolio: true }).catch(() => {});
+    return;
+  }
+  if (status === "RUNNING") {
+    renderAdsOperationStatus("RUNNING");
+    button.disabled = true;
+    button.textContent = "创建中...";
+    return;
+  }
+  const error = statusData?.error || fallbackError || (status === "PREVIEW" ? "确认请求没有到达创建流程，请检查网络后重试" : "创建失败");
+  renderAdsOperationStatus("FAILED", error);
+  button.disabled = false;
+  button.textContent = status === "PREVIEW" ? "重新确认创建" : "重试未完成步骤";
+}
+
+async function previewAdsKeywordCreation(keywordId) {
+  const data = await api("/api/ads/operations/preview", { method: "POST", body: { keywordId } });
+  pendingAdsOperation = data;
+  renderAdsOperationPreview(data);
+  $("#adsPreviewDialog").showModal();
+}
+
+async function addAdsKeywordMatch(keywordId, matchType, button) {
+  const label = adsMatchLabel(matchType);
+  if (!confirm(`确认直接添加“${label}”匹配方式？\n\n系统会立即在后台创建对应的 Amazon Ads Campaign、Ad Group、Product Ad 与 Keyword Target。`)) return;
+  setBusy(button, true, "创建中");
+  try {
+    const data = await api(`/api/ads/keywords/${keywordId}/matches`, { method: "POST", body: { matchType } });
+    await loadAdsWorkspace();
+    await api(`/api/ads/operations/${data.operationId}/start`, { method: "POST", body: { confirmationToken: data.confirmationToken } });
+    await loadAdsWorkspace();
+  } catch (error) {
+    await loadAdsWorkspace().catch(() => {});
+    throw error;
+  } finally {
+    setBusy(button, false, "添加");
+  }
+}
+
+async function setAdsKeywordState(keywordId, nextState, button) {
+  const action = nextState === "PAUSED" ? "暂停" : "开始";
+  if (!confirm(`确认${action}该关键词下所有未停止的广告活动？`)) return;
+  setBusy(button, true, `${action}中`);
+  try {
+    await api(`/api/ads/keywords/${keywordId}/state`, { method: "PUT", body: { state: nextState } });
+    await loadAdsWorkspace();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    setBusy(button, false, action);
+  }
+}
+
+async function stopAdsKeyword(keywordId, button) {
+  if (!confirm("确认停止此关键词？\n\n系统会依次暂停其下所有广告 Campaign。期间状态会显示为“停止中”；仅全部暂停成功后，关键词才会进入左侧“停止”。此操作会更新 Amazon Ads。")) return;
+  setBusy(button, true, "停止中");
+  try {
+    await api(`/api/ads/keywords/${keywordId}/stop`, { method: "POST" });
+    selectedAdsGroup = "STOPPED";
+    selectedAdsKeywordId = keywordId;
+    await loadAdsWorkspace();
+  } catch (error) {
+    alert(`停止未完成：${error.message}`);
+    await loadAdsWorkspace().catch(() => {});
+  } finally {
+    setBusy(button, false, "停止");
+  }
+}
+
+async function confirmAdsOperation() {
+  if (!pendingAdsOperation) return;
+  const operationId = pendingAdsOperation.operationId;
+  const button = $("#adsConfirmOperationBtn");
+  setBusy(button, true, "我已核对，确认创建");
+  renderAdsOperationStatus("RUNNING");
+  try {
+    await api(`/api/ads/operations/${operationId}/confirm`, {
+      method: "POST",
+      body: { confirmationToken: pendingAdsOperation.confirmationToken }
+    });
+    await settleAdsOperationUi(operationId);
+  } catch (error) {
+    await settleAdsOperationUi(operationId, error.message);
+    await loadAdsWorkspace().catch(() => {});
+  }
+}
+
+async function discardAdsCreationPlan(keywordId, button = null) {
+  if (!keywordId) return;
+  if (!confirm("确认关闭这个创建计划？\n\n只会删除尚未创建的本地草稿、Campaign、Ad Group 和预览记录，不会操作 Amazon Ads。")) return;
+  if (button) setBusy(button, true, "关闭创建计划");
+  try {
+    await api(`/api/ads/keywords/${keywordId}`, { method: "DELETE" });
+    if ($("#adsPreviewDialog")?.open) $("#adsPreviewDialog").close();
+    pendingAdsOperation = null;
+    selectedAdsKeywordId = "";
+    await loadAdsWorkspace();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    if (button?.isConnected) setBusy(button, false, "关闭创建计划");
+  }
+}
+
+async function syncAdsPerformance() {
+  const button = $("#adsSyncBtn");
+  setBusy(button, true, "同步广告数据");
+  try {
+    const result = await api("/api/ads/sync", { method: "POST", body: { startDate: $("#adsStartDate").value, endDate: $("#adsEndDate").value } });
+    if (!result.jobs?.length) {
+      alert(result.message || "没有需要同步的受管广告");
+      return;
+    }
+    alert(`已提交 ${result.jobs.length} 个广告报表任务。任务会在后台完成并按日期覆盖保存。`);
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    setBusy(button, false, "同步广告数据");
+  }
 }
 
 async function renderMailPanel() {
@@ -3341,6 +4231,213 @@ $("#fbaReplenishmentToggleBtn").addEventListener("click", async () => {
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
 $("#adsProfileSelect").addEventListener("change", event => selectAdsProfile(event.target.value).catch(error => alert(error.message)));
+$("#adsQueryBtn").addEventListener("click", () => loadAdsWorkspace().catch(error => alert(error.message)));
+$("#adsSyncBtn").addEventListener("click", syncAdsPerformance);
+$("#adsAddKeywordBtn").addEventListener("click", openAdsKeywordDialog);
+$("#adsKeywordSearch").addEventListener("input", renderAdsKeywordRows);
+$("#adsKeywordForm").addEventListener("submit", saveAdsKeywordDraft);
+$("#adsProductTabs").addEventListener("click", event => {
+  const button = event.target.closest("[data-ads-parent]");
+  if (!button) return;
+  selectedAdsParentAsin = button.dataset.adsParent;
+  selectedAdsKeywordId = "";
+  renderAdsWorkspace();
+});
+$("#adsProductTabs").addEventListener("dragstart", event => {
+  const button = event.target.closest("[data-ads-parent]");
+  if (!button) return;
+  draggedAdsParentAsin = button.dataset.adsParent || "";
+  event.dataTransfer.effectAllowed = "move";
+  event.dataTransfer.setData("text/plain", draggedAdsParentAsin);
+  button.classList.add("dragging");
+});
+$("#adsProductTabs").addEventListener("dragover", event => {
+  const button = event.target.closest("[data-ads-parent]");
+  if (!button || !draggedAdsParentAsin || button.dataset.adsParent === draggedAdsParentAsin) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "move";
+  document.querySelectorAll(".ads-product-tab.drag-over").forEach(node => node.classList.remove("drag-over"));
+  button.classList.add("drag-over");
+});
+$("#adsProductTabs").addEventListener("drop", event => {
+  const button = event.target.closest("[data-ads-parent]");
+  document.querySelectorAll(".ads-product-tab.drag-over").forEach(node => node.classList.remove("drag-over"));
+  if (!button) return;
+  event.preventDefault();
+  moveAdsParentTab(button.dataset.adsParent || "");
+});
+$("#adsProductTabs").addEventListener("dragend", event => {
+  event.target.closest("[data-ads-parent]")?.classList.remove("dragging");
+  document.querySelectorAll(".ads-product-tab.drag-over").forEach(node => node.classList.remove("drag-over"));
+  draggedAdsParentAsin = "";
+});
+document.querySelectorAll(".ads-group-filter").forEach(button => button.addEventListener("click", () => {
+  selectedAdsGroup = button.dataset.adsGroup;
+  renderAdsWorkspace();
+}));
+$("#adsKeywordRows").addEventListener("click", event => {
+  const row = event.target.closest("[data-ads-keyword-id]");
+  if (!row) return;
+  selectedAdsKeywordId = row.dataset.adsKeywordId;
+  renderAdsKeywordRows();
+  renderAdsDetail();
+});
+$("#adsKeywordFormBody").addEventListener("change", event => {
+  if (event.target.id === "adsFormParentAsin") {
+    renderAdsKeywordForm(event.target.value);
+    return;
+  }
+  if (event.target.matches('input[name="adsSku"]') && event.target.checked) {
+    const childAsin = event.target.dataset.childAsin || "";
+    document.querySelectorAll('input[name="adsSku"]:checked').forEach(input => {
+      if (input !== event.target && input.dataset.childAsin === childAsin) input.checked = false;
+    });
+  }
+});
+$("#adsKeywordFormBody").addEventListener("click", event => {
+  if (event.target.closest("[data-add-ads-keyword-row]")) {
+    $("#adsKeywordInputRows")?.insertAdjacentHTML("beforeend", adsKeywordFormRow("", "NORMAL", true));
+    return;
+  }
+  const removeButton = event.target.closest(".ads-remove-keyword-row");
+  if (!removeButton) return;
+  const rows = document.querySelectorAll(".ads-keyword-form-row");
+  if (rows.length <= 1) return;
+  removeButton.closest(".ads-keyword-form-row")?.remove();
+});
+$("#adsDetailPanel").addEventListener("change", event => {
+  if (["adsHistoryAsin", "adsHistoryMatch", "adsHistoryMetricA", "adsHistoryMetricB"].includes(event.target.id)) {
+    if (["adsHistoryMetricA", "adsHistoryMetricB"].includes(event.target.id)) {
+      const metricA = $("#adsHistoryMetricA");
+      const metricB = $("#adsHistoryMetricB");
+      if (metricA?.value === metricB?.value) {
+        const other = Object.keys(ADS_HISTORY_METRICS).find(key => key !== event.target.value && !ADS_HISTORY_METRICS[key].unavailable);
+        if (event.target.id === "adsHistoryMetricA") metricB.value = other;
+        else metricA.value = other;
+      }
+    }
+    loadAdsKeywordHistory(selectedAdsKeywordId);
+    return;
+  }
+});
+$("#adsDetailPanel").addEventListener("click", event => {
+  const groupToggle = event.target.closest("[data-ads-group-toggle]");
+  if (groupToggle) {
+    const menu = groupToggle.closest("[data-ads-group-picker]")?.querySelector("[data-ads-group-menu]");
+    if (!menu) return;
+    const willOpen = menu.hidden;
+    document.querySelectorAll("[data-ads-group-menu]").forEach(item => { item.hidden = true; });
+    document.querySelectorAll("[data-ads-group-toggle]").forEach(item => item.setAttribute("aria-expanded", "false"));
+    menu.hidden = !willOpen;
+    groupToggle.setAttribute("aria-expanded", String(willOpen));
+    return;
+  }
+  const groupOption = event.target.closest("[data-ads-group-option]");
+  if (groupOption) {
+    const group = groupOption.dataset.adsGroupOption;
+    const keywordId = groupOption.dataset.adsKeywordId;
+    api(`/api/ads/keywords/${keywordId}/group`, { method: "PUT", body: { group } })
+      .then(() => loadAdsWorkspace()).catch(error => alert(error.message));
+    return;
+  }
+  if (event.target.closest("#adsHistoryDateRange")) {
+    event.stopPropagation();
+    openAdsHistoryDatePicker();
+    return;
+  }
+  if (event.target.closest("#adsHistoryQueryBtn")) {
+    loadAdsKeywordHistory(selectedAdsKeywordId);
+    return;
+  }
+  const campaignSettingsButton = event.target.closest("[data-ads-save-campaign-settings]");
+  if (campaignSettingsButton) {
+    const card = campaignSettingsButton.closest(".ads-campaign-card");
+    const settings = {
+      dailyBudget: card?.querySelector("[data-ads-campaign-budget]")?.value,
+      topOfSearchAdjustment: card?.querySelector("[data-ads-campaign-top]")?.value,
+      restOfSearchAdjustment: card?.querySelector("[data-ads-campaign-rest]")?.value,
+      productPageAdjustment: card?.querySelector("[data-ads-campaign-product]")?.value
+    };
+    if (!confirm(`确认更新此 Campaign 的日预算和位置加价？\n\n预算：${settings.dailyBudget}\n顶部搜索：${settings.topOfSearchAdjustment}%\n其余搜索：${settings.restOfSearchAdjustment}%\n商品页面：${settings.productPageAdjustment}%`)) return;
+    setBusy(campaignSettingsButton, true, "保存中");
+    api(`/api/ads/campaigns/${campaignSettingsButton.dataset.adsSaveCampaignSettings}/settings`, { method: "PUT", body: settings })
+      .then(() => loadAdsWorkspace()).catch(error => alert(error.message)).finally(() => setBusy(campaignSettingsButton, false, "保存设置"));
+    return;
+  }
+  const unitBidButton = event.target.closest("[data-ads-save-unit-bid]");
+  if (unitBidButton) {
+    const row = unitBidButton.closest(".ads-unit-row");
+    const bid = row?.querySelector("[data-ads-unit-bid]")?.value;
+    if (!confirm(`确认将此子 ASIN 的 Ad Group 默认出价和关键词出价更新为 ${bid}？`)) return;
+    setBusy(unitBidButton, true, "保存中");
+    api(`/api/ads/ad-units/${unitBidButton.dataset.adsSaveUnitBid}/bid`, { method: "PUT", body: { bid } })
+      .then(() => loadAdsWorkspace()).catch(error => alert(error.message)).finally(() => setBusy(unitBidButton, false, "保存"));
+    return;
+  }
+  const discardButton = event.target.closest("[data-discard-ads-plan]");
+  if (discardButton) {
+    discardAdsCreationPlan(discardButton.dataset.discardAdsPlan, discardButton);
+    return;
+  }
+  const previewButton = event.target.closest("[data-preview-keyword]");
+  if (previewButton) {
+    previewAdsKeywordCreation(previewButton.dataset.previewKeyword).catch(error => alert(error.message));
+    return;
+  }
+  const addMatchButton = event.target.closest("[data-add-ads-match]");
+  if (addMatchButton) {
+    addAdsKeywordMatch(addMatchButton.dataset.keywordId, addMatchButton.dataset.addAdsMatch, addMatchButton).catch(error => alert(error.message));
+    return;
+  }
+  const keywordStateButton = event.target.closest("[data-ads-keyword-state]");
+  if (keywordStateButton) {
+    setAdsKeywordState(keywordStateButton.dataset.adsKeywordState, keywordStateButton.dataset.nextState, keywordStateButton);
+    return;
+  }
+  const keywordStopButton = event.target.closest("[data-ads-keyword-stop]");
+  if (keywordStopButton) {
+    stopAdsKeyword(keywordStopButton.dataset.adsKeywordStop, keywordStopButton);
+    return;
+  }
+  const campaignButton = event.target.closest("[data-ads-campaign-state]");
+  if (campaignButton) {
+    const action = campaignButton.dataset.nextState === "PAUSED" ? "暂停" : "开始";
+    const asin = campaignButton.closest(".ads-campaign-card")?.querySelector(".ads-campaign-product span")?.textContent?.split(" · ")[0] || "该子 ASIN";
+    if (!confirm(`确认${action}子 ASIN ${asin} 的这个 Campaign？`)) return;
+    api(`/api/ads/campaigns/${campaignButton.dataset.adsCampaignState}/state`, { method: "PUT", body: { state: campaignButton.dataset.nextState } })
+      .then(() => loadAdsWorkspace()).catch(error => alert(error.message));
+    return;
+  }
+  const campaignStopButton = event.target.closest("[data-ads-campaign-stop]");
+  if (campaignStopButton) {
+    const asin = campaignStopButton.closest(".ads-campaign-card")?.querySelector(".ads-campaign-product span")?.textContent?.split(" · ")[0] || "该子 ASIN";
+    if (!confirm(`确认停止子 ASIN ${asin} 的这个 Campaign？\n\n它会暂停该子 ASIN 下的广告，并移入“已停止投放对象”。此操作会更新 Amazon Ads。`)) return;
+    setBusy(campaignStopButton, true, "停止中");
+    api(`/api/ads/campaigns/${campaignStopButton.dataset.adsCampaignStop}/stop`, { method: "POST" })
+      .then(() => loadAdsWorkspace()).catch(error => alert(`停止未完成：${error.message}`)).finally(() => setBusy(campaignStopButton, false, "停止"));
+    return;
+  }
+  const unitButton = event.target.closest("[data-ads-unit-state]");
+  if (unitButton) {
+    const action = unitButton.dataset.nextState === "PAUSED" ? "暂停" : "开始";
+    if (!confirm(`确认${action}这个子 ASIN 的 Ad Group、Product Ad 和 Keyword Target？`)) return;
+    api(`/api/ads/ad-units/${unitButton.dataset.adsUnitState}/state`, { method: "PUT", body: { state: unitButton.dataset.nextState } })
+      .then(() => loadAdsWorkspace()).catch(error => alert(error.message));
+  }
+});
+function updateAdsGroupHoverHelp(event) {
+  const option = event.target.closest("[data-ads-group-option]");
+  if (!option) return;
+  const picker = option.closest("[data-ads-group-picker]");
+  const help = picker?.querySelector("[data-ads-group-help]");
+  if (help) help.textContent = ADS_GROUP_DESCRIPTIONS[option.dataset.adsGroupOption] || "";
+}
+$("#adsDetailPanel").addEventListener("pointerover", updateAdsGroupHoverHelp);
+$("#adsDetailPanel").addEventListener("mouseover", updateAdsGroupHoverHelp);
+$("#adsConfirmOperationBtn").addEventListener("click", confirmAdsOperation);
+$("#adsDiscardPlanPreviewBtn").addEventListener("click", event => discardAdsCreationPlan(event.currentTarget.dataset.keywordId, event.currentTarget));
+document.querySelectorAll("[data-close-ads-dialog]").forEach(button => button.addEventListener("click", () => $("#adsKeywordDialog").close()));
+document.querySelectorAll("[data-close-ads-preview]").forEach(button => button.addEventListener("click", () => $("#adsPreviewDialog").close()));
 $("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(error => alert(error.message)));
 $("#factoryRefreshBtn").addEventListener("click", () => loadFactoryInventory().catch(error => alert(error.message)));
 $("#factorySearch").addEventListener("input", renderFactoryInventory);
@@ -3633,11 +4730,56 @@ $("#fbaDatePicker").addEventListener("click", event => {
 $("#fbaDatePicker").addEventListener("pointerdown", event => {
   event.stopPropagation();
 });
+$("#adsHistoryDatePicker").addEventListener("click", event => {
+  event.stopPropagation();
+  const nav = event.target?.closest?.("[data-ads-history-date-nav]")?.dataset?.adsHistoryDateNav;
+  if (nav) {
+    adsHistoryDatePickerMonth = shiftMonth(adsHistoryDatePickerMonth, Number(nav));
+    renderAdsHistoryDatePicker();
+    return;
+  }
+  const quickType = event.target?.closest?.("[data-ads-history-date-quick]")?.dataset?.adsHistoryDateQuick;
+  if (quickType) {
+    const range = quickDateRange(quickType);
+    adsHistoryState.startDate = range.startDate;
+    adsHistoryState.endDate = range.endDate;
+    adsHistoryDatePickerMonth = range.endDate.slice(0, 7);
+    updateAdsHistoryDateRangeInput();
+    closeAdsHistoryDatePicker();
+    return;
+  }
+  const dayButton = event.target?.closest?.("[data-ads-history-date]");
+  const date = dayButton?.dataset?.adsHistoryDate;
+  if (!date || !adsHistoryDatePickerOpen || dayButton?.disabled || isDateDisabled(date)) return;
+  if (!adsHistoryState.startDate || adsHistoryState.endDate || date < adsHistoryState.startDate) {
+    adsHistoryState.startDate = date;
+    adsHistoryState.endDate = "";
+    adsHistoryDatePickerMonth = date.slice(0, 7);
+    updateAdsHistoryDateRangeInput();
+    renderAdsHistoryDatePicker();
+    return;
+  }
+  adsHistoryState.endDate = date;
+  updateAdsHistoryDateRangeInput();
+  closeAdsHistoryDatePicker();
+});
+$("#adsHistoryDatePicker").addEventListener("pointerdown", event => event.stopPropagation());
 document.addEventListener("click", event => {
   const picker = $("#fbaDatePicker");
   if (!picker || picker.hidden) return;
   if (picker.contains(event.target) || event.target?.id === "salesDateRange") return;
   closeDatePicker();
+});
+document.addEventListener("click", event => {
+  const picker = $("#adsHistoryDatePicker");
+  if (!picker || picker.hidden) return;
+  if (picker.contains(event.target) || event.target?.id === "adsHistoryDateRange") return;
+  closeAdsHistoryDatePicker();
+});
+document.addEventListener("click", event => {
+  if (event.target.closest("[data-ads-group-picker]")) return;
+  document.querySelectorAll("[data-ads-group-menu]").forEach(menu => { menu.hidden = true; });
+  document.querySelectorAll("[data-ads-group-toggle]").forEach(toggle => toggle.setAttribute("aria-expanded", "false"));
 });
 $("#globalSearch").addEventListener("input", () => {
   const value = $("#globalSearch").value;

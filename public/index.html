@@ -155,29 +155,90 @@
             </div>
           </div>
 
-          <section class="panel ads-panel">
-            <div class="panel-head">
-              <h2>下一步报表</h2>
+          <section class="ads-control-bar">
+            <div id="adsPortfolioGuard" class="ads-portfolio-guard loading">
+              <strong>正在检查 AmzAllBlue_ERP</strong>
+              <span>只读取和管理这个广告组合</span>
             </div>
-            <div class="ads-report-grid">
-              <div>
-                <strong>花费</strong>
-                <span>按日期、Campaign、ASIN 统计广告 spend</span>
-              </div>
-              <div>
-                <strong>广告销售额</strong>
-                <span>读取 attributed sales，用于核算投产</span>
-              </div>
-              <div>
-                <strong>ACOS / ROAS</strong>
-                <span>结合 spend 和广告销售额自动计算</span>
-              </div>
-              <div>
-                <strong>库存联动</strong>
-                <span>把广告销量和 FBA 库存放到同一张运营表</span>
-              </div>
+            <div class="ads-range-actions">
+              <label>开始日期<input id="adsStartDate" type="date"></label>
+              <label>结束日期<input id="adsEndDate" type="date"></label>
+              <button id="adsQueryBtn" class="secondary-button" type="button">查询表现</button>
+              <button id="adsSyncBtn" class="secondary-button" type="button">同步广告数据</button>
+              <button id="adsAddKeywordBtn" class="primary" type="button">添加关键词</button>
             </div>
           </section>
+
+          <div id="adsProductTabs" class="ads-product-tabs"></div>
+
+          <section class="ads-workbench">
+            <aside class="ads-groups-panel">
+              <div class="ads-panel-title">
+                <strong>关键词分组</strong>
+                <span id="adsKeywordCount">0 个关键词</span>
+              </div>
+              <button class="ads-group-filter active" data-ads-group="ALL"><span>全部</span><strong id="adsGroupCountAll">0</strong></button>
+              <button class="ads-group-filter" data-ads-group="STABLE"><span>已稳定</span><strong id="adsGroupCountStable">0</strong></button>
+              <button class="ads-group-filter" data-ads-group="PROMOTED"><span>主推</span><strong id="adsGroupCountPromoted">0</strong></button>
+              <button class="ads-group-filter" data-ads-group="NORMAL"><span>普通</span><strong id="adsGroupCountNormal">0</strong></button>
+              <button class="ads-group-filter archived" data-ads-group="STOPPED"><span>停止</span><strong id="adsGroupCountArchived">0</strong></button>
+              <p>分组用于运营管理，不会自动改变广告启停状态。</p>
+            </aside>
+
+            <section class="ads-keyword-panel">
+              <div class="ads-panel-title ads-keyword-toolbar">
+                <div>
+                  <strong id="adsCurrentProductName">选择产品</strong>
+                  <span id="adsCurrentParentAsin"></span>
+                </div>
+                <input id="adsKeywordSearch" placeholder="搜索关键词、子 ASIN、Seller SKU">
+              </div>
+              <div class="ads-keyword-table-wrap">
+                <table class="ads-keyword-table">
+                  <thead>
+                    <tr><th>关键词</th><th>子 ASIN</th><th>分组</th><th>精准</th><th>词组</th><th>广泛</th><th>花费</th><th>销售额</th><th>ACOS</th></tr>
+                  </thead>
+                  <tbody id="adsKeywordRows"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <aside id="adsDetailPanel" class="ads-detail-panel">
+              <div class="ads-empty-detail">
+                <strong>选择一个关键词</strong>
+                <span>查看匹配方式、子 ASIN、出价和表现明细</span>
+              </div>
+            </aside>
+          </section>
+
+          <div id="adsHistoryDatePicker" class="date-picker-popover" hidden></div>
+
+          <dialog id="adsKeywordDialog" class="ads-dialog">
+            <form id="adsKeywordForm" method="dialog">
+              <div class="ads-dialog-head">
+                <div><strong>添加关键词</strong><span>确认后将后台创建 Amazon 广告</span></div>
+                <button type="button" data-close-ads-dialog aria-label="关闭">×</button>
+              </div>
+              <div id="adsKeywordFormBody" class="ads-dialog-body"></div>
+              <div class="ads-dialog-actions">
+                <button type="button" class="secondary-button" data-close-ads-dialog>取消</button>
+                <button id="adsSaveKeywordBtn" type="submit" class="primary">添加</button>
+              </div>
+            </form>
+          </dialog>
+
+          <dialog id="adsPreviewDialog" class="ads-dialog ads-preview-dialog">
+            <div class="ads-dialog-head">
+              <div><strong>确认 Amazon Ads 操作</strong><span>以下内容将作为实际执行参数</span></div>
+              <button type="button" data-close-ads-preview aria-label="关闭">×</button>
+            </div>
+            <div id="adsPreviewBody" class="ads-dialog-body"></div>
+            <div class="ads-dialog-actions">
+              <button id="adsDiscardPlanPreviewBtn" type="button" class="danger" hidden>关闭创建计划</button>
+              <button type="button" class="secondary-button" data-close-ads-preview>取消</button>
+              <button id="adsConfirmOperationBtn" type="button" class="primary">我已核对，确认创建</button>
+            </div>
+          </dialog>
         </section>
 
         <section id="influencersPage" class="module-page">
