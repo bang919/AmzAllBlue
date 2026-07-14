@@ -55,6 +55,7 @@ let selectedAdsKeywordId = "";
 let selectedAdsGroup = "ALL";
 let pendingAdsOperation = null;
 let adsAiState = null;
+let adsAiPollTimer = null;
 let adsHistoryState = {
   keywordId: "",
   childAsin: "ALL",
@@ -3561,8 +3562,14 @@ function renderAdsKeywordRows() {
     const aiReminder = Number(keyword.aiSuggestionCount || 0) > 0
       ? `<button type="button" class="ads-ai-reminder" data-ads-ai-reminder="${keyword.id}" title="${keyword.aiSuggestionCount} 条 AI 建议待处理" aria-label="查看 AI 建议">!</button>`
       : "";
+    const aiSummaryText = keyword.aiGoalSet
+      ? (keyword.aiSuggestionAction ? adsAiActionLabel(keyword.aiSuggestionAction) : (keyword.aiAnalysisSummary === "AI 正在分析中…" ? "AI 正在分析中…" : "已设置调整目标，等待 AI 分析"))
+      : "";
+    const aiSummary = aiSummaryText
+      ? `<span class="ads-keyword-ai-summary"><b>建议行动：</b>${escapeHtml(aiSummaryText)}</span>`
+      : "";
     return `<tr class="${keyword.id === selectedAdsKeywordId ? "selected" : ""}" data-ads-keyword-id="${keyword.id}">
-      <td><div class="ads-keyword-name"><strong>${escapeHtml(keyword.keyword)}</strong>${aiReminder}</div><span>${escapeHtml(keywordSubline)}</span></td>
+      <td><div class="ads-keyword-name"><strong>${escapeHtml(keyword.keyword)}</strong>${aiReminder}</div><span>${escapeHtml(keywordSubline)}</span>${aiSummary}</td>
       <td>${childAsins.length ? childAsins.map(asin => `<span class="ads-asin-chip">${escapeHtml(asin)}</span>`).join("") : "-"}</td>
       <td><span class="ads-group-badge ${keyword.group.toLowerCase()}">${adsGroupLabel(keyword.group)}</span></td>
       <td>${renderAdsMatchCell(keyword, "EXACT")}</td><td>${renderAdsMatchCell(keyword, "PHRASE")}</td><td>${renderAdsMatchCell(keyword, "BROAD")}</td>
@@ -3574,10 +3581,6 @@ function renderAdsKeywordRows() {
 }
 
 function renderAdsAiPanel(keyword, currency) {
-  const metrics = keyword.metrics || {};
-  const impressions = Number(metrics.impressions || 0);
-  const clicks = Number(metrics.clicks || 0);
-  const acos = Number(metrics.acos);
   return `<aside class="ads-ai-panel" id="adsAiPanel">
     <div class="ads-ai-panel-head"><div><span class="ads-ai-kicker">AI 广告助手</span><strong>调整目标与建议</strong><p>分析近 30 天全部广告与排名指标；任何真实调整都需要你逐条确认。</p></div><span id="adsAiConnectionStatus" class="ads-ai-status">读取中</span></div>
     <section class="ads-ai-section ads-ai-goal-section">
@@ -3589,7 +3592,6 @@ function renderAdsAiPanel(keyword, currency) {
     <section class="ads-ai-section">
       <div class="ads-ai-section-title"><strong>AI 分析</strong><span id="adsAiAnalysisStatus">读取中</span></div>
       <div id="adsAiAnalysisContent" class="ads-ai-analysis"><i aria-hidden="true">⌁</i><p>正在读取最近一次分析…</p></div>
-      <div class="ads-ai-data-chips"><span>曝光 ${formatNumber(impressions)}</span><span>点击 ${formatNumber(clicks)}</span><span>ACOS ${adsPercent(Number.isFinite(acos) ? acos : null)}</span></div>
     </section>
     <section class="ads-ai-section ads-ai-action-section">
       <div class="ads-ai-section-title"><strong>建议行动</strong><span id="adsAiRecommendationCount">读取中</span></div>
@@ -3603,18 +3605,20 @@ function renderAdsHistoryPanel(keyword) {
   resetAdsHistoryState(keyword);
   const childAsins = [...new Set(keyword.campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)))];
   const matchTypes = keyword.campaigns.map(campaign => campaign.matchType);
-  return `<div class="ads-data-ai-layout"><section class="ads-history-panel">
+  return `<div class="ads-history-ai-stack"><section class="ads-history-panel">
     <div class="ads-history-title"><div><strong>关键词历史数据</strong><span>选择子 ASIN、策略和两个指标进行对比</span></div></div>
-    <div class="ads-history-filters">
-      <label class="asin">子 ASIN<select id="adsHistoryAsin"><option value="ALL">全部</option>${childAsins.map(asin => `<option value="${escapeHtml(asin)}" ${adsHistoryState.childAsin === asin ? "selected" : ""}>${escapeHtml(asin)}</option>`).join("")}</select></label>
-      <label class="strategy">策略<select id="adsHistoryMatch"><option value="ALL">全部</option>${matchTypes.map(match => `<option value="${match}" ${adsHistoryState.matchType === match ? "selected" : ""}>${adsMatchLabel(match)}</option>`).join("")}</select></label>
-      <label class="metric"><span><i class="ads-series-dot primary"></i>指标一</span><select id="adsHistoryMetricA">${adsHistoryMetricOptions(adsHistoryState.metricA)}</select></label>
-      <label class="metric"><span><i class="ads-series-dot secondary"></i>指标二</span><select id="adsHistoryMetricB">${adsHistoryMetricOptions(adsHistoryState.metricB)}</select></label>
-      <label class="date-range">日期范围<input id="adsHistoryDateRange" type="text" readonly value="${escapeHtml(adsHistoryState.startDate && adsHistoryState.endDate ? `${adsHistoryState.startDate} 至 ${adsHistoryState.endDate}` : "")}"></label>
-      <button id="adsHistoryQueryBtn" class="primary" type="button">查询</button>
-      <small>最多显示 2 个指标；自然位和广告位来自关键词监控每日历史。</small>
+    <div class="ads-history-content">
+      <div class="ads-history-filters">
+        <label class="date-range">日期范围<input id="adsHistoryDateRange" type="text" readonly value="${escapeHtml(adsHistoryState.startDate && adsHistoryState.endDate ? `${adsHistoryState.startDate} 至 ${adsHistoryState.endDate}` : "")}"></label>
+        <label class="asin">子 ASIN<select id="adsHistoryAsin"><option value="ALL">全部</option>${childAsins.map(asin => `<option value="${escapeHtml(asin)}" ${adsHistoryState.childAsin === asin ? "selected" : ""}>${escapeHtml(asin)}</option>`).join("")}</select></label>
+        <label class="strategy">策略<select id="adsHistoryMatch"><option value="ALL">全部</option>${matchTypes.map(match => `<option value="${match}" ${adsHistoryState.matchType === match ? "selected" : ""}>${adsMatchLabel(match)}</option>`).join("")}</select></label>
+        <label class="metric"><span><i class="ads-series-dot primary"></i>指标一</span><select id="adsHistoryMetricA">${adsHistoryMetricOptions(adsHistoryState.metricA)}</select></label>
+        <label class="metric"><span><i class="ads-series-dot secondary"></i>指标二</span><select id="adsHistoryMetricB">${adsHistoryMetricOptions(adsHistoryState.metricB)}</select></label>
+        <button id="adsHistoryQueryBtn" class="primary" type="button">查询</button>
+        <small>最多显示 2 个指标；自然位和广告位来自关键词监控每日历史。</small>
+      </div>
+      <div id="adsHistoryChart" class="ads-history-chart"><div class="ads-history-loading">正在读取历史数据…</div></div>
     </div>
-    <div id="adsHistoryChart" class="ads-history-chart"><div class="ads-history-loading">正在读取历史数据…</div></div>
   </section>${renderAdsAiPanel(keyword, adsWorkspace.profile?.currencyCode || "USD")}</div>`;
 }
 
@@ -3838,7 +3842,7 @@ function adsAiActionLabel(actionType) {
 function adsAiStatusLabel(status) {
   return {
     PENDING: "待确认", EXECUTING: "执行中", EXECUTED: "已执行", FAILED: "执行失败",
-    REJECTED: "已拒绝", SUPERSEDED: "已被新分析取代"
+    REJECTED: "已拒绝", ACKNOWLEDGED: "已确认", SUPERSEDED: "已被新分析取代"
   }[status] || status;
 }
 
@@ -3866,6 +3870,7 @@ function adsAiSettingSummary(value = {}, currency = "USD") {
 function renderAdsAiRecommendation(item, currency) {
   const pending = item.status === "PENDING";
   const executable = item.actionType !== "REQUEST_MORE_DATA";
+  const needsAcknowledgement = item.actionType === "REQUEST_MORE_DATA" || item.status === "FAILED";
   return `<article class="ads-ai-recommendation ${item.status.toLowerCase()}">
     <header><strong>${escapeHtml(adsAiActionLabel(item.actionType))}</strong><span>${escapeHtml(adsAiStatusLabel(item.status))}</span></header>
     ${executable ? `<div class="ads-ai-change"><span>${escapeHtml(adsAiSettingSummary(item.before, currency))}</span><b>→</b><strong>${escapeHtml(adsAiSettingSummary(item.after, currency))}</strong></div>` : ""}
@@ -3873,13 +3878,18 @@ function renderAdsAiRecommendation(item, currency) {
     ${item.risk ? `<small>风险：${escapeHtml(item.risk)}</small>` : ""}
     <div class="ads-ai-recommendation-meta"><span>置信度 ${Math.round(Number(item.confidence || 0) * 100)}%</span><span>观察 ${item.observeDays} 天</span></div>
     ${item.error ? `<div class="ads-inline-error">${escapeHtml(item.error)}</div>` : ""}
-    ${pending ? `<div class="ads-ai-recommendation-actions"><button type="button" class="secondary-button" data-ads-ai-reject="${item.id}">拒绝</button>${executable ? `<button type="button" class="primary" data-ads-ai-execute="${item.id}">确认并执行</button>` : ""}</div>` : ""}
+    ${(pending || item.status === "FAILED") ? `<div class="ads-ai-recommendation-actions">${needsAcknowledgement ? `<button type="button" class="primary" data-ads-ai-ack="${item.id}">我已知晓</button>` : `<button type="button" class="secondary-button" data-ads-ai-reject="${item.id}">拒绝</button>${executable ? `<button type="button" class="primary" data-ads-ai-execute="${item.id}">确认并执行</button>` : ""}`}</div>` : ""}
   </article>`;
 }
 
 function renderAdsAiKeywordState(data) {
   if (!data || currentAdsKeyword()?.id !== data.keyword?.id) return;
+  const previousRunStatus = adsAiState?.latestRun?.status;
   adsAiState = data;
+  if (adsAiPollTimer) {
+    clearTimeout(adsAiPollTimer);
+    adsAiPollTimer = null;
+  }
   const connectionStatus = $("#adsAiConnectionStatus");
   if (connectionStatus) connectionStatus.textContent = data.configured ? "已连接" : "未配置";
   const goal = $("#adsAiGoal");
@@ -3890,7 +3900,9 @@ function renderAdsAiKeywordState(data) {
   const analysisContent = $("#adsAiAnalysisContent");
   if (analysisStatus) analysisStatus.textContent = run ? (run.status === "COMPLETE" ? `规则 v${run.strategyVersion}` : adsAiRunStatusLabel(run.status)) : "尚未分析";
   if (analysisContent) {
-    if (run?.status === "FAILED") {
+    if (run?.status === "RUNNING") {
+      analysisContent.innerHTML = `<i aria-hidden="true">⌁</i><p>后台正在分析中。你可以切换到其他关键词，稍后回来查看结果。</p>`;
+    } else if (run?.status === "FAILED") {
       analysisContent.innerHTML = `<i aria-hidden="true">!</i><p>${escapeHtml(run.error || "AI 分析失败")}</p>`;
     } else if (output?.analysisSummary) {
       const signals = (output.signals || []).map(signal => `<li class="${escapeHtml(signal.severity)}">${escapeHtml(signal.summary)}</li>`).join("");
@@ -3899,14 +3911,35 @@ function renderAdsAiKeywordState(data) {
       analysisContent.innerHTML = `<i aria-hidden="true">⌁</i><p>${data.configured ? "设置关键词目标后，点击“开始 AI 分析”。" : "请先在服务端配置 OPENAI_API_KEY 后再运行分析。"}</p>`;
     }
   }
-  const pending = (data.recommendations || []).filter(item => item.status === "PENDING");
-  const visible = (data.recommendations || []).filter(item => ["PENDING", "EXECUTING", "EXECUTED", "FAILED"].includes(item.status)).slice(0, 12);
+  if (output?.analysisSummary) {
+    const listKeyword = adsWorkspace.keywords.find(item => String(item.id) === String(data.keyword.id));
+    if (listKeyword) {
+      listKeyword.aiGoalSet = true;
+      listKeyword.aiAnalysisSummary = String(output.analysisSummary).trim().slice(0, 240);
+      const latestAction = (data.recommendations || []).find(item => item.actionType && item.actionType !== "NO_ACTION");
+      listKeyword.aiSuggestionAction = latestAction?.actionType || "";
+      listKeyword.aiSuggestionReason = latestAction?.reason || "";
+      renderAdsKeywordRows();
+    }
+  }
+  const pending = (data.recommendations || []).filter(item => item.status === "PENDING" && item.actionType !== "REQUEST_MORE_DATA");
+  const visible = (data.recommendations || []).filter(item => ["PENDING", "EXECUTING", "EXECUTED", "FAILED", "REJECTED", "ACKNOWLEDGED"].includes(item.status)).slice(0, 12);
   const count = $("#adsAiRecommendationCount");
   if (count) count.textContent = pending.length ? `${pending.length} 条待处理` : "暂无待处理";
+  const analyzeButton = $("[data-ads-ai-analyze]");
+  if (analyzeButton) analyzeButton.disabled = run?.status === "RUNNING";
   const container = $("#adsAiRecommendations");
   if (container) container.innerHTML = visible.length
     ? visible.map(item => renderAdsAiRecommendation(item, adsWorkspace.profile?.currencyCode || "USD")).join("")
     : `<div class="ads-ai-action-empty"><strong>暂无 AI 建议</strong><p>只有通过 JSON 校验并符合安全边界的建议才会显示。</p></div>`;
+  if (run?.status === "RUNNING") {
+    const watchedKeywordId = data.keyword.id;
+    adsAiPollTimer = setTimeout(() => {
+      if (currentAdsKeyword()?.id === watchedKeywordId) loadAdsAiKeywordState(watchedKeywordId);
+    }, 5000);
+  } else if (run?.status === "COMPLETE" && previousRunStatus === "RUNNING") {
+    setTimeout(() => loadAdsWorkspace().catch(() => {}), 0);
+  }
 }
 
 async function loadAdsAiKeywordState(keywordId) {
@@ -3929,6 +3962,7 @@ async function saveAdsAiGoal(keywordId, button) {
   setBusy(button, true, "保存中");
   try {
     await api(`/api/ads/keywords/${keywordId}/ai`, { method: "PUT", body: { goalText, constraints: {} } });
+    await loadAdsWorkspace();
   } finally {
     setBusy(button, false, "保存目标");
   }
@@ -3946,12 +3980,20 @@ async function analyzeAdsKeyword(keywordId, button) {
     await loadAdsWorkspace();
   } finally {
     setBusy(button, false, "开始 AI 分析");
+    if (adsAiState?.latestRun?.status === "RUNNING") button.disabled = true;
   }
 }
 
 function renderAdsAiStrategyForm(strategy) {
   const rules = strategy.rules;
   const limits = rules.globalLimits;
+  const rawSchedule = rules.schedule || {};
+  const rawApprovalMode = String(rawSchedule.approvalMode || "").toUpperCase();
+  const schedule = {
+    dailyBatchEnabled: rawSchedule.dailyBatchEnabled === true,
+    dailyBatchTime: rawSchedule.dailyBatchTime || "09:00",
+    approvalMode: ["MANUAL", "RISK_ONLY", "AUTO_ALL"].includes(rawApprovalMode) ? rawApprovalMode : "MANUAL"
+  };
   const groupSection = group => `<section class="ads-ai-strategy-section"><div><strong>${escapeHtml(rules.groups[group].title)}</strong><span>${escapeHtml(rules.groups[group].objective)}</span></div><label>策略规则<textarea data-ads-ai-group-rules="${group}" rows="5">${escapeHtml(rules.groups[group].rulesText)}</textarea></label></section>`;
   $("#adsAiStrategyBody").innerHTML = `<div class="ads-ai-strategy-form">
     <section class="ads-ai-strategy-section"><div><strong>全局分析规则</strong><span>这些说明会和每次分析数据一起发送给 AI</span></div><label>总规则<textarea id="adsAiGeneralRules" rows="5">${escapeHtml(rules.generalText)}</textarea></label></section>
@@ -3967,9 +4009,10 @@ function renderAdsAiStrategyForm(strategy) {
       <label>库存安全线（天）<input data-ads-ai-limit="inventorySafetyDays" type="number" min="0" max="365" step="1" value="${limits.inventorySafetyDays}"></label>
       <label class="ads-ai-required-confirmation"><input type="checkbox" checked disabled> 所有真实调整必须人工确认</label>
     </div></section>
+    <section class="ads-ai-strategy-section"><div><strong>每日批量分析</strong><span>在广告 Profile 所在时区，用一次后台批量任务分析所有填写了调整目标的关键词。</span></div><div class="ads-ai-schedule-fields"><label class="ads-ai-schedule-enabled"><input id="adsAiDailyBatchEnabled" type="checkbox" ${schedule.dailyBatchEnabled ? "checked" : ""}> 每天自动分析</label><label>执行时间<input id="adsAiDailyBatchTime" type="time" value="${escapeHtml(schedule.dailyBatchTime)}"></label></div><div class="ads-ai-approval-setting"><strong>处理建议行动</strong><span>AI 只负责判断；服务端会按此模式决定是否调用 Amazon Ads 执行接口。</span><div class="ads-ai-approval-options"><label class="${schedule.approvalMode === "MANUAL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="MANUAL" ${schedule.approvalMode === "MANUAL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>请求批准</strong><small>所有行动都需用户批准</small></span></label><label class="${schedule.approvalMode === "RISK_ONLY" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="RISK_ONLY" ${schedule.approvalMode === "RISK_ONLY" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>替我审批</strong><small>仅竞价自动执行，风险操作请求批准</small></span></label><label class="${schedule.approvalMode === "AUTO_ALL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="AUTO_ALL" ${schedule.approvalMode === "AUTO_ALL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>完全批准</strong><small>自动执行所有通过安全边界的行动</small></span></label></div></div></section>
     ${groupSection("NORMAL")}${groupSection("PROMOTED")}${groupSection("STABLE")}
   </div>`;
-  $("#adsAiStrategyVersion").textContent = `当前版本 v${strategy.version}`;
+  $("#adsAiStrategyVersion").textContent = "";
 }
 
 async function openAdsAiStrategyDialog() {
@@ -3990,11 +4033,18 @@ async function saveAdsAiStrategy(button) {
   });
   setBusy(button, true, "保存中");
   try {
-    const data = await api("/api/ads/ai/strategy", { method: "PUT", body: { rules: { generalText: $("#adsAiGeneralRules")?.value || "", globalLimits, groups } } });
+    const approvalMode = $("#adsAiStrategyBody").querySelector("input[name=adsAiApprovalMode]:checked")?.value || "MANUAL";
+    const schedule = {
+      dailyBatchEnabled: Boolean($("#adsAiDailyBatchEnabled")?.checked),
+      dailyBatchTime: $("#adsAiDailyBatchTime")?.value || "09:00",
+      approvalMode
+    };
+    const data = await api("/api/ads/ai/strategy", { method: "PUT", body: { rules: { generalText: $("#adsAiGeneralRules")?.value || "", globalLimits, schedule, groups } } });
+    if (adsAiState) adsAiState.strategy = data.strategy;
     renderAdsAiStrategyForm(data.strategy);
     if (selectedAdsKeywordId) await loadAdsAiKeywordState(selectedAdsKeywordId);
   } finally {
-    setBusy(button, false, "保存新版本");
+    setBusy(button, false, "确认");
   }
 }
 
@@ -4494,7 +4544,6 @@ $("#fbaReplenishmentToggleBtn").addEventListener("click", async () => {
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
 $("#adsProfileSelect").addEventListener("change", event => selectAdsProfile(event.target.value).catch(error => alert(error.message)));
-$("#adsQueryBtn").addEventListener("click", () => loadAdsWorkspace().catch(error => alert(error.message)));
 $("#adsSyncBtn").addEventListener("click", syncAdsPerformance);
 $("#adsAddKeywordBtn").addEventListener("click", openAdsKeywordDialog);
 $("#adsKeywordSearch").addEventListener("input", renderAdsKeywordRows);
@@ -4632,6 +4681,12 @@ $("#adsDetailPanel").addEventListener("click", event => {
       .then(() => loadAdsWorkspace()).catch(error => alert(error.message));
     return;
   }
+  const acknowledgeRecommendationButton = event.target.closest("[data-ads-ai-ack]");
+  if (acknowledgeRecommendationButton) {
+    api(`/api/ads/ai/recommendations/${acknowledgeRecommendationButton.dataset.adsAiAck}/decision`, { method: "POST", body: { decision: "ACKNOWLEDGED" } })
+      .then(() => loadAdsWorkspace()).catch(error => alert(error.message));
+    return;
+  }
   const groupToggle = event.target.closest("[data-ads-group-toggle]");
   if (groupToggle) {
     const menu = groupToggle.closest("[data-ads-group-picker]")?.querySelector("[data-ads-group-menu]");
@@ -4762,6 +4817,13 @@ document.querySelectorAll("[data-close-ads-dialog]").forEach(button => button.ad
 document.querySelectorAll("[data-close-ads-preview]").forEach(button => button.addEventListener("click", () => $("#adsPreviewDialog").close()));
 document.querySelectorAll("[data-close-ads-ai-strategy]").forEach(button => button.addEventListener("click", () => $("#adsAiStrategyDialog").close()));
 $("#adsAiSaveStrategyBtn").addEventListener("click", event => saveAdsAiStrategy(event.currentTarget).catch(error => alert(error.message)));
+$("#adsAiStrategyBody").addEventListener("change", event => {
+  const input = event.target.closest("input[name=adsAiApprovalMode]");
+  if (!input) return;
+  $("#adsAiStrategyBody").querySelectorAll(".ads-ai-approval-options label").forEach(label => {
+    label.classList.toggle("selected", label.querySelector("input")?.checked === true);
+  });
+});
 $("#factoryAddAsinBtn").addEventListener("click", () => addFactoryAsin().catch(error => alert(error.message)));
 $("#factoryRefreshBtn").addEventListener("click", () => loadFactoryInventory().catch(error => alert(error.message)));
 $("#factorySearch").addEventListener("input", renderFactoryInventory);

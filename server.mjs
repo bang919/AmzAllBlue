@@ -25,6 +25,7 @@ const ADS_AI_ACTION_TYPES = new Set([
   "PAUSE_CAMPAIGN", "RESUME_CAMPAIGN", "MOVE_GROUP", "REQUEST_MORE_DATA"
 ]);
 const ADS_AI_GROUPS = new Set(["NORMAL", "PROMOTED", "STABLE"]);
+const ADS_AI_APPROVAL_MODES = new Set(["MANUAL", "RISK_ONLY", "AUTO_ALL"]);
 const SECRET_KEYS = {
   gmailToken: "gmail_token",
   adsToken: "amazon_ads_token",
@@ -50,6 +51,8 @@ let fbaScheduledSyncTimer = null;
 let adsHourlySyncTimer = null;
 let adsRollingSyncTimer = null;
 let sifDailySyncTimer = null;
+let adsAiDailyScheduleTimer = null;
+const adsAiAnalysisJobs = new Map();
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -590,6 +593,25 @@ async function ensureAdsMysqlSchema(pool) {
       PRIMARY KEY (id),
       KEY idx_ads_ai_recommendation_events (recommendation_id, created_at),
       CONSTRAINT fk_ads_ai_recommendation_event FOREIGN KEY (recommendation_id) REFERENCES ads_ai_recommendations (id) ON UPDATE RESTRICT ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ai_batch_runs (
+      id VARCHAR(64) NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      trigger_source VARCHAR(32) NOT NULL,
+      schedule_date DATE NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
+      keyword_count INT UNSIGNED NOT NULL DEFAULT 0,
+      input_payload JSON NULL,
+      output_payload JSON NULL,
+      last_error TEXT NULL,
+      started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date),
+      KEY idx_ads_ai_batch_profile_status (profile_id, status, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query("ALTER TABLE ads_campaigns ADD COLUMN amazon_campaign_name VARCHAR(255) NULL AFTER campaign_name").catch(() => {});
@@ -1674,7 +1696,7 @@ function parseMysqlJson(value) {
 
 function defaultAdsAiStrategyRules() {
   return {
-    generalText: "只针对 AmzAllBlue_ERP 内的广告对象提出建议。优先保护账户安全、利润和库存；数据不足时返回 REQUEST_MORE_DATA。任何建议必须说明证据、风险和观察期，所有真实广告调整必须由用户逐条确认。",
+    generalText: "只针对 AmzAllBlue_ERP 内的广告对象提出建议。优先保护账户安全、利润和库存；数据不足时返回 REQUEST_MORE_DATA。任何建议必须说明证据、风险和观察期；真实广告调整是否需要逐条确认，由下方处理建议行动模式决定。",
     globalLimits: {
       requireManualConfirmation: true,
       analysisWindowDays: 30,
@@ -1686,6 +1708,11 @@ function defaultAdsAiStrategyRules() {
       maxDailyBudgetChangePercent: 0.25,
       maxPlacementAdjustment: 300,
       inventorySafetyDays: 21
+    },
+    schedule: {
+      dailyBatchEnabled: false,
+      dailyBatchTime: "09:00",
+      approvalMode: "MANUAL"
     },
     groups: {
       NORMAL: {
@@ -1717,6 +1744,7 @@ function sanitizeAdsAiStrategyRules(value) {
   const defaults = defaultAdsAiStrategyRules();
   const source = value && typeof value === "object" ? value : {};
   const sourceLimits = source.globalLimits && typeof source.globalLimits === "object" ? source.globalLimits : {};
+  const sourceSchedule = source.schedule && typeof source.schedule === "object" ? source.schedule : {};
   const limits = defaults.globalLimits;
   const groups = {};
   for (const group of ADS_AI_GROUPS) {
@@ -1740,6 +1768,15 @@ function sanitizeAdsAiStrategyRules(value) {
       maxDailyBudgetChangePercent: adsAiNumber(sourceLimits.maxDailyBudgetChangePercent, limits.maxDailyBudgetChangePercent, 0.01, 5),
       maxPlacementAdjustment: Math.round(adsAiNumber(sourceLimits.maxPlacementAdjustment, limits.maxPlacementAdjustment, 0, 900)),
       inventorySafetyDays: Math.round(adsAiNumber(sourceLimits.inventorySafetyDays, limits.inventorySafetyDays, 0, 365))
+    },
+    schedule: {
+      dailyBatchEnabled: sourceSchedule.dailyBatchEnabled === true,
+      dailyBatchTime: /^([01]\d|2[0-3]):[0-5]\d$/.test(String(sourceSchedule.dailyBatchTime || ""))
+        ? String(sourceSchedule.dailyBatchTime)
+        : defaults.schedule.dailyBatchTime,
+      approvalMode: ADS_AI_APPROVAL_MODES.has(String(sourceSchedule.approvalMode || "").toUpperCase())
+        ? String(sourceSchedule.approvalMode).toUpperCase()
+        : defaults.schedule.approvalMode
     },
     groups
   };
@@ -6671,12 +6708,33 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
   let performanceRows = [];
   let placementRows = [];
   let aiSuggestionRows = [];
+  let aiLatestRecommendationRows = [];
+  let aiGoalRows = [];
+  let aiRunRows = [];
   if (keywordIds.length) {
     [aiSuggestionRows] = await pool.query(`
       SELECT keyword_id, COUNT(*) suggestion_count
       FROM ads_ai_recommendations
       WHERE keyword_id IN (?) AND profile_id = ? AND status = 'PENDING'
+        AND action_type NOT IN ('REQUEST_MORE_DATA', 'NO_ACTION')
       GROUP BY keyword_id
+    `, [keywordIds, String(profile.profileId)]);
+    [aiLatestRecommendationRows] = await pool.query(`
+      SELECT keyword_id, action_type, reason_text, status
+      FROM ads_ai_recommendations
+      WHERE keyword_id IN (?) AND profile_id = ?
+      ORDER BY created_at DESC, id DESC
+    `, [keywordIds, String(profile.profileId)]);
+    [aiGoalRows] = await pool.query(`
+      SELECT keyword_id, goal_text
+      FROM ads_ai_keyword_goals
+      WHERE keyword_id IN (?) AND profile_id = ?
+    `, [keywordIds, String(profile.profileId)]);
+    [aiRunRows] = await pool.query(`
+      SELECT keyword_id, status, output_payload
+      FROM ads_ai_analysis_runs
+      WHERE keyword_id IN (?) AND profile_id = ?
+      ORDER BY created_at DESC, id DESC
     `, [keywordIds, String(profile.profileId)]);
     [campaignRows] = await pool.query("SELECT * FROM ads_campaigns WHERE keyword_id IN (?) ORDER BY match_type", [keywordIds]);
     const campaignIds = campaignRows.map(row => row.id);
@@ -6699,6 +6757,27 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
     }
   }
   const aiSuggestionCountByKeyword = new Map(aiSuggestionRows.map(row => [String(row.keyword_id), Number(row.suggestion_count || 0)]));
+  const aiLatestRecommendationByKeyword = new Map();
+  for (const row of aiLatestRecommendationRows) {
+    const key = String(row.keyword_id);
+    if (!aiLatestRecommendationByKeyword.has(key)) {
+      aiLatestRecommendationByKeyword.set(key, { actionType: row.action_type, reason: row.reason_text || "", status: row.status });
+    }
+  }
+  const aiGoalByKeyword = new Map(aiGoalRows.map(row => [String(row.keyword_id), String(row.goal_text || "").trim()]));
+  const aiSummaryByKeyword = new Map();
+  const aiLatestStatusByKeyword = new Map();
+  for (const row of aiRunRows) {
+    const key = String(row.keyword_id);
+    if (!aiLatestStatusByKeyword.has(key)) aiLatestStatusByKeyword.set(key, row.status);
+    if (row.status !== "COMPLETE" || aiSummaryByKeyword.has(key)) continue;
+    const output = parseMysqlJson(row.output_payload) || {};
+    const summary = String(output.analysisSummary || "").trim();
+    if (summary) aiSummaryByKeyword.set(key, summary.slice(0, 240));
+  }
+  for (const [key, status] of aiLatestStatusByKeyword) {
+    if (status === "RUNNING") aiSummaryByKeyword.set(key, "AI 正在分析中…");
+  }
   const metricsByAdUnit = new Map(performanceRows.map(row => [String(row.ad_unit_id), {
     impressions: Number(row.impressions || 0), clicks: Number(row.clicks || 0), spend: Number(row.spend || 0),
     orders: Number(row.orders_count || 0), units: Number(row.units_sold || 0), sales: Number(row.sales || 0)
@@ -6799,7 +6878,9 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
     });
     const monitorStatus = monitoring.length && monitoring.every(item => item.status === "ACTIVE")
       ? "ACTIVE" : monitoring.some(item => item.status === "ACTIVE") ? "PARTIAL" : "INACTIVE";
-    return { id: String(row.id), parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(String(row.id)) || 0 };
+    const keywordKey = String(row.id);
+    const latestRecommendation = aiLatestRecommendationByKeyword.get(keywordKey) || null;
+    return { id: keywordKey, parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(keywordKey) || 0, aiGoalSet: Boolean(aiGoalByKeyword.get(keywordKey)), aiAnalysisSummary: aiSummaryByKeyword.get(keywordKey) || "", aiSuggestionAction: latestRecommendation?.actionType || "", aiSuggestionReason: latestRecommendation?.reason || "" };
   });
   return {
     profile,
@@ -7040,11 +7121,8 @@ async function saveAdsAiStrategy(body = {}) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-    const [rows] = await connection.query(`
-      SELECT COALESCE(MAX(version), 0) latest_version
-      FROM ads_ai_strategy_versions WHERE profile_id = ? FOR UPDATE
-    `, [String(profile.profileId)]);
-    const version = Number(rows[0]?.latest_version || 0) + 1;
+    await connection.query("DELETE FROM ads_ai_strategy_versions WHERE profile_id = ?", [String(profile.profileId)]);
+    const version = 1;
     await connection.query(`
       INSERT INTO ads_ai_strategy_versions (profile_id, version, rules_payload, created_by)
       VALUES (?, ?, CAST(? AS JSON), 'USER')
@@ -7402,16 +7480,88 @@ async function rememberAdsAiRecommendationEvent(recommendationId, eventType, pay
   `, [recommendationId, eventType, JSON.stringify(payload)]);
 }
 
-async function runAdsAiAnalysis(keywordId) {
-  const input = await buildAdsAiAnalysisInput(keywordId);
+async function persistAdsAiAnalysisOutput(runId, input, output) {
   const pool = getMysqlPool();
-  const runId = randomUUID();
-  const modelName = process.env.OPENAI_MODEL || "gpt-5.4";
-  await pool.query(`
-    INSERT INTO ads_ai_analysis_runs (
-      id, profile_id, keyword_id, status, model_name, prompt_version, strategy_version, input_payload
-    ) VALUES (?, ?, ?, 'RUNNING', ?, ?, ?, CAST(? AS JSON))
-  `, [runId, input.context.profileId, input.context.keywordId, modelName, ADS_AI_PROMPT_VERSION, input.context.strategyVersion, JSON.stringify(input)]);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [supersededRows] = await connection.query(`
+      SELECT id FROM ads_ai_recommendations
+      WHERE keyword_id = ? AND profile_id = ? AND status = 'PENDING'
+      FOR UPDATE
+    `, [input.context.keywordId, input.context.profileId]);
+    await connection.query(`
+      UPDATE ads_ai_recommendations
+      SET status = 'SUPERSEDED'
+      WHERE keyword_id = ? AND profile_id = ? AND status = 'PENDING'
+    `, [input.context.keywordId, input.context.profileId]);
+    for (const previous of supersededRows) {
+      await rememberAdsAiRecommendationEvent(previous.id, "SUPERSEDED", { supersededByAnalysisRunId: runId }, connection);
+    }
+    await connection.query(`
+      UPDATE ads_ai_analysis_runs
+      SET status = 'COMPLETE', output_payload = CAST(? AS JSON), validation_error = NULL, completed_at = NOW()
+      WHERE id = ?
+    `, [JSON.stringify(output), runId]);
+    for (const recommendation of output.recommendations) {
+      const recommendationId = randomUUID();
+      await connection.query(`
+        INSERT INTO ads_ai_recommendations (
+          id, analysis_run_id, profile_id, keyword_id, action_type, target_payload, before_payload, after_payload,
+          reason_text, risk_text, evidence_payload, confidence, observe_days, status
+        ) VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), CAST(? AS JSON), ?, ?, CAST(? AS JSON), ?, ?, 'PENDING')
+      `, [
+        recommendationId, runId, input.context.profileId, input.context.keywordId, recommendation.actionType,
+        JSON.stringify(recommendation.target), JSON.stringify(recommendation.before), JSON.stringify(recommendation.after),
+        recommendation.reason, recommendation.risk, JSON.stringify(recommendation.evidence), recommendation.confidence, recommendation.observeDays
+      ]);
+      await rememberAdsAiRecommendationEvent(recommendationId, "GENERATED", recommendation, connection);
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+function adsAiApprovalAllows(actionType, mode) {
+  if (actionType === "REQUEST_MORE_DATA" || actionType === "NO_ACTION") return false;
+  if (mode === "AUTO_ALL") return true;
+  if (mode === "RISK_ONLY") return actionType === "CHANGE_BID";
+  return false;
+}
+
+async function autoExecuteAdsAiRecommendations(runId, input) {
+  const mode = input.strategy?.schedule?.approvalMode || "MANUAL";
+  if (mode === "MANUAL") return [];
+  const rows = await getMysqlPool().query(`
+    SELECT id, action_type FROM ads_ai_recommendations
+    WHERE analysis_run_id = ? AND status = 'PENDING'
+  `).then(([result]) => result);
+  const executed = [];
+  for (const row of rows) {
+    if (!adsAiApprovalAllows(row.action_type, mode)) continue;
+    try {
+      await executeAdsAiRecommendation(row.id, { confirmed: true, source: `AI_APPROVAL_${mode}` });
+      executed.push({ id: row.id, status: "EXECUTED" });
+    } catch (error) {
+      executed.push({ id: row.id, status: "FAILED", error: error.message });
+    }
+  }
+  return executed;
+}
+
+async function failAdsAiAnalysisRun(runId, outputForAudit, error) {
+  await getMysqlPool().query(`
+    UPDATE ads_ai_analysis_runs
+    SET status = 'FAILED', output_payload = CAST(? AS JSON), validation_error = ?, completed_at = NOW()
+    WHERE id = ?
+  `, [JSON.stringify(outputForAudit), error.message, runId]);
+}
+
+async function executeAdsAiAnalysisRun(runId, input) {
   let outputForAudit = null;
   try {
     const content = await callOpenAI([
@@ -7431,57 +7581,187 @@ async function runAdsAiAnalysis(keywordId) {
       throw new Error("AI 返回内容不是合法 JSON");
     }
     const output = validateAdsAiOutput(rawOutput, input);
-    const connection = await pool.getConnection();
-    try {
-      await connection.beginTransaction();
-      const [supersededRows] = await connection.query(`
-        SELECT id FROM ads_ai_recommendations
-        WHERE keyword_id = ? AND profile_id = ? AND status = 'PENDING'
-        FOR UPDATE
-      `, [input.context.keywordId, input.context.profileId]);
-      await connection.query(`
-        UPDATE ads_ai_recommendations
-        SET status = 'SUPERSEDED'
-        WHERE keyword_id = ? AND profile_id = ? AND status = 'PENDING'
-      `, [input.context.keywordId, input.context.profileId]);
-      for (const previous of supersededRows) {
-        await rememberAdsAiRecommendationEvent(previous.id, "SUPERSEDED", { supersededByAnalysisRunId: runId }, connection);
-      }
-      await connection.query(`
-        UPDATE ads_ai_analysis_runs
-        SET status = 'COMPLETE', output_payload = CAST(? AS JSON), validation_error = NULL, completed_at = NOW()
-        WHERE id = ?
-      `, [JSON.stringify(output), runId]);
-      for (const recommendation of output.recommendations) {
-        const recommendationId = randomUUID();
-        await connection.query(`
-          INSERT INTO ads_ai_recommendations (
-            id, analysis_run_id, profile_id, keyword_id, action_type, target_payload, before_payload, after_payload,
-            reason_text, risk_text, evidence_payload, confidence, observe_days, status
-          ) VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), CAST(? AS JSON), ?, ?, CAST(? AS JSON), ?, ?, 'PENDING')
-        `, [
-          recommendationId, runId, input.context.profileId, input.context.keywordId, recommendation.actionType,
-          JSON.stringify(recommendation.target), JSON.stringify(recommendation.before), JSON.stringify(recommendation.after),
-          recommendation.reason, recommendation.risk, JSON.stringify(recommendation.evidence), recommendation.confidence, recommendation.observeDays
-        ]);
-        await rememberAdsAiRecommendationEvent(recommendationId, "GENERATED", recommendation, connection);
-      }
-      await connection.commit();
-    } catch (error) {
-      await connection.rollback().catch(() => {});
-      throw error;
-    } finally {
-      connection.release();
-    }
-    return await readAdsAiKeywordState(keywordId, runId);
+    await persistAdsAiAnalysisOutput(runId, input, output);
+    await autoExecuteAdsAiRecommendations(runId, input);
+    return output;
   } catch (error) {
-    await pool.query(`
-      UPDATE ads_ai_analysis_runs
-      SET status = 'FAILED', output_payload = CAST(? AS JSON), validation_error = ?, completed_at = NOW()
-      WHERE id = ?
-    `, [JSON.stringify(outputForAudit), error.message, runId]);
+    await failAdsAiAnalysisRun(runId, outputForAudit, error);
     throw error;
   }
+}
+
+async function createAdsAiAnalysisRun(keywordId) {
+  const input = await buildAdsAiAnalysisInput(keywordId);
+  return createAdsAiAnalysisRunFromInput(input);
+}
+
+async function createAdsAiAnalysisRunFromInput(input) {
+  const pool = getMysqlPool();
+  const runId = randomUUID();
+  const modelName = process.env.OPENAI_MODEL || "gpt-5.4";
+  await pool.query(`
+    INSERT INTO ads_ai_analysis_runs (
+      id, profile_id, keyword_id, status, model_name, prompt_version, strategy_version, input_payload
+    ) VALUES (?, ?, ?, 'RUNNING', ?, ?, ?, CAST(? AS JSON))
+  `, [runId, input.context.profileId, input.context.keywordId, modelName, ADS_AI_PROMPT_VERSION, input.context.strategyVersion, JSON.stringify(input)]);
+  return { runId, input };
+}
+
+async function startAdsAiAnalysis(keywordId) {
+  const { profile, keyword } = await requireAdsAiKeyword(keywordId);
+  const pool = getMysqlPool();
+  await expireStaleAdsAiAnalysisRuns(profile.profileId, keyword.id);
+  const [runningRows] = await pool.query(`
+    SELECT id FROM ads_ai_analysis_runs
+    WHERE keyword_id = ? AND profile_id = ? AND status = 'RUNNING'
+    ORDER BY started_at DESC LIMIT 1
+  `, [keyword.id, String(profile.profileId)]);
+  if (runningRows[0]) return readAdsAiKeywordState(keyword.id, runningRows[0].id);
+
+  const run = await createAdsAiAnalysisRun(keyword.id);
+  const job = executeAdsAiAnalysisRun(run.runId, run.input)
+    .catch(error => console.error(`AI analysis ${run.runId} failed: ${error.message}`))
+    .finally(() => adsAiAnalysisJobs.delete(String(keyword.id)));
+  adsAiAnalysisJobs.set(String(keyword.id), job);
+  return readAdsAiKeywordState(keyword.id, run.runId);
+}
+
+async function expireStaleAdsAiAnalysisRuns(profileId, keywordId = null) {
+  const timeoutMinutes = Math.max(5, Number(process.env.ADS_AI_RUNNING_TIMEOUT_MINUTES || 15));
+  const where = ["profile_id = ?", "status = 'RUNNING'", "started_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)"];
+  const params = [String(profileId), timeoutMinutes];
+  if (keywordId !== null) {
+    where.push("keyword_id = ?");
+    params.push(keywordId);
+  }
+  await getMysqlPool().query(`
+    UPDATE ads_ai_analysis_runs
+    SET status = 'FAILED', validation_error = '后台 AI 任务超时或服务重启，请重新分析', completed_at = NOW()
+    WHERE ${where.join(" AND ")}
+  `, params);
+}
+
+async function executeAdsAiBatchAnalysisRuns(runs) {
+  let outputForAudit = null;
+  try {
+    const content = await callOpenAI([
+      {
+        role: "system",
+        content: `你是 Amazon Ads 每日批量关键词投放分析器。只能根据每个关键词各自的输入 JSON 和策略规则判断，不得在关键词之间混用数据。所有真实调整都必须人工确认。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{"results":[{"keywordId":"输入中的 keywordId","analysisSummary":"string","signals":[{"code":"string","severity":"info|warning|critical","summary":"string","evidence":["输入字段路径"]}],"recommendations":[{"actionType":"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION","target":{},"before":{},"after":{},"reason":"string","risk":"string","evidence":["输入字段路径"],"confidence":0.0,"observeDays":3}]}]}\n每个输入关键词必须恰好返回一个同 keywordId 的结果。必须使用输入中真实存在的本地 ID。证据不足时返回 REQUEST_MORE_DATA 或空 recommendations。`
+      },
+      { role: "user", content: JSON.stringify({ analyses: runs.map(run => run.input) }) }
+    ], true);
+    if (!content) throw new Error("未配置 OPENAI_API_KEY，无法调用 CCAI 分析");
+    outputForAudit = { rawText: String(content).slice(0, 500000) };
+    let rawOutput;
+    try {
+      rawOutput = JSON.parse(content);
+      outputForAudit = rawOutput;
+    } catch {
+      throw new Error("AI 批量返回内容不是合法 JSON");
+    }
+    if (!isAdsAiJsonObject(rawOutput) || !Array.isArray(rawOutput.results)) throw new Error("AI 批量输出缺少 results 数组");
+    const resultsByKeywordId = new Map();
+    for (const item of rawOutput.results) {
+      if (!isAdsAiJsonObject(item) || typeof item.keywordId !== "string") throw new Error("AI 批量结果缺少 keywordId");
+      if (resultsByKeywordId.has(item.keywordId)) throw new Error(`AI 批量结果重复 keywordId：${item.keywordId}`);
+      resultsByKeywordId.set(item.keywordId, item);
+    }
+    const completed = [];
+    for (const run of runs) {
+      const result = resultsByKeywordId.get(run.input.context.keywordId);
+      try {
+        if (!result) throw new Error("AI 批量结果缺少该关键词");
+        const { keywordId, ...rawKeywordOutput } = result;
+        const output = validateAdsAiOutput(rawKeywordOutput, run.input);
+        await persistAdsAiAnalysisOutput(run.runId, run.input, output);
+        completed.push({ keywordId, runId: run.runId, status: "COMPLETE" });
+      } catch (error) {
+        await failAdsAiAnalysisRun(run.runId, result || outputForAudit, error);
+        completed.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "FAILED", error: error.message });
+      }
+    }
+    return { results: completed, rawOutput: outputForAudit };
+  } catch (error) {
+    await Promise.all(runs.map(run => failAdsAiAnalysisRun(run.runId, outputForAudit, error).catch(() => {})));
+    throw error;
+  }
+}
+
+async function startDailyAdsAiBatch(profile, scheduleDate) {
+  const pool = getMysqlPool();
+  const batchId = randomUUID();
+  let runs = [];
+  const [batchInsert] = await pool.query(`
+    INSERT IGNORE INTO ads_ai_batch_runs (id, profile_id, trigger_source, schedule_date, status)
+    VALUES (?, ?, 'DAILY', ?, 'RUNNING')
+  `, [batchId, String(profile.profileId), scheduleDate]);
+  if (!Number(batchInsert.affectedRows || 0)) return { started: false, reason: "ALREADY_RUN" };
+  try {
+    await expireStaleAdsAiAnalysisRuns(profile.profileId);
+    const [goalRows] = await pool.query(`
+      SELECT g.keyword_id
+      FROM ads_ai_keyword_goals g
+      JOIN ads_keywords k ON k.id = g.keyword_id
+      WHERE g.profile_id = ? AND k.lifecycle_status = 'ACTIVE' AND TRIM(g.goal_text) <> ''
+      ORDER BY g.updated_at, g.keyword_id
+    `, [String(profile.profileId)]);
+    for (const goal of goalRows) {
+      const keywordId = String(goal.keyword_id);
+      const [runningRows] = await pool.query(`
+        SELECT id FROM ads_ai_analysis_runs
+        WHERE keyword_id = ? AND profile_id = ? AND status = 'RUNNING'
+        ORDER BY started_at DESC LIMIT 1
+      `, [keywordId, String(profile.profileId)]);
+      if (runningRows[0]) continue;
+      const input = await buildAdsAiAnalysisInput(keywordId);
+      runs.push(await createAdsAiAnalysisRunFromInput(input));
+    }
+    await pool.query(`
+      UPDATE ads_ai_batch_runs
+      SET keyword_count = ?, input_payload = CAST(? AS JSON)
+      WHERE id = ?
+    `, [runs.length, JSON.stringify(runs.map(run => ({ runId: run.runId, input: run.input }))), batchId]);
+    if (!runs.length) {
+      await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify({ results: [] }), batchId]);
+      return { started: false, reason: "NO_ELIGIBLE_KEYWORDS" };
+    }
+    const job = executeAdsAiBatchAnalysisRuns(runs)
+      .then(async result => {
+        await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify(result), batchId]);
+      })
+      .catch(async error => {
+        await pool.query("UPDATE ads_ai_batch_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, batchId]);
+        console.error(`Daily AI batch ${batchId} failed: ${error.message}`);
+      })
+      .finally(() => runs.forEach(run => adsAiAnalysisJobs.delete(run.input.context.keywordId)));
+    runs.forEach(run => adsAiAnalysisJobs.set(run.input.context.keywordId, job));
+    return { started: true, batchId, keywordCount: runs.length };
+  } catch (error) {
+    await Promise.all(runs.map(run => failAdsAiAnalysisRun(run.runId, null, error).catch(() => {})));
+    await pool.query("UPDATE ads_ai_batch_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, batchId]);
+    throw error;
+  }
+}
+
+async function runDueDailyAdsAiBatch() {
+  if (["0", "false"].includes(String(process.env.ADS_AI_DAILY_ANALYSIS_ENABLED || "").toLowerCase())) return;
+  const profile = await readAdsProfileSelection();
+  if (!profile?.profileId) return;
+  const strategy = await readLatestAdsAiStrategy(profile.profileId);
+  if (!strategy.rules.schedule?.dailyBatchEnabled) return;
+  const timeZone = profile.timezone || US_MARKETPLACE_TIME_ZONE;
+  const now = getZonedParts(new Date(), timeZone);
+  const nowTime = `${String(now.hour).padStart(2, "0")}:${String(now.minute).padStart(2, "0")}`;
+  if (nowTime < strategy.rules.schedule.dailyBatchTime) return;
+  await startDailyAdsAiBatch(profile, formatDateInTimeZone(new Date(), timeZone));
+}
+
+function startDailyAdsAiBatchSchedule() {
+  if (adsAiDailyScheduleTimer) return;
+  const tick = () => runDueDailyAdsAiBatch().catch(error => console.error(`Daily AI schedule failed: ${error.message}`));
+  tick();
+  adsAiDailyScheduleTimer = setInterval(tick, 60_000);
 }
 
 function mapAdsAiRecommendation(row) {
@@ -7529,15 +7809,16 @@ async function readAdsAiKeywordState(keywordId, preferredRunId = "") {
 
 async function decideAdsAiRecommendation(recommendationId, decision) {
   const profile = await requireSelectedAdsProfile();
-  const nextStatus = String(decision || "").toUpperCase() === "REJECTED" ? "REJECTED" : "";
+  const requested = String(decision || "").toUpperCase();
+  const nextStatus = ["REJECTED", "ACKNOWLEDGED"].includes(requested) ? requested : "";
   if (!nextStatus) throw new Error("不支持的建议处理方式");
   const pool = getMysqlPool();
   const [result] = await pool.query(`
     UPDATE ads_ai_recommendations SET status = ?
-    WHERE id = ? AND profile_id = ? AND status = 'PENDING'
+    WHERE id = ? AND profile_id = ? AND status IN ('PENDING', 'FAILED')
   `, [nextStatus, recommendationId, String(profile.profileId)]);
   if (!Number(result.affectedRows || 0)) throw new Error("建议不存在或状态已经变化");
-  await rememberAdsAiRecommendationEvent(recommendationId, "REJECTED", { decision: nextStatus });
+  await rememberAdsAiRecommendationEvent(recommendationId, nextStatus === "ACKNOWLEDGED" ? "ACKNOWLEDGED" : "REJECTED", { decision: nextStatus });
   return { id: recommendationId, status: nextStatus };
 }
 
@@ -8978,7 +9259,7 @@ async function handleApi(req, res, url) {
 
   const adsKeywordAiAnalyzeMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/ai\/analyze$/);
   if (req.method === "POST" && adsKeywordAiAnalyzeMatch) {
-    return sendJson(res, await runAdsAiAnalysis(adsKeywordAiAnalyzeMatch[1]), 201);
+    return sendJson(res, await startAdsAiAnalysis(adsKeywordAiAnalyzeMatch[1]), 202);
   }
 
   const adsAiRecommendationExecuteMatch = url.pathname.match(/^\/api\/ads\/ai\/recommendations\/([^/]+)\/execute$/);
@@ -9762,6 +10043,7 @@ server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
   if (process.env.AMZ_ADS_SYNC_ENABLED !== "0" && process.env.AMZ_ADS_SYNC_ENABLED !== "false") startAdsPerformanceSchedule();
   if (process.env.SIF_SYNC_ENABLED !== "0" && process.env.SIF_SYNC_ENABLED !== "false") startSifKeywordSchedule();
+  startDailyAdsAiBatchSchedule();
   const scheduledFbaSyncEnabled = process.env.AMZ_FBA_SCHEDULE_ENABLED !== "0" && process.env.AMZ_FBA_SCHEDULE_ENABLED !== "false";
   if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
     setTimeout(async () => {

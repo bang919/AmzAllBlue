@@ -17,9 +17,10 @@
 | `ads_sync_dates` | 日期范围完成状态及日期选择器标记 |
 | `ads_operations` | 创建、改名和启停操作的预览、确认及执行状态 |
 | `ads_operation_steps` | 每个远端对象步骤的结果，用于失败续传 |
-| `ads_ai_strategy_versions` | 每个 Profile 的 AI 策略规则版本；历史版本不可覆盖 |
+| `ads_ai_strategy_versions` | 每个 Profile 的当前 AI 策略规则；保存时替换旧规则，不保留历史版本 |
 | `ads_ai_keyword_goals` | 单个关键词的手动调整目标和约束 |
 | `ads_ai_analysis_runs` | 每次 AI 分析的输入快照、标准输出、模型和校验状态 |
+| `ads_ai_batch_runs` | 每日批量分析的触发时间、关键词集合与一次 CCAI 请求的审计记录 |
 | `ads_ai_recommendations` | AI 建议、人工决定、执行结果和复盘时间 |
 | `ads_ai_recommendation_events` | 建议生成、拒绝、确认、执行和失败的不可变事件流水 |
 
