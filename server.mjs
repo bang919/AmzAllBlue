@@ -19,6 +19,12 @@ const GMAIL_TOKEN_PATH = join(DATA_DIR, "gmail-token.json");
 const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
 const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
 const ADS_MANAGED_PORTFOLIO_NAME = "AmzAllBlue_ERP";
+const ADS_AI_PROMPT_VERSION = "ads-ai-v1";
+const ADS_AI_ACTION_TYPES = new Set([
+  "NO_ACTION", "CHANGE_BID", "CHANGE_PLACEMENT_ADJUSTMENT", "CHANGE_DAILY_BUDGET",
+  "PAUSE_CAMPAIGN", "RESUME_CAMPAIGN", "MOVE_GROUP", "REQUEST_MORE_DATA"
+]);
+const ADS_AI_GROUPS = new Set(["NORMAL", "PROMOTED", "STABLE"]);
 const SECRET_KEYS = {
   gmailToken: "gmail_token",
   adsToken: "amazon_ads_token",
@@ -494,6 +500,96 @@ async function ensureAdsMysqlSchema(pool) {
       UNIQUE KEY uq_ads_operation_step (operation_id, step_key),
       KEY idx_ads_operation_steps_resume (operation_id, status, step_order),
       CONSTRAINT fk_ads_operation_steps_operation FOREIGN KEY (operation_id) REFERENCES ads_operations (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ai_strategy_versions (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      profile_id VARCHAR(64) NOT NULL,
+      version INT UNSIGNED NOT NULL,
+      rules_payload JSON NOT NULL,
+      created_by VARCHAR(32) NOT NULL DEFAULT 'USER',
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_ads_ai_strategy_version (profile_id, version),
+      KEY idx_ads_ai_strategy_latest (profile_id, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ai_keyword_goals (
+      keyword_id BIGINT UNSIGNED NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      goal_text TEXT NOT NULL,
+      constraints_payload JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (keyword_id),
+      KEY idx_ads_ai_keyword_goals_profile (profile_id, updated_at),
+      CONSTRAINT fk_ads_ai_keyword_goal_keyword FOREIGN KEY (keyword_id) REFERENCES ads_keywords (id) ON UPDATE RESTRICT ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ai_analysis_runs (
+      id VARCHAR(64) NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      keyword_id BIGINT UNSIGNED NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
+      model_name VARCHAR(128) NOT NULL DEFAULT '',
+      prompt_version VARCHAR(64) NOT NULL,
+      strategy_version INT UNSIGNED NOT NULL DEFAULT 1,
+      input_payload JSON NOT NULL,
+      output_payload JSON NULL,
+      validation_error TEXT NULL,
+      started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_ads_ai_runs_keyword (keyword_id, created_at),
+      KEY idx_ads_ai_runs_profile_status (profile_id, status, created_at),
+      CONSTRAINT fk_ads_ai_run_keyword FOREIGN KEY (keyword_id) REFERENCES ads_keywords (id) ON UPDATE RESTRICT ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ai_recommendations (
+      id VARCHAR(64) NOT NULL,
+      analysis_run_id VARCHAR(64) NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      keyword_id BIGINT UNSIGNED NOT NULL,
+      action_type VARCHAR(48) NOT NULL,
+      target_payload JSON NOT NULL,
+      before_payload JSON NULL,
+      after_payload JSON NULL,
+      reason_text TEXT NOT NULL,
+      risk_text TEXT NULL,
+      evidence_payload JSON NULL,
+      confidence DECIMAL(5,4) NOT NULL DEFAULT 0,
+      observe_days INT UNSIGNED NOT NULL DEFAULT 3,
+      status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
+      execution_result JSON NULL,
+      last_error TEXT NULL,
+      confirmed_at DATETIME NULL,
+      executed_at DATETIME NULL,
+      review_due_at DATETIME NULL,
+      reviewed_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_ads_ai_recommendations_keyword (keyword_id, status, created_at),
+      KEY idx_ads_ai_recommendations_run (analysis_run_id),
+      CONSTRAINT fk_ads_ai_recommendation_run FOREIGN KEY (analysis_run_id) REFERENCES ads_ai_analysis_runs (id) ON UPDATE RESTRICT ON DELETE CASCADE,
+      CONSTRAINT fk_ads_ai_recommendation_keyword FOREIGN KEY (keyword_id) REFERENCES ads_keywords (id) ON UPDATE RESTRICT ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ai_recommendation_events (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      recommendation_id VARCHAR(64) NOT NULL,
+      event_type VARCHAR(48) NOT NULL,
+      payload JSON NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_ads_ai_recommendation_events (recommendation_id, created_at),
+      CONSTRAINT fk_ads_ai_recommendation_event FOREIGN KEY (recommendation_id) REFERENCES ads_ai_recommendations (id) ON UPDATE RESTRICT ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query("ALTER TABLE ads_campaigns ADD COLUMN amazon_campaign_name VARCHAR(255) NULL AFTER campaign_name").catch(() => {});
@@ -1574,6 +1670,79 @@ function parseMysqlJson(value) {
   } catch {
     return null;
   }
+}
+
+function defaultAdsAiStrategyRules() {
+  return {
+    generalText: "只针对 AmzAllBlue_ERP 内的广告对象提出建议。优先保护账户安全、利润和库存；数据不足时返回 REQUEST_MORE_DATA。任何建议必须说明证据、风险和观察期，所有真实广告调整必须由用户逐条确认。",
+    globalLimits: {
+      requireManualConfirmation: true,
+      analysisWindowDays: 30,
+      minObservationDays: 3,
+      maxBid: 5,
+      maxBidChangeAmount: 0.2,
+      maxBidChangePercent: 0.25,
+      maxDailyBudget: 200,
+      maxDailyBudgetChangePercent: 0.25,
+      maxPlacementAdjustment: 300,
+      inventorySafetyDays: 21
+    },
+    groups: {
+      NORMAL: {
+        title: "普通",
+        objective: "测试关键词价值，并通过较低成本获取有利润的订单。",
+        rulesText: "使用相对保守的出价积累数据；词组和广泛匹配用于发现有效搜索词，精准匹配验证关键词本身的转化能力；有稳定转化且值得提升自然排名时可建议转为主推；流量不大但稳定盈利的长尾词继续保留；长期只有点击没有订单时建议降低出价或暂停。重点关注曝光、点击、CTR、CPC、订单、转化率、ACOS 和广告利润。"
+      },
+      PROMOTED: {
+        title: "主推",
+        objective: "增加关键词广告成交并提升自然排名，最终增加自然流量和自然订单。",
+        rulesText: "以精准匹配为主要投放方式；根据表现评估提高精准出价和顶部搜索加价；在可控范围内允许比利润型广告更高的 ACOS；观察广告订单增长是否带来自然排名、自然订单和总订单增长；关注库存安全，避免排名提升后断货；自然排名和订单持续稳定后可建议转为已稳定。重点关注自然排名、广告订单、顶部曝光、ACOS、库存与建议竞价。"
+      },
+      STABLE: {
+        title: "已稳定",
+        objective: "保持已有自然排名和销量，同时减少不必要的广告花费并提高整体利润。",
+        rulesText: "保留必要的精准广告维持曝光和成交；逐步测试降低出价或顶部搜索加价；减少词组和广泛匹配中的无效流量；观察降低广告投入后自然排名是否仍稳定；自然排名明显下降时可建议重新转为主推。重点关注排名稳定性、ACOS、广告利润、总销量和异常波动。"
+      }
+    }
+  };
+}
+
+function adsAiNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(max, Math.max(min, number));
+}
+
+function sanitizeAdsAiStrategyRules(value) {
+  const defaults = defaultAdsAiStrategyRules();
+  const source = value && typeof value === "object" ? value : {};
+  const sourceLimits = source.globalLimits && typeof source.globalLimits === "object" ? source.globalLimits : {};
+  const limits = defaults.globalLimits;
+  const groups = {};
+  for (const group of ADS_AI_GROUPS) {
+    const sourceGroup = source.groups?.[group] && typeof source.groups[group] === "object" ? source.groups[group] : {};
+    groups[group] = {
+      ...defaults.groups[group],
+      objective: String(sourceGroup.objective || defaults.groups[group].objective).trim().slice(0, 2000),
+      rulesText: String(sourceGroup.rulesText || defaults.groups[group].rulesText).trim().slice(0, 12000)
+    };
+  }
+  return {
+    generalText: String(source.generalText || defaults.generalText).trim().slice(0, 12000),
+    globalLimits: {
+      requireManualConfirmation: true,
+      analysisWindowDays: Math.round(adsAiNumber(sourceLimits.analysisWindowDays, limits.analysisWindowDays, 7, 90)),
+      minObservationDays: Math.round(adsAiNumber(sourceLimits.minObservationDays, limits.minObservationDays, 1, 30)),
+      maxBid: adsAiNumber(sourceLimits.maxBid, limits.maxBid, 0.02, 100),
+      maxBidChangeAmount: adsAiNumber(sourceLimits.maxBidChangeAmount, limits.maxBidChangeAmount, 0.01, 20),
+      maxBidChangePercent: adsAiNumber(sourceLimits.maxBidChangePercent, limits.maxBidChangePercent, 0.01, 2),
+      maxDailyBudget: adsAiNumber(sourceLimits.maxDailyBudget, limits.maxDailyBudget, 1, 100000),
+      maxDailyBudgetChangePercent: adsAiNumber(sourceLimits.maxDailyBudgetChangePercent, limits.maxDailyBudgetChangePercent, 0.01, 5),
+      maxPlacementAdjustment: Math.round(adsAiNumber(sourceLimits.maxPlacementAdjustment, limits.maxPlacementAdjustment, 0, 900)),
+      inventorySafetyDays: Math.round(adsAiNumber(sourceLimits.inventorySafetyDays, limits.inventorySafetyDays, 0, 365))
+    },
+    groups
+  };
 }
 
 function calculateTotalGoodsQuantity(row) {
@@ -6501,7 +6670,14 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
   let adUnitRows = [];
   let performanceRows = [];
   let placementRows = [];
+  let aiSuggestionRows = [];
   if (keywordIds.length) {
+    [aiSuggestionRows] = await pool.query(`
+      SELECT keyword_id, COUNT(*) suggestion_count
+      FROM ads_ai_recommendations
+      WHERE keyword_id IN (?) AND profile_id = ? AND status = 'PENDING'
+      GROUP BY keyword_id
+    `, [keywordIds, String(profile.profileId)]);
     [campaignRows] = await pool.query("SELECT * FROM ads_campaigns WHERE keyword_id IN (?) ORDER BY match_type", [keywordIds]);
     const campaignIds = campaignRows.map(row => row.id);
     if (campaignIds.length) {
@@ -6522,6 +6698,7 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
       `, [adUnitIds, safeStart, safeEnd]);
     }
   }
+  const aiSuggestionCountByKeyword = new Map(aiSuggestionRows.map(row => [String(row.keyword_id), Number(row.suggestion_count || 0)]));
   const metricsByAdUnit = new Map(performanceRows.map(row => [String(row.ad_unit_id), {
     impressions: Number(row.impressions || 0), clicks: Number(row.clicks || 0), spend: Number(row.spend || 0),
     orders: Number(row.orders_count || 0), units: Number(row.units_sold || 0), sales: Number(row.sales || 0)
@@ -6622,7 +6799,7 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
     });
     const monitorStatus = monitoring.length && monitoring.every(item => item.status === "ACTIVE")
       ? "ACTIVE" : monitoring.some(item => item.status === "ACTIVE") ? "PARTIAL" : "INACTIVE";
-    return { id: String(row.id), parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus };
+    return { id: String(row.id), parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(String(row.id)) || 0 };
   });
   return {
     profile,
@@ -6831,6 +7008,613 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     points,
     unavailableMetrics: []
   };
+}
+
+async function readLatestAdsAiStrategy(profileId) {
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT version, rules_payload, created_at
+    FROM ads_ai_strategy_versions
+    WHERE profile_id = ?
+    ORDER BY version DESC LIMIT 1
+  `, [String(profileId)]);
+  if (rows[0]) {
+    return {
+      version: Number(rows[0].version),
+      rules: sanitizeAdsAiStrategyRules(parseMysqlJson(rows[0].rules_payload)),
+      createdAt: rows[0].created_at
+    };
+  }
+  const rules = defaultAdsAiStrategyRules();
+  await pool.query(`
+    INSERT INTO ads_ai_strategy_versions (profile_id, version, rules_payload, created_by)
+    VALUES (?, 1, CAST(? AS JSON), 'SYSTEM')
+  `, [String(profileId), JSON.stringify(rules)]);
+  return { version: 1, rules, createdAt: new Date() };
+}
+
+async function saveAdsAiStrategy(body = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const rules = sanitizeAdsAiStrategyRules(body.rules);
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const [rows] = await connection.query(`
+      SELECT COALESCE(MAX(version), 0) latest_version
+      FROM ads_ai_strategy_versions WHERE profile_id = ? FOR UPDATE
+    `, [String(profile.profileId)]);
+    const version = Number(rows[0]?.latest_version || 0) + 1;
+    await connection.query(`
+      INSERT INTO ads_ai_strategy_versions (profile_id, version, rules_payload, created_by)
+      VALUES (?, ?, CAST(? AS JSON), 'USER')
+    `, [String(profile.profileId), version, JSON.stringify(rules)]);
+    await connection.commit();
+    return { version, rules };
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function requireAdsAiKeyword(keywordId) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT * FROM ads_keywords
+    WHERE id = ? AND profile_id = ? AND lifecycle_status = 'ACTIVE'
+  `, [keywordId, String(profile.profileId)]);
+  if (!rows[0]) throw new Error("关键词不存在或当前不可分析");
+  return { profile, keyword: rows[0] };
+}
+
+async function readAdsAiKeywordGoal(keywordId, profileId) {
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT goal_text, constraints_payload, updated_at
+    FROM ads_ai_keyword_goals
+    WHERE keyword_id = ? AND profile_id = ?
+  `, [keywordId, String(profileId)]);
+  const row = rows[0];
+  return {
+    text: row?.goal_text || "",
+    constraints: parseMysqlJson(row?.constraints_payload) || {},
+    updatedAt: row?.updated_at || null
+  };
+}
+
+async function saveAdsAiKeywordGoal(keywordId, body = {}) {
+  const { profile, keyword } = await requireAdsAiKeyword(keywordId);
+  const goalText = String(body.goalText || "").trim().slice(0, 4000);
+  const constraints = body.constraints && typeof body.constraints === "object" ? body.constraints : {};
+  const pool = getMysqlPool();
+  await pool.query(`
+    INSERT INTO ads_ai_keyword_goals (keyword_id, profile_id, goal_text, constraints_payload)
+    VALUES (?, ?, ?, CAST(? AS JSON))
+    ON DUPLICATE KEY UPDATE goal_text = VALUES(goal_text), constraints_payload = VALUES(constraints_payload)
+  `, [keyword.id, String(profile.profileId), goalText, JSON.stringify(constraints)]);
+  return { keywordId: String(keyword.id), goal: { text: goalText, constraints } };
+}
+
+function adsAiPeriodSummary(points) {
+  const totals = points.reduce((acc, point) => {
+    for (const key of ["impressions", "clicks", "spend", "orders", "units", "sales"]) acc[key] += Number(point[key] || 0);
+    return acc;
+  }, { impressions: 0, clicks: 0, spend: 0, orders: 0, units: 0, sales: 0 });
+  return {
+    ...totals,
+    ctr: totals.impressions > 0 ? totals.clicks / totals.impressions : null,
+    cpc: totals.clicks > 0 ? totals.spend / totals.clicks : null,
+    conversionRate: totals.clicks > 0 ? totals.orders / totals.clicks : null,
+    acos: totals.sales > 0 ? totals.spend / totals.sales : null,
+    roas: totals.spend > 0 ? totals.sales / totals.spend : null,
+    naturalRankStart: points.find(point => point.naturalRank !== null)?.naturalRank ?? null,
+    naturalRankEnd: [...points].reverse().find(point => point.naturalRank !== null)?.naturalRank ?? null,
+    adRankStart: points.find(point => point.adRank !== null)?.adRank ?? null,
+    adRankEnd: [...points].reverse().find(point => point.adRank !== null)?.adRank ?? null
+  };
+}
+
+function adsAiPercentChange(current, previous) {
+  const currentValue = Number(current || 0);
+  const previousValue = Number(previous || 0);
+  if (!previousValue) return currentValue ? null : 0;
+  return (currentValue - previousValue) / Math.abs(previousValue);
+}
+
+async function buildAdsAiAnalysisInput(keywordId) {
+  const { profile, keyword } = await requireAdsAiKeyword(keywordId);
+  const pool = getMysqlPool();
+  const strategy = await readLatestAdsAiStrategy(profile.profileId);
+  const goal = await readAdsAiKeywordGoal(keyword.id, profile.profileId);
+  const analysisWindowDays = Number(strategy.rules.globalLimits.analysisWindowDays || 30);
+  const historyDays = Math.max(30, analysisWindowDays);
+  const analysisEndDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+  const history = await readAdsKeywordHistory(keyword.id, {
+    startDate: addDays(analysisEndDate, -(historyDays - 1)),
+    endDate: analysisEndDate
+  });
+  const [campaignRows] = await pool.query(`
+    SELECT * FROM ads_campaigns
+    WHERE keyword_id = ? AND profile_id = ? AND lifecycle_status <> 'STOPPED'
+    ORDER BY match_type, id
+  `, [keyword.id, String(profile.profileId)]);
+  const campaignIds = campaignRows.map(row => row.id);
+  let unitRows = [];
+  if (campaignIds.length) {
+    [unitRows] = await pool.query(`
+      SELECT * FROM ads_ad_units WHERE campaign_id IN (?) AND lifecycle_status <> 'STOPPED' ORDER BY campaign_id, id
+    `, [campaignIds]);
+  }
+  const monitorAsins = [...new Set(unitRows.map(row => String(row.child_asin || "").toUpperCase()).filter(Boolean))];
+  let inventoryStatus = "NOT_FOUND";
+  let inventorySnapshot = [];
+  try {
+    const productCatalog = await readAdsProductCatalog();
+    const wantedUnits = new Set(unitRows.map(row => `${String(row.child_asin || "").toUpperCase()}|${String(row.seller_sku || "")}`));
+    inventorySnapshot = productCatalog.flatMap(product => product.children || []).filter(item =>
+      wantedUnits.has(`${String(item.asin || "").toUpperCase()}|${String(item.sellerSku || "")}`)
+    ).map(item => {
+      const totalGoodsQuantity = item.totalGoodsQuantity === null || item.totalGoodsQuantity === undefined ? null : Number(item.totalGoodsQuantity || 0);
+      const dailySales = Number(item.dailySales || 0);
+      return {
+        asin: item.asin,
+        sellerSku: item.sellerSku,
+        inventoryDate: item.inventoryDate || "",
+        totalGoodsQuantity,
+        fulfillableQuantity: item.fulfillableQuantity === null || item.fulfillableQuantity === undefined ? null : Number(item.fulfillableQuantity || 0),
+        averageDailySales30d: dailySales,
+        estimatedCoverDays: dailySales > 0 && totalGoodsQuantity !== null ? totalGoodsQuantity / dailySales : null
+      };
+    });
+    if (inventorySnapshot.length) inventoryStatus = "AVAILABLE";
+  } catch {
+    inventoryStatus = "UNAVAILABLE";
+  }
+  let recommendedBidRows = [];
+  if (monitorAsins.length) {
+    [recommendedBidRows] = await pool.query(`
+      SELECT m.asin, b.date, b.exact_start, b.exact_median, b.exact_end,
+        b.phrase_start, b.phrase_median, b.phrase_end, b.broad_start, b.broad_median, b.broad_end
+      FROM sif_keyword_monitors m
+      JOIN sif_keyword_bid_daily b ON b.monitor_id = m.id
+      JOIN (SELECT monitor_id, MAX(date) max_date FROM sif_keyword_bid_daily GROUP BY monitor_id) latest
+        ON latest.monitor_id = b.monitor_id AND latest.max_date = b.date
+      WHERE m.country_code = ? AND m.normalized_keyword = ? AND m.asin IN (?)
+    `, [String(profile.countryCode || "US").toUpperCase(), normalizeSifKeyword(keyword.keyword_text), monitorAsins]);
+  }
+  const historyStart = addDays(history.range.endDate, -29);
+  const [recentRecommendationRows] = await pool.query(`
+    SELECT r.*, a.output_payload, a.completed_at analysis_completed_at
+    FROM ads_ai_recommendations r
+    JOIN ads_ai_analysis_runs a ON a.id = r.analysis_run_id
+    WHERE r.keyword_id = ? AND r.profile_id = ? AND r.created_at >= ?
+    ORDER BY r.created_at DESC LIMIT 50
+  `, [keyword.id, String(profile.profileId), `${historyStart} 00:00:00`]);
+  const availablePoints = history.points.slice(-historyDays);
+  const points = availablePoints.slice(-analysisWindowDays);
+  const last7 = availablePoints.slice(-7);
+  const previous7 = availablePoints.slice(-14, -7);
+  const summary30 = adsAiPeriodSummary(availablePoints.slice(-30));
+  const summary7 = adsAiPeriodSummary(last7);
+  const summaryPrevious7 = adsAiPeriodSummary(previous7);
+  const campaigns = campaignRows.map(row => ({
+    id: String(row.id), matchType: row.match_type, childAsin: row.child_asin || "", sellerSku: row.seller_sku || "",
+    state: row.desired_state, amazonState: row.amazon_state || "", dailyBudget: Number(row.daily_budget || 0),
+    topOfSearchAdjustment: Number(row.top_of_search_adjustment || 0), restOfSearchAdjustment: Number(row.rest_of_search_adjustment || 0),
+    productPageAdjustment: Number(row.product_page_adjustment || 0), amazonCampaignId: row.amazon_campaign_id || ""
+  }));
+  const adUnits = unitRows.map(row => ({
+    id: String(row.id), campaignId: String(row.campaign_id), childAsin: row.child_asin, sellerSku: row.seller_sku,
+    bid: Number(row.bid || 0), state: row.desired_state, amazonAdGroupId: row.amazon_ad_group_id || "",
+    amazonTargetId: row.amazon_target_id || ""
+  }));
+  const decimal = value => value === null || value === undefined ? null : Number(value);
+  return {
+    context: {
+      profileId: String(profile.profileId), countryCode: profile.countryCode || "US", currency: profile.currencyCode || "USD",
+      keywordId: String(keyword.id), parentAsin: keyword.parent_asin, keyword: keyword.keyword_text,
+      group: keyword.keyword_group, dataCutoff: history.range.endDate, analysisWindowDays,
+      strategyVersion: strategy.version, promptVersion: ADS_AI_PROMPT_VERSION
+    },
+    strategy: { ...strategy.rules, keywordGoal: goal },
+    currentState: {
+      campaigns,
+      adUnits,
+      inventory: {
+        status: inventoryStatus,
+        safetyDays: Number(strategy.rules.globalLimits.inventorySafetyDays || 0),
+        items: inventorySnapshot
+      }
+    },
+    recommendedBids: recommendedBidRows.map(row => ({
+      asin: row.asin, date: adsDateValue(row.date),
+      exact: { start: decimal(row.exact_start), median: decimal(row.exact_median), end: decimal(row.exact_end) },
+      phrase: { start: decimal(row.phrase_start), median: decimal(row.phrase_median), end: decimal(row.phrase_end) },
+      broad: { start: decimal(row.broad_start), median: decimal(row.broad_median), end: decimal(row.broad_end) }
+    })),
+    performanceSummary: {
+      last7Days: summary7,
+      previous7Days: summaryPrevious7,
+      last30Days: summary30,
+      changes: {
+        impressions7dVsPrevious7d: adsAiPercentChange(summary7.impressions, summaryPrevious7.impressions),
+        clicks7dVsPrevious7d: adsAiPercentChange(summary7.clicks, summaryPrevious7.clicks),
+        orders7dVsPrevious7d: adsAiPercentChange(summary7.orders, summaryPrevious7.orders),
+        sales7dVsPrevious7d: adsAiPercentChange(summary7.sales, summaryPrevious7.sales),
+        acos7dVsPrevious7d: summary7.acos === null || summaryPrevious7.acos === null ? null : adsAiPercentChange(summary7.acos, summaryPrevious7.acos)
+      }
+    },
+    dailyHistory: points,
+    recentAiHistory: recentRecommendationRows.map(row => ({
+      recommendationId: row.id, actionType: row.action_type, target: parseMysqlJson(row.target_payload) || {},
+      before: parseMysqlJson(row.before_payload), after: parseMysqlJson(row.after_payload), reason: row.reason_text,
+      risk: row.risk_text || "", confidence: Number(row.confidence || 0), observeDays: Number(row.observe_days || 0),
+      status: row.status, executionResult: parseMysqlJson(row.execution_result), error: row.last_error || "",
+      createdAt: row.created_at, executedAt: row.executed_at, reviewDueAt: row.review_due_at, reviewedAt: row.reviewed_at
+    }))
+  };
+}
+
+function adsAiApproxEqual(left, right) {
+  return Math.abs(Number(left) - Number(right)) < 0.0001;
+}
+
+function isAdsAiJsonObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateAdsAiOutput(raw, input) {
+  if (!isAdsAiJsonObject(raw)) throw new Error("AI 输出必须是 JSON 对象");
+  const output = raw;
+  if (typeof output.analysisSummary !== "string") throw new Error("AI 输出的 analysisSummary 必须是字符串");
+  const analysisSummary = output.analysisSummary.trim().slice(0, 8000);
+  if (!analysisSummary) throw new Error("AI 输出缺少 analysisSummary");
+  if (!Array.isArray(output.signals)) throw new Error("AI 输出缺少 signals 数组");
+  const signals = output.signals.slice(0, 30).map(signal => {
+    if (!isAdsAiJsonObject(signal) || typeof signal.code !== "string" || typeof signal.summary !== "string") {
+      throw new Error("AI signals 字段结构不合法");
+    }
+    const severity = String(signal.severity || "").toLowerCase();
+    if (!["info", "warning", "critical"].includes(severity)) throw new Error("AI signal severity 不合法");
+    if (!Array.isArray(signal.evidence) || signal.evidence.some(item => typeof item !== "string")) {
+      throw new Error("AI signal evidence 必须是字符串数组");
+    }
+    const summary = signal.summary.trim().slice(0, 2000);
+    if (!summary) throw new Error("AI signal 缺少 summary");
+    return {
+      code: signal.code.trim().slice(0, 64) || "OTHER",
+      severity,
+      summary,
+      evidence: signal.evidence.map(item => item.slice(0, 200)).slice(0, 20)
+    };
+  });
+  if (!Array.isArray(output.recommendations)) throw new Error("AI 输出缺少 recommendations 数组");
+  const campaigns = new Map(input.currentState.campaigns.map(item => [String(item.id), item]));
+  const adUnits = new Map(input.currentState.adUnits.map(item => [String(item.id), item]));
+  const limits = input.strategy.globalLimits;
+  const recommendations = [];
+  for (const source of output.recommendations.slice(0, 20)) {
+    if (!isAdsAiJsonObject(source) || typeof source.actionType !== "string") throw new Error("AI recommendation 字段结构不合法");
+    if (!isAdsAiJsonObject(source.target) || !isAdsAiJsonObject(source.before) || !isAdsAiJsonObject(source.after)) {
+      throw new Error("AI recommendation 的 target、before、after 必须是 JSON 对象");
+    }
+    if (typeof source.reason !== "string" || (source.risk !== undefined && typeof source.risk !== "string")) {
+      throw new Error("AI recommendation 的 reason 或 risk 不合法");
+    }
+    if (!Array.isArray(source.evidence) || source.evidence.some(item => typeof item !== "string")) {
+      throw new Error("AI recommendation evidence 必须是字符串数组");
+    }
+    if (typeof source.confidence !== "number" || !Number.isFinite(source.confidence) || source.confidence < 0 || source.confidence > 1) {
+      throw new Error("AI recommendation confidence 必须是 0 到 1 的数字");
+    }
+    if (typeof source.observeDays !== "number" || !Number.isInteger(source.observeDays)) {
+      throw new Error("AI recommendation observeDays 必须是整数");
+    }
+    const actionType = source.actionType.toUpperCase();
+    if (!ADS_AI_ACTION_TYPES.has(actionType)) throw new Error(`AI 返回了不支持的动作：${actionType || "空"}`);
+    if (actionType === "NO_ACTION") continue;
+    const target = { ...source.target };
+    const before = { ...source.before };
+    const after = { ...source.after };
+    if (["CHANGE_BID"].includes(actionType)) {
+      if (typeof target.adUnitId !== "string" || typeof before.bid !== "number" || typeof after.bid !== "number"
+        || !Number.isFinite(before.bid) || !Number.isFinite(after.bid)) throw new Error("调价建议字段类型不合法");
+      const unit = adUnits.get(String(target.adUnitId || ""));
+      if (!unit) throw new Error("调价建议缺少有效 adUnitId");
+      const nextBid = after.bid;
+      if (!adsAiApproxEqual(before.bid, unit.bid)) throw new Error("调价建议的 before.bid 与当前值不一致");
+      if (!(nextBid > 0) || nextBid > limits.maxBid) throw new Error("调价建议超出最高竞价限制");
+      if (Math.abs(nextBid - unit.bid) > limits.maxBidChangeAmount + 0.0001) throw new Error("调价建议超出单次金额限制");
+      if (unit.bid > 0 && Math.abs(nextBid - unit.bid) / unit.bid > limits.maxBidChangePercent + 0.0001) throw new Error("调价建议超出单次比例限制");
+      target.adUnitId = String(unit.id);
+      target.campaignId = String(unit.campaignId);
+      before.bid = Number(unit.bid);
+      after.bid = nextBid;
+    } else if (["CHANGE_PLACEMENT_ADJUSTMENT", "CHANGE_DAILY_BUDGET"].includes(actionType)) {
+      if (typeof target.campaignId !== "string") throw new Error("Campaign 调整建议的 campaignId 必须是字符串");
+      const campaign = campaigns.get(String(target.campaignId || ""));
+      if (!campaign) throw new Error("Campaign 调整建议缺少有效 campaignId");
+      const current = {
+        dailyBudget: campaign.dailyBudget,
+        topOfSearchAdjustment: campaign.topOfSearchAdjustment,
+        restOfSearchAdjustment: campaign.restOfSearchAdjustment,
+        productPageAdjustment: campaign.productPageAdjustment
+      };
+      if (actionType === "CHANGE_DAILY_BUDGET") {
+        if (typeof before.dailyBudget !== "number" || typeof after.dailyBudget !== "number"
+          || !Number.isFinite(before.dailyBudget) || !Number.isFinite(after.dailyBudget)) throw new Error("预算建议字段类型不合法");
+        const nextBudget = after.dailyBudget;
+        if (!adsAiApproxEqual(before.dailyBudget, current.dailyBudget)) throw new Error("预算建议的当前值不一致");
+        if (!(nextBudget > 0) || nextBudget > limits.maxDailyBudget) throw new Error("预算建议超出最高预算限制");
+        if (current.dailyBudget > 0 && Math.abs(nextBudget - current.dailyBudget) / current.dailyBudget > limits.maxDailyBudgetChangePercent + 0.0001) throw new Error("预算建议超出单次比例限制");
+        after.dailyBudget = nextBudget;
+      } else {
+        for (const key of ["topOfSearchAdjustment", "restOfSearchAdjustment", "productPageAdjustment"]) {
+          if (after[key] === undefined) after[key] = current[key];
+          const value = after[key];
+          if (!Number.isInteger(value) || value < 0 || value > limits.maxPlacementAdjustment) throw new Error("位置加价建议超出限制");
+          after[key] = value;
+        }
+      }
+      Object.assign(before, current);
+      Object.assign(after, { ...current, ...after });
+      target.campaignId = String(campaign.id);
+    } else if (["PAUSE_CAMPAIGN", "RESUME_CAMPAIGN"].includes(actionType)) {
+      if (typeof target.campaignId !== "string") throw new Error("启停建议的 campaignId 必须是字符串");
+      const campaign = campaigns.get(String(target.campaignId || ""));
+      if (!campaign) throw new Error("启停建议缺少有效 campaignId");
+      const expectedAfter = actionType === "PAUSE_CAMPAIGN" ? "PAUSED" : "ENABLED";
+      before.state = campaign.state;
+      after.state = expectedAfter;
+      target.campaignId = String(campaign.id);
+    } else if (actionType === "MOVE_GROUP") {
+      if (target.keywordId !== undefined && typeof target.keywordId !== "string") throw new Error("分组建议的 keywordId 必须是字符串");
+      if (typeof after.group !== "string") throw new Error("分组建议的 group 必须是字符串");
+      const nextGroup = String(after.group || "").toUpperCase();
+      if (String(target.keywordId || input.context.keywordId) !== input.context.keywordId || !ADS_AI_GROUPS.has(nextGroup)) throw new Error("分组建议不合法");
+      target.keywordId = input.context.keywordId;
+      before.group = input.context.group;
+      after.group = nextGroup;
+    } else if (actionType === "REQUEST_MORE_DATA") {
+      target.keywordId = input.context.keywordId;
+    }
+    const reason = source.reason.trim().slice(0, 8000);
+    if (!reason) throw new Error("AI 建议缺少 reason");
+    recommendations.push({
+      actionType, target, before, after, reason,
+      risk: String(source.risk || "").trim().slice(0, 4000),
+      evidence: source.evidence.map(item => item.slice(0, 300)).slice(0, 30),
+      confidence: source.confidence,
+      observeDays: Math.round(adsAiNumber(source.observeDays, limits.minObservationDays, limits.minObservationDays, 30))
+    });
+  }
+  return { analysisSummary, signals, recommendations };
+}
+
+async function rememberAdsAiRecommendationEvent(recommendationId, eventType, payload = null, connection = null) {
+  const executor = connection || getMysqlPool();
+  await executor.query(`
+    INSERT INTO ads_ai_recommendation_events (recommendation_id, event_type, payload)
+    VALUES (?, ?, CAST(? AS JSON))
+  `, [recommendationId, eventType, JSON.stringify(payload)]);
+}
+
+async function runAdsAiAnalysis(keywordId) {
+  const input = await buildAdsAiAnalysisInput(keywordId);
+  const pool = getMysqlPool();
+  const runId = randomUUID();
+  const modelName = process.env.OPENAI_MODEL || "gpt-5.4";
+  await pool.query(`
+    INSERT INTO ads_ai_analysis_runs (
+      id, profile_id, keyword_id, status, model_name, prompt_version, strategy_version, input_payload
+    ) VALUES (?, ?, ?, 'RUNNING', ?, ?, ?, CAST(? AS JSON))
+  `, [runId, input.context.profileId, input.context.keywordId, modelName, ADS_AI_PROMPT_VERSION, input.context.strategyVersion, JSON.stringify(input)]);
+  let outputForAudit = null;
+  try {
+    const content = await callOpenAI([
+      {
+        role: "system",
+        content: `你是 Amazon Ads 关键词投放分析器。只能根据输入 JSON 和策略规则判断，不得虚构数据。所有真实调整都必须人工确认。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{\"analysisSummary\":\"string\",\"signals\":[{\"code\":\"string\",\"severity\":\"info|warning|critical\",\"summary\":\"string\",\"evidence\":[\"输入字段路径\"]}],\"recommendations\":[{\"actionType\":\"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION\",\"target\":{\"keywordId\":\"string 可选\",\"campaignId\":\"string 可选\",\"adUnitId\":\"string 可选\"},\"before\":{},\"after\":{},\"reason\":\"string\",\"risk\":\"string\",\"evidence\":[\"输入字段路径\"],\"confidence\":0.0,\"observeDays\":3}]}\n必须使用输入中真实存在的本地 ID。CHANGE_BID 使用 before/after.bid；位置加价使用 topOfSearchAdjustment/restOfSearchAdjustment/productPageAdjustment；预算使用 dailyBudget；启停使用 state；分组使用 group。若证据不足，返回 REQUEST_MORE_DATA 或空 recommendations。`
+      },
+      { role: "user", content: JSON.stringify(input) }
+    ], true);
+    if (!content) throw new Error("未配置 OPENAI_API_KEY，无法调用 CCAI 分析");
+    outputForAudit = { rawText: String(content).slice(0, 200000) };
+    let rawOutput;
+    try {
+      rawOutput = JSON.parse(content);
+      outputForAudit = rawOutput;
+    } catch {
+      throw new Error("AI 返回内容不是合法 JSON");
+    }
+    const output = validateAdsAiOutput(rawOutput, input);
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [supersededRows] = await connection.query(`
+        SELECT id FROM ads_ai_recommendations
+        WHERE keyword_id = ? AND profile_id = ? AND status = 'PENDING'
+        FOR UPDATE
+      `, [input.context.keywordId, input.context.profileId]);
+      await connection.query(`
+        UPDATE ads_ai_recommendations
+        SET status = 'SUPERSEDED'
+        WHERE keyword_id = ? AND profile_id = ? AND status = 'PENDING'
+      `, [input.context.keywordId, input.context.profileId]);
+      for (const previous of supersededRows) {
+        await rememberAdsAiRecommendationEvent(previous.id, "SUPERSEDED", { supersededByAnalysisRunId: runId }, connection);
+      }
+      await connection.query(`
+        UPDATE ads_ai_analysis_runs
+        SET status = 'COMPLETE', output_payload = CAST(? AS JSON), validation_error = NULL, completed_at = NOW()
+        WHERE id = ?
+      `, [JSON.stringify(output), runId]);
+      for (const recommendation of output.recommendations) {
+        const recommendationId = randomUUID();
+        await connection.query(`
+          INSERT INTO ads_ai_recommendations (
+            id, analysis_run_id, profile_id, keyword_id, action_type, target_payload, before_payload, after_payload,
+            reason_text, risk_text, evidence_payload, confidence, observe_days, status
+          ) VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), CAST(? AS JSON), CAST(? AS JSON), ?, ?, CAST(? AS JSON), ?, ?, 'PENDING')
+        `, [
+          recommendationId, runId, input.context.profileId, input.context.keywordId, recommendation.actionType,
+          JSON.stringify(recommendation.target), JSON.stringify(recommendation.before), JSON.stringify(recommendation.after),
+          recommendation.reason, recommendation.risk, JSON.stringify(recommendation.evidence), recommendation.confidence, recommendation.observeDays
+        ]);
+        await rememberAdsAiRecommendationEvent(recommendationId, "GENERATED", recommendation, connection);
+      }
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      connection.release();
+    }
+    return await readAdsAiKeywordState(keywordId, runId);
+  } catch (error) {
+    await pool.query(`
+      UPDATE ads_ai_analysis_runs
+      SET status = 'FAILED', output_payload = CAST(? AS JSON), validation_error = ?, completed_at = NOW()
+      WHERE id = ?
+    `, [JSON.stringify(outputForAudit), error.message, runId]);
+    throw error;
+  }
+}
+
+function mapAdsAiRecommendation(row) {
+  return {
+    id: row.id, analysisRunId: row.analysis_run_id, actionType: row.action_type,
+    target: parseMysqlJson(row.target_payload) || {}, before: parseMysqlJson(row.before_payload) || {},
+    after: parseMysqlJson(row.after_payload) || {}, reason: row.reason_text, risk: row.risk_text || "",
+    evidence: parseMysqlJson(row.evidence_payload) || [], confidence: Number(row.confidence || 0),
+    observeDays: Number(row.observe_days || 0), status: row.status,
+    executionResult: parseMysqlJson(row.execution_result), error: row.last_error || "",
+    confirmedAt: row.confirmed_at, executedAt: row.executed_at, reviewDueAt: row.review_due_at,
+    reviewedAt: row.reviewed_at, createdAt: row.created_at, updatedAt: row.updated_at
+  };
+}
+
+async function readAdsAiKeywordState(keywordId, preferredRunId = "") {
+  const { profile, keyword } = await requireAdsAiKeyword(keywordId);
+  const pool = getMysqlPool();
+  const strategy = await readLatestAdsAiStrategy(profile.profileId);
+  const goal = await readAdsAiKeywordGoal(keyword.id, profile.profileId);
+  const [runRows] = await pool.query(`
+    SELECT id, status, model_name, prompt_version, strategy_version, output_payload, validation_error,
+      started_at, completed_at, created_at
+    FROM ads_ai_analysis_runs
+    WHERE keyword_id = ? AND profile_id = ?
+    ORDER BY (id = ?) DESC, created_at DESC LIMIT 1
+  `, [keyword.id, String(profile.profileId), preferredRunId || ""]);
+  const latestRun = runRows[0] ? {
+    id: runRows[0].id, status: runRows[0].status, model: runRows[0].model_name,
+    promptVersion: runRows[0].prompt_version, strategyVersion: Number(runRows[0].strategy_version),
+    output: parseMysqlJson(runRows[0].output_payload), error: runRows[0].validation_error || "",
+    startedAt: runRows[0].started_at, completedAt: runRows[0].completed_at, createdAt: runRows[0].created_at
+  } : null;
+  const [recommendationRows] = await pool.query(`
+    SELECT * FROM ads_ai_recommendations
+    WHERE keyword_id = ? AND profile_id = ?
+    ORDER BY created_at DESC LIMIT 30
+  `, [keyword.id, String(profile.profileId)]);
+  return {
+    configured: Boolean(process.env.OPENAI_API_KEY),
+    keyword: { id: String(keyword.id), text: keyword.keyword_text, group: keyword.keyword_group },
+    goal, strategy, latestRun, recommendations: recommendationRows.map(mapAdsAiRecommendation)
+  };
+}
+
+async function decideAdsAiRecommendation(recommendationId, decision) {
+  const profile = await requireSelectedAdsProfile();
+  const nextStatus = String(decision || "").toUpperCase() === "REJECTED" ? "REJECTED" : "";
+  if (!nextStatus) throw new Error("不支持的建议处理方式");
+  const pool = getMysqlPool();
+  const [result] = await pool.query(`
+    UPDATE ads_ai_recommendations SET status = ?
+    WHERE id = ? AND profile_id = ? AND status = 'PENDING'
+  `, [nextStatus, recommendationId, String(profile.profileId)]);
+  if (!Number(result.affectedRows || 0)) throw new Error("建议不存在或状态已经变化");
+  await rememberAdsAiRecommendationEvent(recommendationId, "REJECTED", { decision: nextStatus });
+  return { id: recommendationId, status: nextStatus };
+}
+
+async function assertAdsAiRecommendationFresh(row) {
+  const pool = getMysqlPool();
+  const target = parseMysqlJson(row.target_payload) || {};
+  const before = parseMysqlJson(row.before_payload) || {};
+  if (row.action_type === "CHANGE_BID") {
+    const [rows] = await pool.query("SELECT bid FROM ads_ad_units WHERE id = ? AND profile_id = ?", [target.adUnitId, row.profile_id]);
+    if (!rows[0] || !adsAiApproxEqual(rows[0].bid, before.bid)) throw new Error("当前竞价已变化，该建议已过期，请重新分析");
+  } else if (["CHANGE_PLACEMENT_ADJUSTMENT", "CHANGE_DAILY_BUDGET"].includes(row.action_type)) {
+    const [rows] = await pool.query("SELECT daily_budget, top_of_search_adjustment, rest_of_search_adjustment, product_page_adjustment FROM ads_campaigns WHERE id = ? AND profile_id = ?", [target.campaignId, row.profile_id]);
+    const campaign = rows[0];
+    if (!campaign || !adsAiApproxEqual(campaign.daily_budget, before.dailyBudget)
+      || Number(campaign.top_of_search_adjustment) !== Number(before.topOfSearchAdjustment)
+      || Number(campaign.rest_of_search_adjustment) !== Number(before.restOfSearchAdjustment)
+      || Number(campaign.product_page_adjustment) !== Number(before.productPageAdjustment)) {
+      throw new Error("Campaign 设置已变化，该建议已过期，请重新分析");
+    }
+  } else if (["PAUSE_CAMPAIGN", "RESUME_CAMPAIGN"].includes(row.action_type)) {
+    const [rows] = await pool.query("SELECT desired_state FROM ads_campaigns WHERE id = ? AND profile_id = ?", [target.campaignId, row.profile_id]);
+    if (!rows[0] || rows[0].desired_state !== before.state) throw new Error("Campaign 状态已变化，该建议已过期，请重新分析");
+  } else if (row.action_type === "MOVE_GROUP") {
+    const [rows] = await pool.query("SELECT keyword_group FROM ads_keywords WHERE id = ? AND profile_id = ?", [row.keyword_id, row.profile_id]);
+    if (!rows[0] || rows[0].keyword_group !== before.group) throw new Error("关键词分组已变化，该建议已过期，请重新分析");
+  }
+}
+
+async function executeAdsAiRecommendation(recommendationId, body = {}) {
+  if (body.confirmed !== true) throw new Error("必须明确确认后才能执行 AI 建议");
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT * FROM ads_ai_recommendations WHERE id = ? AND profile_id = ?
+  `, [recommendationId, String(profile.profileId)]);
+  const row = rows[0];
+  if (!row || row.status !== "PENDING") throw new Error("建议不存在或已处理");
+  if (["REQUEST_MORE_DATA", "NO_ACTION"].includes(row.action_type)) throw new Error("该建议不包含可执行的广告操作");
+  const target = parseMysqlJson(row.target_payload) || {};
+  const after = parseMysqlJson(row.after_payload) || {};
+  const [claimResult] = await pool.query(`
+    UPDATE ads_ai_recommendations
+    SET status = 'EXECUTING', confirmed_at = NOW(), last_error = NULL
+    WHERE id = ? AND profile_id = ? AND status = 'PENDING'
+  `, [recommendationId, String(profile.profileId)]);
+  if (!Number(claimResult.affectedRows || 0)) throw new Error("建议已被处理，请刷新后重试");
+  try {
+    await rememberAdsAiRecommendationEvent(recommendationId, "USER_CONFIRMED", { confirmed: true });
+    await assertAdsAiRecommendationFresh(row);
+    await rememberAdsAiRecommendationEvent(recommendationId, "EXECUTION_STARTED", { actionType: row.action_type, target, after });
+    let result;
+    if (row.action_type === "CHANGE_BID") {
+      result = await updateAdsAdUnitBid(target.adUnitId, { bid: after.bid });
+    } else if (["CHANGE_PLACEMENT_ADJUSTMENT", "CHANGE_DAILY_BUDGET"].includes(row.action_type)) {
+      result = await updateAdsCampaignSettings(target.campaignId, after);
+    } else if (row.action_type === "PAUSE_CAMPAIGN") {
+      result = await setAdsCampaignState(target.campaignId, "PAUSED");
+    } else if (row.action_type === "RESUME_CAMPAIGN") {
+      result = await setAdsCampaignState(target.campaignId, "ENABLED");
+    } else if (row.action_type === "MOVE_GROUP") {
+      result = await updateAdsKeywordGroup(row.keyword_id, after.group);
+    } else {
+      throw new Error("尚不支持执行该建议类型");
+    }
+    await pool.query(`
+      UPDATE ads_ai_recommendations
+      SET status = 'EXECUTED', execution_result = CAST(? AS JSON), executed_at = NOW(),
+        review_due_at = DATE_ADD(NOW(), INTERVAL ? DAY), last_error = NULL
+      WHERE id = ?
+    `, [JSON.stringify(result || {}), Number(row.observe_days || 3), recommendationId]);
+    await rememberAdsAiRecommendationEvent(recommendationId, "EXECUTED", result || {});
+    return { id: recommendationId, status: "EXECUTED", result };
+  } catch (error) {
+    await pool.query("UPDATE ads_ai_recommendations SET status = 'FAILED', last_error = ? WHERE id = ?", [error.message, recommendationId]);
+    await rememberAdsAiRecommendationEvent(recommendationId, "EXECUTION_FAILED", { error: error.message });
+    throw error;
+  }
 }
 
 async function readAdsDateStatus() {
@@ -8156,6 +8940,15 @@ async function handleApi(req, res, url) {
     return sendJson(res, { template: await ensureAdsCreationTemplate(profile) });
   }
 
+  if (req.method === "GET" && url.pathname === "/api/ads/ai/strategy") {
+    const profile = await requireSelectedAdsProfile();
+    return sendJson(res, { strategy: await readLatestAdsAiStrategy(profile.profileId) });
+  }
+
+  if (req.method === "PUT" && url.pathname === "/api/ads/ai/strategy") {
+    return sendJson(res, { strategy: await saveAdsAiStrategy(await parseBody(req)) });
+  }
+
   if (req.method === "POST" && url.pathname === "/api/ads/keywords") {
     const result = await createAdsKeywordDraft(await parseBody(req));
     return sendJson(res, result, 201);
@@ -8173,6 +8966,30 @@ async function handleApi(req, res, url) {
       childAsin: url.searchParams.get("childAsin") || "",
       matchType: url.searchParams.get("matchType") || ""
     }));
+  }
+
+  const adsKeywordAiMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/ai$/);
+  if (req.method === "GET" && adsKeywordAiMatch) {
+    return sendJson(res, await readAdsAiKeywordState(adsKeywordAiMatch[1]));
+  }
+  if (req.method === "PUT" && adsKeywordAiMatch) {
+    return sendJson(res, await saveAdsAiKeywordGoal(adsKeywordAiMatch[1], await parseBody(req)));
+  }
+
+  const adsKeywordAiAnalyzeMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/ai\/analyze$/);
+  if (req.method === "POST" && adsKeywordAiAnalyzeMatch) {
+    return sendJson(res, await runAdsAiAnalysis(adsKeywordAiAnalyzeMatch[1]), 201);
+  }
+
+  const adsAiRecommendationExecuteMatch = url.pathname.match(/^\/api\/ads\/ai\/recommendations\/([^/]+)\/execute$/);
+  if (req.method === "POST" && adsAiRecommendationExecuteMatch) {
+    return sendJson(res, await executeAdsAiRecommendation(adsAiRecommendationExecuteMatch[1], await parseBody(req)));
+  }
+
+  const adsAiRecommendationDecisionMatch = url.pathname.match(/^\/api\/ads\/ai\/recommendations\/([^/]+)\/decision$/);
+  if (req.method === "POST" && adsAiRecommendationDecisionMatch) {
+    const body = await parseBody(req);
+    return sendJson(res, await decideAdsAiRecommendation(adsAiRecommendationDecisionMatch[1], body.decision));
   }
 
   const adsKeywordMonitoringMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/monitoring$/);

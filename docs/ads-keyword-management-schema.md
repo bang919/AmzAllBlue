@@ -17,6 +17,11 @@
 | `ads_sync_dates` | 日期范围完成状态及日期选择器标记 |
 | `ads_operations` | 创建、改名和启停操作的预览、确认及执行状态 |
 | `ads_operation_steps` | 每个远端对象步骤的结果，用于失败续传 |
+| `ads_ai_strategy_versions` | 每个 Profile 的 AI 策略规则版本；历史版本不可覆盖 |
+| `ads_ai_keyword_goals` | 单个关键词的手动调整目标和约束 |
+| `ads_ai_analysis_runs` | 每次 AI 分析的输入快照、标准输出、模型和校验状态 |
+| `ads_ai_recommendations` | AI 建议、人工决定、执行结果和复盘时间 |
+| `ads_ai_recommendation_events` | 建议生成、拒绝、确认、执行和失败的不可变事件流水 |
 
 ## 核心关系
 
@@ -26,6 +31,12 @@ ads_keywords
        ├─ ads_ad_units (一个子 ASIN，一个明确 Seller SKU)
        │    └─ ads_performance_daily
        └─ ads_placement_performance_daily
+
+ads_keywords
+  ├─ ads_ai_keyword_goals
+  └─ ads_ai_analysis_runs
+       └─ ads_ai_recommendations
+            └─ ads_ai_recommendation_events
 ```
 
 内部主键使用 `BIGINT UNSIGNED`，Amazon ID 使用字符串保存。日报主键不重复保存 Profile、关键词等维度，避免大数据量下重复字段和过大的索引。
@@ -49,6 +60,14 @@ ads_keywords
 `ads_keywords.creation_batch` 在保存草稿时生成一次，采用 UTC 紧凑时间戳，例如 `20260713T093015123Z`。该值复制到 `ads_campaigns` 和 `ads_ad_units`，预览、确认、创建及失败续传全过程不重新生成。
 
 `ads_sync_jobs.active_dedupe_key` 只在任务处于活动状态时有值，利用唯一索引阻止同一报表并发重复申请；任务结束后清空，允许以后重新覆盖同步同一日期范围。
+
+## AI 分析与执行审计
+
+每次 AI 分析先写入 `ads_ai_analysis_runs`，保存策略版本、关键词目标、近 30 天完整指标数组、建议竞价、最近建议与执行历史。CCAI 返回内容必须通过服务端 JSON 结构、对象归属、当前值和策略安全边界校验，校验失败的分析保存为 `FAILED`，不产生建议。
+
+新分析成功后，上一轮仍未处理的建议转为 `SUPERSEDED`。真正可展示的提醒只统计 `PENDING` 建议。用户拒绝、确认和执行均写入 `ads_ai_recommendation_events`；执行前再次核对数据库当前值，若竞价、预算、位置加价、状态或分组已经变化，则拒绝执行过期建议。
+
+建议状态包括 `PENDING`、`EXECUTING`、`EXECUTED`、`FAILED`、`REJECTED` 和 `SUPERSEDED`。任何真实广告操作均要求用户逐条确认，AI 策略中的 `requireManualConfirmation` 由服务端强制保持为真。
 
 ## 数据保留
 

@@ -240,6 +240,19 @@
               <button id="adsConfirmOperationBtn" type="button" class="primary">我已核对，确认创建</button>
             </div>
           </dialog>
+
+          <dialog id="adsAiStrategyDialog" class="ads-dialog ads-ai-strategy-dialog">
+            <div class="ads-dialog-head">
+              <div><strong>调整 AI 策略规则</strong><span>规则按版本保存；新的分析使用最新版本，历史分析保留当时的完整快照</span></div>
+              <button type="button" data-close-ads-ai-strategy aria-label="关闭">×</button>
+            </div>
+            <div id="adsAiStrategyBody" class="ads-dialog-body"></div>
+            <div class="ads-dialog-actions">
+              <span id="adsAiStrategyVersion" class="ads-ai-strategy-version"></span>
+              <button type="button" class="secondary-button" data-close-ads-ai-strategy>取消</button>
+              <button id="adsAiSaveStrategyBtn" type="button" class="primary">保存新版本</button>
+            </div>
+          </dialog>
         </section>
 
         <section id="keywordMonitorPage" class="module-page">
