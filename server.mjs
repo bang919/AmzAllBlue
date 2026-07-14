@@ -22,8 +22,10 @@ const ADS_MANAGED_PORTFOLIO_NAME = "AmzAllBlue_ERP";
 const SECRET_KEYS = {
   gmailToken: "gmail_token",
   adsToken: "amazon_ads_token",
-  adsProfile: "amazon_ads_profile"
+  adsProfile: "amazon_ads_profile",
+  sifCredentials: "sif_keyword_monitor_credentials"
 };
+const SIF_ORIGIN = "https://www.sif.com";
 const ENV_PATH = join(ROOT, ".env");
 const FBA_DATE_MARKER_SKU = "__DATE_MARKER__";
 const fbaInventoryCache = new Map();
@@ -41,6 +43,7 @@ let mysqlDatabaseReady = false;
 let fbaScheduledSyncTimer = null;
 let adsHourlySyncTimer = null;
 let adsRollingSyncTimer = null;
+let sifDailySyncTimer = null;
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -161,6 +164,76 @@ function getMysqlPool() {
 }
 
 async function ensureAdsMysqlSchema(pool) {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sif_keyword_monitors (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+      country_code VARCHAR(8) NOT NULL DEFAULT 'US',
+      asin VARCHAR(32) NOT NULL,
+      keyword_text VARCHAR(255) NOT NULL,
+      normalized_keyword VARCHAR(255) NOT NULL,
+      monitor_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      source VARCHAR(16) NOT NULL DEFAULT 'SIF',
+      last_seen_at DATETIME NULL,
+      last_synced_at DATETIME NULL,
+      last_error TEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      UNIQUE KEY uq_sif_keyword_monitor (country_code, asin, normalized_keyword),
+      KEY idx_sif_keyword_monitors_status (monitor_status, asin),
+      KEY idx_sif_keyword_monitors_keyword (normalized_keyword)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sif_keyword_rank_daily (
+      monitor_id BIGINT UNSIGNED NOT NULL,
+      date DATE NOT NULL,
+      natural_rank INT UNSIGNED NULL,
+      natural_rank_str VARCHAR(64) NULL,
+      natural_asin VARCHAR(32) NULL,
+      sp_rank INT UNSIGNED NULL,
+      sp_rank_str VARCHAR(64) NULL,
+      sp_asin VARCHAR(32) NULL,
+      est_searches_num BIGINT UNSIGNED NULL,
+      aba_rank BIGINT UNSIGNED NULL,
+      synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (monitor_id, date),
+      KEY idx_sif_keyword_rank_daily_date (date),
+      CONSTRAINT fk_sif_keyword_rank_monitor FOREIGN KEY (monitor_id) REFERENCES sif_keyword_monitors (id) ON UPDATE RESTRICT ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sif_keyword_bid_daily (
+      monitor_id BIGINT UNSIGNED NOT NULL,
+      date DATE NOT NULL,
+      category_id VARCHAR(64) NOT NULL,
+      category_name VARCHAR(255) NOT NULL DEFAULT '',
+      category_product_count BIGINT UNSIGNED NULL,
+      bid_mode VARCHAR(16) NOT NULL DEFAULT 'legacy',
+      match_status VARCHAR(32) NOT NULL DEFAULT 'MATCHED',
+      category_source VARCHAR(16) NOT NULL DEFAULT 'CHILD',
+      exact_start DECIMAL(10,4) NULL,
+      exact_median DECIMAL(10,4) NULL,
+      exact_end DECIMAL(10,4) NULL,
+      phrase_start DECIMAL(10,4) NULL,
+      phrase_median DECIMAL(10,4) NULL,
+      phrase_end DECIMAL(10,4) NULL,
+      broad_start DECIMAL(10,4) NULL,
+      broad_median DECIMAL(10,4) NULL,
+      broad_end DECIMAL(10,4) NULL,
+      synced_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (monitor_id, date),
+      KEY idx_sif_keyword_bid_daily_date (date),
+      KEY idx_sif_keyword_bid_daily_category (category_id),
+      CONSTRAINT fk_sif_keyword_bid_monitor FOREIGN KEY (monitor_id) REFERENCES sif_keyword_monitors (id) ON UPDATE RESTRICT ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query("ALTER TABLE sif_keyword_bid_daily ADD COLUMN match_status VARCHAR(32) NOT NULL DEFAULT 'MATCHED' AFTER bid_mode").catch(() => {});
+  await pool.query("ALTER TABLE sif_keyword_bid_daily ADD COLUMN category_source VARCHAR(16) NOT NULL DEFAULT 'CHILD' AFTER match_status").catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS ads_managed_portfolios (
       profile_id VARCHAR(64) NOT NULL,
@@ -511,12 +584,33 @@ async function ensureAppMysqlSchema() {
       parent_asin VARCHAR(32) NOT NULL,
       internal_name VARCHAR(255) NOT NULL DEFAULT '',
       sort_order INT NOT NULL DEFAULT 0,
+      category_id VARCHAR(64) NOT NULL DEFAULT '',
+      category_name VARCHAR(255) NOT NULL DEFAULT '',
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (parent_asin)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query("ALTER TABLE parent_asin_metadata ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER internal_name").catch(() => {});
+  await pool.query("ALTER TABLE parent_asin_metadata ADD COLUMN category_id VARCHAR(64) NOT NULL DEFAULT '' AFTER sort_order").catch(() => {});
+  await pool.query("ALTER TABLE parent_asin_metadata ADD COLUMN category_name VARCHAR(255) NOT NULL DEFAULT '' AFTER category_id").catch(() => {});
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS amazon_browse_categories (
+      category_id VARCHAR(64) NOT NULL,
+      category_name VARCHAR(255) NOT NULL DEFAULT '',
+      source VARCHAR(32) NOT NULL DEFAULT '',
+      last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (category_id),
+      KEY idx_amazon_browse_categories_name (category_name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    INSERT INTO amazon_browse_categories (category_id, category_name, source)
+    VALUES ('3743931', 'Under-Bed Storage', 'MANUAL')
+    ON DUPLICATE KEY UPDATE category_name = VALUES(category_name)
+  `);
   await pool.query(`
     CREATE TABLE IF NOT EXISTS app_secrets (
       secret_key VARCHAR(128) NOT NULL,
@@ -591,6 +685,753 @@ async function writeAppSecret(secretKey, value) {
     VALUES (?, CAST(? AS JSON))
     ON DUPLICATE KEY UPDATE encrypted_value = VALUES(encrypted_value)
   `, [secretKey, JSON.stringify(encrypted)]);
+}
+
+async function deleteAppSecret(secretKey) {
+  await ensureAppMysqlSchema();
+  await getMysqlPool().query("DELETE FROM app_secrets WHERE secret_key = ?", [secretKey]);
+}
+
+function parseSifCurl(curlText) {
+  const source = String(curlText || "").trim();
+  if (!source) throw new Error("请粘贴从 SIF 复制的 cURL 请求");
+  const urlMatch = source.match(/https:\/\/www\.sif\.com\/api\/[^\s'\"]*/i);
+  if (!urlMatch) throw new Error("未找到有效的 SIF API 请求地址");
+  const requestUrl = new URL(urlMatch[0]);
+  const headers = {};
+  const headerPattern = /(?:--header|-H)\s+(?:'([^']*)'|"([^"]*)")/gi;
+  let headerMatch;
+  while ((headerMatch = headerPattern.exec(source))) {
+    const line = headerMatch[1] ?? headerMatch[2] ?? "";
+    const separator = line.indexOf(":");
+    if (separator <= 0) continue;
+    headers[line.slice(0, separator).trim().toLowerCase()] = line.slice(separator + 1).trim();
+  }
+  const authorization = String(headers.authorization || "").trim();
+  if (!authorization) throw new Error("cURL 中没有找到 authorization 请求头");
+  const refererCountry = String(headers.referer || "").match(/[?&]country=([A-Za-z]{2})/i)?.[1] || "";
+  return {
+    authorization,
+    cookie: String(headers.cookie || "").trim(),
+    userAgent: String(headers["user-agent"] || "Mozilla/5.0").trim(),
+    marker: String(requestUrl.searchParams.get("_m") || "").trim(),
+    country: String(requestUrl.searchParams.get("country") || refererCountry || "US").trim().toUpperCase()
+  };
+}
+
+function sifRequestUrl(pathname, credentials) {
+  const url = new URL(pathname, SIF_ORIGIN);
+  url.searchParams.set("country", credentials.country || "US");
+  url.searchParams.set("_t", String(Date.now()));
+  if (credentials.marker) url.searchParams.set("_m", credentials.marker);
+  return url;
+}
+
+async function sifRequest(pathname, body, credentials) {
+  const response = await fetch(sifRequestUrl(pathname, credentials), {
+    method: "POST",
+    headers: {
+      accept: "application/json, text/plain, */*",
+      "content-type": "application/json;charset=UTF-8",
+      origin: SIF_ORIGIN,
+      referer: `${SIF_ORIGIN}/dailyrank?country=${encodeURIComponent(credentials.country || "US")}`,
+      "user-agent": credentials.userAgent || "Mozilla/5.0",
+      authorization: credentials.authorization,
+      ...(credentials.cookie ? { cookie: credentials.cookie } : {})
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(Number(process.env.SIF_REQUEST_TIMEOUT_MS || 20_000))
+  });
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`SIF 返回了无法解析的响应（HTTP ${response.status}）`);
+  }
+  if (!response.ok || Number(payload?.code) !== 1) {
+    const remoteMessage = String(payload?.message || payload?.msg || payload?.error || "授权可能已过期").slice(0, 180);
+    throw new Error(`SIF 请求失败：${remoteMessage}`);
+  }
+  return payload;
+}
+
+async function checkSifCredentials(credentials) {
+  const response = await fetch(sifRequestUrl("/api/user/sys/info", credentials), {
+    method: "GET",
+    headers: {
+      accept: "application/json, text/plain, */*",
+      origin: SIF_ORIGIN,
+      referer: `${SIF_ORIGIN}/dailyrank?country=${encodeURIComponent(credentials.country || "US")}`,
+      "user-agent": credentials.userAgent || "Mozilla/5.0",
+      authorization: credentials.authorization,
+      ...(credentials.cookie ? { cookie: credentials.cookie } : {})
+    },
+    signal: AbortSignal.timeout(Number(process.env.SIF_REQUEST_TIMEOUT_MS || 20_000))
+  });
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(`SIF 返回了无法解析的响应（HTTP ${response.status}）`);
+  }
+  if (!response.ok || Number(payload?.code) !== 1) {
+    const remoteMessage = String(payload?.message || payload?.msg || payload?.error || "authorization 可能已过期").slice(0, 180);
+    throw new Error(`SIF 身份验证失败：${remoteMessage}`);
+  }
+  return true;
+}
+
+function normalizeSifAsin(value) {
+  const asin = String(value || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{10}$/.test(asin)) throw new Error("请输入有效的 10 位子 ASIN");
+  return asin;
+}
+
+function normalizeSifKeyword(value) {
+  return String(value || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+}
+
+async function setSifMonitorStatuses(country, asin, keywords, status, { source = "SIF", error = null } = {}) {
+  const safeCountry = String(country || "US").trim().toUpperCase();
+  const safeAsin = normalizeSifAsin(asin);
+  const rows = [...new Map((keywords || []).map(keyword => {
+    const text = String(keyword || "").trim().replace(/\s+/g, " ");
+    return [normalizeSifKeyword(text), text];
+  }).filter(([normalized]) => normalized)).entries()];
+  if (!rows.length) return [];
+  const now = new Date();
+  await getMysqlPool().query(`
+    INSERT INTO sif_keyword_monitors (
+      country_code, asin, keyword_text, normalized_keyword, monitor_status, source,
+      last_seen_at, last_synced_at, last_error
+    ) VALUES ?
+    ON DUPLICATE KEY UPDATE
+      keyword_text = VALUES(keyword_text), monitor_status = VALUES(monitor_status),
+      source = IF(source = 'ADS', source, VALUES(source)),
+      last_seen_at = IF(VALUES(monitor_status) = 'ACTIVE', VALUES(last_seen_at), last_seen_at),
+      last_synced_at = VALUES(last_synced_at), last_error = VALUES(last_error)
+  `, [rows.map(([normalized, text]) => [
+    safeCountry, safeAsin, text, normalized, status, source,
+    status === "ACTIVE" ? now : null, now, error
+  ])]);
+  return rows.map(([normalized]) => normalized);
+}
+
+async function syncSifKeywordSnapshot(asin, payload, country = "US") {
+  const data = payload?.data || {};
+  const keywords = Array.isArray(data.keywords) ? data.keywords.filter(item => item?.keyword) : [];
+  const safeAsin = normalizeSifAsin(asin);
+  const safeCountry = String(country || "US").trim().toUpperCase();
+  const normalized = await setSifMonitorStatuses(safeCountry, safeAsin, keywords.map(item => item.keyword), "ACTIVE", { source: "SIF" });
+  const pool = getMysqlPool();
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    const completeSnapshot = Number(data.total || 0) <= keywords.length;
+    if (completeSnapshot) {
+      if (normalized.length) {
+        await connection.query(`
+          UPDATE sif_keyword_monitors
+          SET monitor_status = 'INACTIVE', last_synced_at = NOW()
+          WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE'
+            AND normalized_keyword NOT IN (?)
+        `, [safeCountry, safeAsin, normalized]);
+      } else {
+        await connection.query(`
+          UPDATE sif_keyword_monitors SET monitor_status = 'INACTIVE', last_synced_at = NOW()
+          WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE'
+        `, [safeCountry, safeAsin]);
+      }
+    }
+    const [monitorRows] = await connection.query(`
+      SELECT id, normalized_keyword FROM sif_keyword_monitors
+      WHERE country_code = ? AND asin = ?
+    `, [safeCountry, safeAsin]);
+    const monitorIds = new Map(monitorRows.map(row => [row.normalized_keyword, Number(row.id)]));
+    const daily = new Map();
+    for (const keyword of keywords) {
+      const monitorId = monitorIds.get(normalizeSifKeyword(keyword.keyword));
+      if (!monitorId) continue;
+      for (const rankItem of Array.isArray(keyword.rankInfo) ? keyword.rankInfo : []) {
+        const nf = rankItem?.nf || {};
+        const sp = rankItem?.sp || {};
+        const date = String(nf.updateTime || sp.updateTime || "").slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+        daily.set(`${monitorId}|${date}`, {
+          monitorId, date,
+          naturalRank: nf.rank === null || nf.rank === undefined ? null : Number(nf.rank),
+          naturalRankStr: nf.rankStr || null, naturalAsin: nf.asin || safeAsin,
+          spRank: sp.rank === null || sp.rank === undefined ? null : Number(sp.rank),
+          spRankStr: sp.rankStr || null, spAsin: sp.asin || safeAsin,
+          searches: null, abaRank: null
+        });
+      }
+      const history = keyword.estSearchesNumHistory || {};
+      const historyDates = Array.isArray(history.date) ? history.date : [];
+      for (let index = 0; index < historyDates.length; index += 1) {
+        const date = String(historyDates[index] || "").slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+        const key = `${monitorId}|${date}`;
+        const item = daily.get(key) || {
+          monitorId, date, naturalRank: null, naturalRankStr: null, naturalAsin: null,
+          spRank: null, spRankStr: null, spAsin: null, searches: null, abaRank: null
+        };
+        item.searches = history.estSearchesNum?.[index] === null || history.estSearchesNum?.[index] === undefined ? null : Number(history.estSearchesNum[index]);
+        item.abaRank = history.searchesRank?.[index] === null || history.searchesRank?.[index] === undefined ? null : Number(history.searchesRank[index]);
+        daily.set(key, item);
+      }
+    }
+    const rows = [...daily.values()];
+    if (rows.length) {
+      await connection.query(`
+        INSERT INTO sif_keyword_rank_daily (
+          monitor_id, date, natural_rank, natural_rank_str, natural_asin,
+          sp_rank, sp_rank_str, sp_asin, est_searches_num, aba_rank, synced_at
+        ) VALUES ?
+        ON DUPLICATE KEY UPDATE
+          natural_rank = VALUES(natural_rank), natural_rank_str = VALUES(natural_rank_str), natural_asin = VALUES(natural_asin),
+          sp_rank = VALUES(sp_rank), sp_rank_str = VALUES(sp_rank_str), sp_asin = VALUES(sp_asin),
+          est_searches_num = COALESCE(VALUES(est_searches_num), est_searches_num),
+          aba_rank = COALESCE(VALUES(aba_rank), aba_rank), synced_at = VALUES(synced_at)
+      `, [rows.map(item => [
+        item.monitorId, item.date, item.naturalRank, item.naturalRankStr, item.naturalAsin,
+        item.spRank, item.spRankStr, item.spAsin, item.searches, item.abaRank, new Date()
+      ])]);
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback().catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function listSifKeywords(credentials, asin = "") {
+  const selectedAsin = normalizeSifAsin(asin);
+  const payload = await sifRequest("/api/search/subscribe/v2", {
+    filterAsin: "",
+    granularity: "week",
+    asin: selectedAsin,
+    endDay: null,
+    pageNum: 1,
+    pageSize: 200,
+    interval: 7,
+    sortBy: "estSearchesNum",
+    desc: true,
+    isListingSearch: true,
+    isExample: false
+  }, credentials);
+  await syncSifKeywordSnapshot(selectedAsin, payload, credentials.country || "US");
+  return { selectedAsin, payload };
+}
+
+async function ensureSifAsinClassification(asin, forceRefresh = false) {
+  const selectedAsin = normalizeSifAsin(asin);
+  const config = getSpApiConfig();
+  const metadataRows = (await readFbaSkuMetadataRows()).filter(row =>
+    row.marketplaceId === config.marketplaceId && normalizeAsin(row.asin) === selectedAsin
+  );
+  if (!forceRefresh) {
+    for (const row of metadataRows) {
+      const classification = catalogClassification(row);
+      if (classification.categoryIds.length) return classification;
+    }
+  }
+  const fetched = await fetchCatalogDetails([selectedAsin]);
+  const item = fetched.get(selectedAsin);
+  if (!item?.categoryIds?.length) return { categoryId: "", categoryName: "", categoryIds: [], categoryNodes: [] };
+  await upsertBrowseCategories(item.categoryNodes || [], "AMAZON_CATALOG");
+  const fetchedAt = new Date().toISOString();
+  if (metadataRows.length) {
+    await upsertFbaSkuMetadata(metadataRows.map(row => ({
+      ...row,
+      parentAsin: item.parentAsin || row.parentAsin || "",
+      title: item.title || row.title || "",
+      brand: item.brand || row.brand || "",
+      imageUrl: item.imageUrl || row.imageUrl || "",
+      lastSeenAt: fetchedAt,
+      rawJson: {
+        source: "catalog",
+        catalogFetchedAt: fetchedAt,
+        browseClassification: {
+          categoryId: item.categoryId || "",
+          categoryName: item.categoryName || "",
+          categoryIds: item.categoryIds || [],
+          categoryNodes: item.categoryNodes || []
+        }
+      }
+    })), "catalog").catch(() => {});
+  }
+  return {
+    categoryId: item.categoryId || "",
+    categoryName: item.categoryName || "",
+    categoryIds: item.categoryIds || [],
+    categoryNodes: item.categoryNodes || []
+  };
+}
+
+async function readParentCategoryForChildAsin(asin) {
+  const selectedAsin = normalizeSifAsin(asin);
+  const config = getSpApiConfig();
+  const metadataRows = (await readFbaSkuMetadataRows()).filter(row =>
+    row.marketplaceId === config.marketplaceId && normalizeAsin(row.asin) === selectedAsin
+  );
+  const parentAsin = normalizeAsin(metadataRows.find(row => normalizeAsin(row.parentAsin))?.parentAsin);
+  if (!parentAsin) return { parentAsin: "", categoryId: "", categoryName: "" };
+  const parent = (await readParentAsinMetadataRows()).find(row => row.parentAsin === parentAsin);
+  return {
+    parentAsin,
+    categoryId: String(parent?.categoryId || ""),
+    categoryName: String(parent?.categoryName || "")
+  };
+}
+
+function sifFixedBidValues(category, matchType) {
+  const values = category?.matchTypes?.[matchType]?.legacy || {};
+  const number = value => value === null || value === undefined || value === "" || !Number.isFinite(Number(value)) ? null : Number(value);
+  return { start: number(values.start), median: number(values.median), end: number(values.end) };
+}
+
+async function syncSifKeywordBids(credentials, asin, keywordTexts) {
+  const selectedAsin = normalizeSifAsin(asin);
+  const keywords = [...new Map((keywordTexts || []).map(value => {
+    const text = String(value || "").trim().replace(/\s+/g, " ");
+    return [normalizeSifKeyword(text), text];
+  }).filter(([normalized]) => normalized)).values()];
+  if (!keywords.length) return { saved: 0, skipped: true };
+  const country = String(credentials.country || "US").toUpperCase();
+  const normalizedKeywords = keywords.map(normalizeSifKeyword);
+  const [monitorRows] = await getMysqlPool().query(`
+    SELECT id, normalized_keyword FROM sif_keyword_monitors
+    WHERE country_code = ? AND asin = ? AND normalized_keyword IN (?)
+  `, [country, selectedAsin, normalizedKeywords]);
+  const monitorIds = new Map(monitorRows.map(row => [row.normalized_keyword, Number(row.id)]));
+  if (monitorRows.length) {
+    const [todayRows] = await getMysqlPool().query(`
+      SELECT COUNT(DISTINCT monitor_id) saved_count FROM sif_keyword_bid_daily
+      WHERE monitor_id IN (?) AND date = ?
+    `, [monitorRows.map(row => Number(row.id)), formatDateInTimeZone()]);
+    if (Number(todayRows[0]?.saved_count || 0) >= monitorRows.length) {
+      return { saved: 0, skipped: true, reason: "already_synced_today" };
+    }
+  }
+  let classification = await ensureSifAsinClassification(selectedAsin);
+  if (!classification.categoryIds.length) throw new Error(`${selectedAsin} 的 Amazon Catalog 类目节点暂时无法获取`);
+  const parentCategory = await readParentCategoryForChildAsin(selectedAsin);
+  let categoryPriority = [...new Set([classification.categoryId, ...classification.categoryIds].filter(Boolean))];
+  const responseKeywords = [];
+  for (const batch of chunkArray(keywords, 30)) {
+    const payload = await sifRequest("/api/search/cpc/category", {
+      isExpand: true,
+      keywords: batch,
+      pageNum: 1,
+      pageSize: 30,
+      granularity: "week",
+      desc: true,
+      sortBy: "estSearchesNum"
+    }, credentials);
+    responseKeywords.push(...(Array.isArray(payload?.data?.keywords) ? payload.data.keywords : []));
+  }
+  await upsertBrowseCategories(responseKeywords.flatMap(item => Array.isArray(item.categorys) ? item.categorys : []), "SIF_CPC");
+  const availableCategoryIds = new Set(responseKeywords.flatMap(item =>
+    (Array.isArray(item.categorys) ? item.categorys : []).map(category => String(category?.categoryId || "")).filter(Boolean)
+  ));
+  if (!categoryPriority.some(categoryId => availableCategoryIds.has(String(categoryId))) &&
+      !availableCategoryIds.has(String(parentCategory.categoryId || ""))) {
+    classification = await ensureSifAsinClassification(selectedAsin, true);
+    categoryPriority = [...new Set([classification.categoryId, ...classification.categoryIds].filter(Boolean))];
+  }
+  const normalized = responseKeywords.map(item => normalizeSifKeyword(item.keyword)).filter(Boolean);
+  if (!normalized.length) return { saved: 0, category: classification };
+  const rows = [];
+  for (const keyword of responseKeywords) {
+    const monitorId = monitorIds.get(normalizeSifKeyword(keyword.keyword));
+    if (!monitorId) continue;
+    const categories = Array.isArray(keyword.categorys) ? keyword.categorys : [];
+    let selectedCategory = null;
+    let categorySource = "CHILD";
+    for (const categoryId of categoryPriority) {
+      selectedCategory = categories.find(category => String(category?.categoryId || "") === String(categoryId)) || null;
+      if (selectedCategory) break;
+    }
+    if (!selectedCategory && parentCategory.categoryId) {
+      selectedCategory = categories.find(category => String(category?.categoryId || "") === parentCategory.categoryId) || null;
+      if (selectedCategory) categorySource = "PARENT";
+    }
+    rows.push({
+      monitorId,
+      category: selectedCategory || {
+        categoryId: classification.categoryId || categoryPriority[0] || "UNKNOWN",
+        categoryName: classification.categoryName || "Amazon Catalog 类目",
+        saleNum: null,
+        matchTypes: {}
+      },
+      matchStatus: selectedCategory ? "MATCHED" : "NO_CATEGORY_MATCH",
+      categorySource,
+      exact: sifFixedBidValues(selectedCategory, "exact"),
+      phrase: sifFixedBidValues(selectedCategory, "phrase"),
+      broad: sifFixedBidValues(selectedCategory, "broad")
+    });
+  }
+  if (rows.length) {
+    await getMysqlPool().query(`
+      INSERT INTO sif_keyword_bid_daily (
+        monitor_id, date, category_id, category_name, category_product_count, bid_mode, match_status, category_source,
+        exact_start, exact_median, exact_end, phrase_start, phrase_median, phrase_end,
+        broad_start, broad_median, broad_end, synced_at
+      ) VALUES ?
+      ON DUPLICATE KEY UPDATE
+        category_id = VALUES(category_id), category_name = VALUES(category_name),
+        category_product_count = VALUES(category_product_count), bid_mode = VALUES(bid_mode), match_status = VALUES(match_status), category_source = VALUES(category_source),
+        exact_start = VALUES(exact_start), exact_median = VALUES(exact_median), exact_end = VALUES(exact_end),
+        phrase_start = VALUES(phrase_start), phrase_median = VALUES(phrase_median), phrase_end = VALUES(phrase_end),
+        broad_start = VALUES(broad_start), broad_median = VALUES(broad_median), broad_end = VALUES(broad_end),
+        synced_at = VALUES(synced_at)
+    `, [rows.map(row => [
+      row.monitorId, formatDateInTimeZone(), String(row.category.categoryId || ""), String(row.category.categoryName || ""),
+      row.category.saleNum === null || row.category.saleNum === undefined ? null : Number(row.category.saleNum), "legacy",
+      row.matchStatus,
+      row.categorySource,
+      row.exact.start, row.exact.median, row.exact.end,
+      row.phrase.start, row.phrase.median, row.phrase.end,
+      row.broad.start, row.broad.median, row.broad.end,
+      new Date()
+    ])]);
+  }
+  return { saved: rows.length, requested: keywords.length, category: classification };
+}
+
+async function readSifLatestBids(asin, keywordTexts) {
+  const normalized = [...new Set((keywordTexts || []).map(normalizeSifKeyword).filter(Boolean))];
+  if (!normalized.length) return new Map();
+  const [rows] = await getMysqlPool().query(`
+    SELECT m.normalized_keyword, b.*
+    FROM sif_keyword_monitors m
+    JOIN sif_keyword_bid_daily b ON b.monitor_id = m.id
+    JOIN (
+      SELECT monitor_id, MAX(date) max_date FROM sif_keyword_bid_daily GROUP BY monitor_id
+    ) latest ON latest.monitor_id = b.monitor_id AND latest.max_date = b.date
+    WHERE m.asin = ? AND m.normalized_keyword IN (?)
+  `, [normalizeSifAsin(asin), normalized]);
+  const price = value => value === null || value === undefined ? null : Number(value);
+  return new Map(rows.map(row => [row.normalized_keyword, {
+    date: adsDateValue(row.date), mode: row.bid_mode || "legacy", matchStatus: row.match_status || "MATCHED", categorySource: row.category_source || "CHILD",
+    categoryId: row.category_id || "", categoryName: row.category_name || "",
+    productCount: row.category_product_count === null ? null : Number(row.category_product_count),
+    exact: { start: price(row.exact_start), median: price(row.exact_median), end: price(row.exact_end) },
+    phrase: { start: price(row.phrase_start), median: price(row.phrase_median), end: price(row.phrase_end) },
+    broad: { start: price(row.broad_start), median: price(row.broad_median), end: price(row.broad_end) }
+  }]));
+}
+
+async function readAdsKeywordChildProducts() {
+  await ensureAppMysqlSchema();
+  const profile = await readAdsProfileSelection();
+  if (!profile?.profileId) return [];
+  const [rows] = await getMysqlPool().query(`
+    SELECT u.child_asin, k.parent_asin, MAX(k.updated_at) last_keyword_at
+    FROM ads_ad_units u
+    JOIN ads_campaigns c ON c.id = u.campaign_id
+    JOIN ads_keywords k ON k.id = c.keyword_id
+    WHERE u.profile_id = ?
+      AND u.child_asin IS NOT NULL AND u.child_asin <> ''
+      AND k.lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING')
+      AND c.lifecycle_status <> 'STOPPED'
+      AND u.lifecycle_status <> 'STOPPED'
+    GROUP BY u.child_asin, k.parent_asin
+    ORDER BY last_keyword_at DESC, u.child_asin ASC
+  `, [String(profile.profileId)]);
+  const catalog = await readAdsProductCatalog();
+  const parentByAsin = new Map(catalog.map(item => [item.parentAsin, item]));
+  return rows.map(row => {
+    const asin = String(row.child_asin || "").trim().toUpperCase();
+    const parentAsin = String(row.parent_asin || "").trim().toUpperCase();
+    const parent = parentByAsin.get(parentAsin);
+    const child = parent?.children?.find(item => item.asin === asin) || null;
+    return {
+      asin,
+      parentAsin,
+      parentName: parent?.internalName || parentAsin,
+      childName: child?.internalName || child?.title || asin,
+      imageUrl: child?.imageUrl || ""
+    };
+  }).filter(item => /^[A-Z0-9]{10}$/.test(item.asin));
+}
+
+async function readAdsKeywordChildAsins() {
+  return (await readAdsKeywordChildProducts()).map(item => item.asin);
+}
+
+async function readSifRankMatrix(asin, keywordTexts, maxDays = 60) {
+  const normalized = [...new Set((keywordTexts || []).map(normalizeSifKeyword).filter(Boolean))];
+  if (!normalized.length) return { dates: [], byKeyword: new Map() };
+  const pool = getMysqlPool();
+  const [maxRows] = await pool.query(`
+    SELECT MAX(d.date) max_date
+    FROM sif_keyword_rank_daily d JOIN sif_keyword_monitors m ON m.id = d.monitor_id
+    WHERE m.asin = ? AND m.normalized_keyword IN (?)
+      AND (d.natural_asin IS NOT NULL OR d.sp_asin IS NOT NULL)
+  `, [asin, normalized]);
+  const maxDate = adsDateValue(maxRows[0]?.max_date);
+  if (!maxDate) return { dates: [], byKeyword: new Map() };
+  const startDate = addDays(maxDate, -(Math.max(1, Math.min(60, Number(maxDays) || 60)) - 1));
+  const [rows] = await pool.query(`
+    SELECT m.normalized_keyword, d.date, d.natural_rank, d.natural_rank_str, d.natural_asin,
+      d.sp_rank, d.sp_rank_str, d.sp_asin
+    FROM sif_keyword_rank_daily d JOIN sif_keyword_monitors m ON m.id = d.monitor_id
+    WHERE m.asin = ? AND m.normalized_keyword IN (?) AND d.date BETWEEN ? AND ?
+      AND (d.natural_asin IS NOT NULL OR d.sp_asin IS NOT NULL)
+    ORDER BY d.date DESC
+  `, [asin, normalized, startDate, maxDate]);
+  const dates = [...new Set(rows.map(row => adsDateValue(row.date)))];
+  const byKeyword = new Map();
+  for (const row of rows) {
+    const list = byKeyword.get(row.normalized_keyword) || [];
+    const date = adsDateValue(row.date);
+    list.push({
+      nf: { asin: row.natural_asin || asin, rank: row.natural_rank === null ? null : Number(row.natural_rank), rankStr: row.natural_rank_str || null, updateTime: date, changeType: "noChange", isSubscribe: true },
+      sp: { asin: row.sp_asin || asin, rank: row.sp_rank === null ? null : Number(row.sp_rank), rankStr: row.sp_rank_str || null, updateTime: date, changeType: "noChange", isSubscribe: true }
+    });
+    byKeyword.set(row.normalized_keyword, list);
+  }
+  return { dates, byKeyword };
+}
+
+function sifWorkspaceData(payloadData, adsProducts, matrix = { dates: [], byKeyword: new Map() }, bids = new Map()) {
+  const keywords = (payloadData?.keywords || []).map(keyword => ({
+    ...keyword,
+    rankInfo: matrix.byKeyword.get(normalizeSifKeyword(keyword.keyword)) || [],
+    fixedBid: bids.get(normalizeSifKeyword(keyword.keyword)) || null
+  }));
+  return {
+    ...(payloadData || {}),
+    dates: matrix.dates,
+    keywords,
+    asins: adsProducts.map(item => item.asin),
+    asinProducts: adsProducts,
+    asinNum: adsProducts.length
+  };
+}
+
+async function readSifKeywordWorkspace(asin = "") {
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) return { authorized: false, configured: false };
+  try {
+    const adsProducts = await readAdsKeywordChildProducts();
+    const adsAsins = adsProducts.map(item => item.asin);
+    const requestedAsin = String(asin || "").trim().toUpperCase();
+    const selectedAsin = adsAsins.includes(requestedAsin) ? requestedAsin : adsAsins[0] || "";
+    if (!selectedAsin) {
+      await checkSifCredentials(credentials);
+      return {
+        authorized: true,
+        configured: true,
+        requiresAdsAsin: true,
+        country: credentials.country || "US",
+        selectedAsin: "",
+        data: { dates: [], keywords: [], asins: [], asinProducts: [], asinNum: 0, keywordNum: 0 }
+      };
+    }
+    const result = await listSifKeywords(credentials, selectedAsin);
+    const keywordTexts = result.payload.data?.keywords?.map(item => item.keyword) || [];
+    const [matrix, bids] = await Promise.all([
+      readSifRankMatrix(selectedAsin, keywordTexts, 60),
+      readSifLatestBids(selectedAsin, keywordTexts)
+    ]);
+    return {
+      authorized: true,
+      configured: true,
+      country: credentials.country || "US",
+      selectedAsin: result.selectedAsin,
+      data: sifWorkspaceData(result.payload.data, adsProducts, matrix, bids)
+    };
+  } catch (error) {
+    return { authorized: false, configured: true, error: error.message };
+  }
+}
+
+async function syncAllSifKeywordRanks() {
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) return { synced: 0, skipped: true };
+  const adsAsins = await readAdsKeywordChildAsins();
+  const [monitorRows] = await getMysqlPool().query(`
+    SELECT DISTINCT asin FROM sif_keyword_monitors
+    WHERE country_code = ? AND monitor_status = 'ACTIVE'
+  `, [String(credentials.country || "US").toUpperCase()]);
+  const asins = [...new Set([...adsAsins, ...monitorRows.map(row => String(row.asin || "").toUpperCase())])]
+    .filter(asin => /^[A-Z0-9]{10}$/.test(asin));
+  let synced = 0;
+  const errors = [];
+  for (const asin of asins) {
+    try {
+      const result = await listSifKeywords(credentials, asin);
+      await syncSifKeywordBids(credentials, asin, result.payload.data?.keywords?.map(item => item.keyword) || []);
+      synced += 1;
+    } catch (error) {
+      errors.push(`${asin}: ${error.message}`);
+    }
+  }
+  return { synced, errors };
+}
+
+async function syncSifKeywordAsinNow(asin) {
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) throw new Error("请先授权 SIF 账户");
+  const selectedAsin = normalizeSifAsin(asin);
+  const result = await listSifKeywords(credentials, selectedAsin);
+  const bids = await syncSifKeywordBids(credentials, selectedAsin, result.payload.data?.keywords?.map(item => item.keyword) || []);
+  return { asin: selectedAsin, ranksSynced: true, bids };
+}
+
+function startSifKeywordSchedule() {
+  if (sifDailySyncTimer) return;
+  const run = () => syncAllSifKeywordRanks().then(result => {
+    if (result.errors?.length) console.error(`SIF keyword sync partial failure: ${result.errors.join("；")}`);
+  }).catch(error => console.error(`SIF keyword sync failed: ${error.message}`));
+  const scheduleNext = () => {
+    const now = new Date();
+    const hour = Math.max(0, Math.min(23, Number(process.env.SIF_SYNC_HOUR || 10)));
+    const minute = Math.max(0, Math.min(59, Number(process.env.SIF_SYNC_MINUTE || 15)));
+    const marketplaceDate = formatDateInTimeZone(now, US_MARKETPLACE_TIME_ZONE);
+    let next = zonedDateTimeToUtc(marketplaceDate, hour, minute, 0, US_MARKETPLACE_TIME_ZONE);
+    if (next <= now) next = zonedDateTimeToUtc(addDays(marketplaceDate, 1), hour, minute, 0, US_MARKETPLACE_TIME_ZONE);
+    sifDailySyncTimer = setTimeout(async () => {
+      await run();
+      scheduleNext();
+    }, next.getTime() - now.getTime());
+  };
+  scheduleNext();
+  setTimeout(run, Math.max(10_000, Number(process.env.SIF_STARTUP_SYNC_DELAY_MS || 120_000)));
+}
+
+async function saveSifCredentialsFromCurl(curlText) {
+  const credentials = parseSifCurl(curlText);
+  const adsProducts = await readAdsKeywordChildProducts();
+  const adsAsins = adsProducts.map(item => item.asin);
+  const selectedAsin = adsAsins[0] || "";
+  const result = selectedAsin ? await listSifKeywords(credentials, selectedAsin) : null;
+  if (!result) await checkSifCredentials(credentials);
+  const keywordTexts = result?.payload.data?.keywords?.map(item => item.keyword) || [];
+  const [matrix, bids] = result ? await Promise.all([
+    readSifRankMatrix(selectedAsin, keywordTexts, 60),
+    readSifLatestBids(selectedAsin, keywordTexts)
+  ]) : [null, new Map()];
+  await writeAppSecret(SECRET_KEYS.sifCredentials, credentials);
+  return {
+    authorized: true,
+    configured: true,
+    requiresAdsAsin: !selectedAsin,
+    country: credentials.country,
+    selectedAsin: result?.selectedAsin || "",
+    data: result ? sifWorkspaceData(result.payload.data, adsProducts, matrix, bids) : { dates: [], keywords: [], asins: [], asinProducts: [], asinNum: 0, keywordNum: 0 }
+  };
+}
+
+async function readSifKeywordHistory({ asin, keyword, startDate, endDate }) {
+  const selectedAsin = normalizeSifAsin(asin);
+  const normalizedKeyword = normalizeSifKeyword(keyword);
+  if (!normalizedKeyword) throw new Error("缺少关键词");
+  const safeEnd = /^\d{4}-\d{2}-\d{2}$/.test(String(endDate || "")) ? String(endDate) : formatDateInTimeZone();
+  const safeStart = /^\d{4}-\d{2}-\d{2}$/.test(String(startDate || "")) ? String(startDate) : addDays(safeEnd, -59);
+  if (safeStart > safeEnd) throw new Error("开始日期不能晚于结束日期");
+  if (dateRangeInclusive(safeStart, safeEnd).length > 366) throw new Error("单次最多查询 366 天");
+  const [rows] = await getMysqlPool().query(`
+    SELECT d.date, d.natural_rank, d.natural_rank_str, d.natural_asin,
+      d.sp_rank, d.sp_rank_str, d.sp_asin, d.est_searches_num, d.aba_rank
+    FROM sif_keyword_rank_daily d JOIN sif_keyword_monitors m ON m.id = d.monitor_id
+    WHERE m.asin = ? AND m.normalized_keyword = ? AND d.date BETWEEN ? AND ?
+    ORDER BY d.date
+  `, [selectedAsin, normalizedKeyword, safeStart, safeEnd]);
+  return {
+    asin: selectedAsin,
+    keyword: String(keyword),
+    range: { startDate: safeStart, endDate: safeEnd },
+    points: rows.map(row => ({
+      date: adsDateValue(row.date),
+      naturalRank: row.natural_rank === null ? null : Number(row.natural_rank), naturalRankStr: row.natural_rank_str || "", naturalAsin: row.natural_asin || selectedAsin,
+      spRank: row.sp_rank === null ? null : Number(row.sp_rank), spRankStr: row.sp_rank_str || "", spAsin: row.sp_asin || selectedAsin,
+      searches: row.est_searches_num === null ? null : Number(row.est_searches_num), abaRank: row.aba_rank === null ? null : Number(row.aba_rank)
+    }))
+  };
+}
+
+async function updateSifKeywordSubscription({ asin, keywords, type }) {
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) throw new Error("请先授权 SIF 账户");
+  const selectedAsin = normalizeSifAsin(asin);
+  const safeKeywords = [...new Set((Array.isArray(keywords) ? keywords : [keywords])
+    .map(keyword => String(keyword || "").trim())
+    .filter(Boolean))].slice(0, 100);
+  if (!safeKeywords.length) throw new Error("请输入至少一个关键词");
+  const actionType = Number(type);
+  if (![1, 2].includes(actionType)) throw new Error("关键词操作类型无效");
+  const payload = await sifRequest("/api/user/subs/handle", { asin: selectedAsin, keywords: safeKeywords, type: actionType }, credentials);
+  if (payload?.data?.isSuccess !== true) throw new Error("SIF 未确认关键词操作成功");
+  const invalidKeywords = Array.isArray(payload?.data?.invalidKeywords) ? payload.data.invalidKeywords.map(String) : [];
+  const invalidSet = new Set(invalidKeywords.map(normalizeSifKeyword));
+  if (actionType === 1) {
+    const validKeywords = safeKeywords.filter(keyword => !invalidSet.has(normalizeSifKeyword(keyword)));
+    await setSifMonitorStatuses(credentials.country || "US", selectedAsin, validKeywords, "ACTIVE", { source: "ADS" });
+    if (invalidKeywords.length) {
+      await setSifMonitorStatuses(credentials.country || "US", selectedAsin, invalidKeywords, "ERROR", { source: "ADS", error: "SIF 判定关键词无效" });
+    }
+  } else {
+    await setSifMonitorStatuses(credentials.country || "US", selectedAsin, safeKeywords, "INACTIVE", { source: "ADS" });
+  }
+  return {
+    success: true,
+    invalidKeywords
+  };
+}
+
+async function ensureSifKeywordPairsMonitored(pairs = []) {
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) throw new Error("请先在关键词监控中授权 SIF 账户，再添加广告关键词");
+  const country = credentials.country || "US";
+  const byAsin = new Map();
+  for (const pair of pairs) {
+    const asin = normalizeSifAsin(pair.asin || pair.childAsin);
+    const keyword = String(pair.keyword || "").trim();
+    if (!keyword) continue;
+    const list = byAsin.get(asin) || [];
+    list.push(keyword);
+    byAsin.set(asin, list);
+  }
+  for (const [asin, keywords] of byAsin) {
+    const normalized = [...new Set(keywords.map(normalizeSifKeyword))];
+    const [rows] = await getMysqlPool().query(`
+      SELECT normalized_keyword FROM sif_keyword_monitors
+      WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE'
+        AND normalized_keyword IN (?)
+    `, [country, asin, normalized]);
+    const active = new Set(rows.map(row => row.normalized_keyword));
+    const missing = [...new Map(keywords.map(keyword => [normalizeSifKeyword(keyword), keyword]))]
+      .filter(([key]) => !active.has(key)).map(([, keyword]) => keyword);
+    if (!missing.length) continue;
+    const result = await updateSifKeywordSubscription({ asin, keywords: missing, type: 1 });
+    if (result.invalidKeywords.length) throw new Error(`SIF 无法监控关键词：${result.invalidKeywords.join("、")}`);
+  }
+}
+
+async function setAdsKeywordSifMonitoring(keywordId, active) {
+  const profile = await requireSelectedAdsProfile();
+  const [rows] = await getMysqlPool().query(`
+    SELECT DISTINCT k.keyword_text, u.child_asin
+    FROM ads_keywords k
+    JOIN ads_campaigns c ON c.keyword_id = k.id
+    JOIN ads_ad_units u ON u.campaign_id = c.id
+    WHERE k.id = ? AND k.profile_id = ? AND u.child_asin <> ''
+  `, [keywordId, String(profile.profileId)]);
+  if (!rows.length) throw new Error("该广告关键词还没有可监控的子 ASIN");
+  if (active) {
+    await ensureSifKeywordPairsMonitored(rows.map(row => ({ asin: row.child_asin, keyword: row.keyword_text })));
+  } else {
+    for (const row of rows) {
+      await updateSifKeywordSubscription({ asin: row.child_asin, keywords: [row.keyword_text], type: 2 });
+    }
+  }
+  return { active, asins: [...new Set(rows.map(row => row.child_asin))] };
 }
 
 function jsonRowId(row, index) {
@@ -900,8 +1741,24 @@ function catalogFetchedAt(row = {}) {
   return raw.catalogFetchedAt || raw.catalog?.fetchedAt || "";
 }
 
+function catalogClassification(row = {}) {
+  const raw = row.rawJson || row.rawInventoryJson || {};
+  const source = raw.browseClassification || raw.catalog?.browseClassification || {};
+  const categoryIds = [...new Set([
+    source.categoryId,
+    ...(Array.isArray(source.categoryIds) ? source.categoryIds : [])
+  ].map(value => String(value || "").trim()).filter(Boolean))];
+  return {
+    categoryId: String(source.categoryId || categoryIds[0] || "").trim(),
+    categoryName: String(source.categoryName || "").trim(),
+    categoryIds,
+    categoryNodes: Array.isArray(source.categoryNodes) ? source.categoryNodes : []
+  };
+}
+
 function isCatalogMetadataFresh(row = {}, now = Date.now()) {
   if (!row.title && !row.imageUrl && !row.parentAsin && !row.brand) return false;
+  if (!catalogClassification(row).categoryIds.length) return false;
   const fetchedAt = catalogFetchedAt(row);
   const fetchedTime = fetchedAt ? new Date(fetchedAt).getTime() : 0;
   if (!Number.isFinite(fetchedTime) || fetchedTime <= 0) return false;
@@ -929,18 +1786,22 @@ async function catalogForInventorySummaries(summaries, options = {}) {
     asinSet.add(asin);
     const cached = metadataByAsin.get(asin);
     if (isCatalogMetadataFresh(cached, now)) {
+      const classification = catalogClassification(cached);
       catalog.set(asin, {
         parentAsin: cached.parentAsin || "",
         title: cached.title || "",
         brand: cached.brand || "",
         imageUrl: cached.imageUrl || "",
-        catalogFetchedAt: catalogFetchedAt(cached)
+        catalogFetchedAt: catalogFetchedAt(cached),
+        ...classification
       });
     }
   }
+  await upsertBrowseCategories([...catalog.values()].flatMap(item => item.categoryNodes || []), "AMAZON_CATALOG");
   const staleAsins = [...asinSet].filter(asin => !catalog.has(asin));
   if (!staleAsins.length) return catalog;
   const fetched = await fetchCatalogDetails(staleAsins);
+  await upsertBrowseCategories([...fetched.values()].flatMap(item => item.categoryNodes || []), "AMAZON_CATALOG");
   const fetchedAt = new Date().toISOString();
   const metadataUpdates = [];
   for (const [asin, item] of fetched.entries()) {
@@ -962,7 +1823,16 @@ async function catalogForInventorySummaries(summaries, options = {}) {
       imageUrl: item.imageUrl || "",
       condition: summary.condition || "",
       lastSeenAt: fetchedAt,
-      rawJson: { source: "catalog", catalogFetchedAt: fetchedAt }
+      rawJson: {
+        source: "catalog",
+        catalogFetchedAt: fetchedAt,
+        browseClassification: {
+          categoryId: item.categoryId || "",
+          categoryName: item.categoryName || "",
+          categoryIds: item.categoryIds || [],
+          categoryNodes: item.categoryNodes || []
+        }
+      }
     });
   }
   await upsertFbaSkuMetadata(metadataUpdates, "catalog").catch(() => {});
@@ -1759,11 +2629,13 @@ async function readParentAsinMetadataMap() {
 async function readParentAsinMetadataRows() {
   await ensureAppMysqlSchema();
   const pool = getMysqlPool();
-  const [rows] = await pool.query("SELECT parent_asin, internal_name, sort_order FROM parent_asin_metadata");
+  const [rows] = await pool.query("SELECT parent_asin, internal_name, sort_order, category_id, category_name FROM parent_asin_metadata");
   return rows.map(row => ({
     parentAsin: String(row.parent_asin || "").trim().toUpperCase(),
     internalName: String(row.internal_name || "").trim(),
-    sortOrder: Number(row.sort_order || 0)
+    sortOrder: Number(row.sort_order || 0),
+    categoryId: String(row.category_id || "").trim(),
+    categoryName: String(row.category_name || "").trim()
   })).filter(row => row.parentAsin);
 }
 
@@ -1802,6 +2674,51 @@ async function upsertParentAsinMetadata(parentAsin, internalName) {
     VALUES (?, ?)
     ON DUPLICATE KEY UPDATE internal_name = VALUES(internal_name)
   `, [normalizedParentAsin, String(internalName || "").trim()]);
+}
+
+async function upsertParentAsinCategory(parentAsin, categoryId, categoryName) {
+  const normalizedParentAsin = String(parentAsin || "").trim().toUpperCase();
+  const normalizedCategoryId = String(categoryId || "").trim();
+  if (!normalizedParentAsin) throw new Error("Missing parent ASIN");
+  await ensureAppMysqlSchema();
+  await getMysqlPool().query(`
+    INSERT INTO parent_asin_metadata (parent_asin, category_id, category_name)
+    VALUES (?, ?, ?)
+    ON DUPLICATE KEY UPDATE category_id = VALUES(category_id), category_name = VALUES(category_name)
+  `, [normalizedParentAsin, normalizedCategoryId, normalizedCategoryId ? String(categoryName || "").trim() : ""]);
+  await getMysqlPool().query(`
+    DELETE b FROM sif_keyword_bid_daily b
+    JOIN sif_keyword_monitors m ON m.id = b.monitor_id
+    WHERE b.date = ? AND m.asin IN (
+      SELECT DISTINCT asin FROM fba_sku_metadata WHERE parent_asin = ? AND asin <> ''
+    )
+  `, [formatDateInTimeZone(), normalizedParentAsin]);
+}
+
+async function upsertBrowseCategories(categories, source = "") {
+  const rows = [...new Map((categories || []).map(category => {
+    const id = String(category?.id || category?.categoryId || "").trim();
+    const name = String(category?.name || category?.categoryName || "").trim();
+    return [id, { id, name }];
+  }).filter(([id]) => id)).values()];
+  if (!rows.length) return;
+  await ensureAppMysqlSchema();
+  await getMysqlPool().query(`
+    INSERT INTO amazon_browse_categories (category_id, category_name, source, last_seen_at)
+    VALUES ?
+    ON DUPLICATE KEY UPDATE
+      category_name = IF(VALUES(category_name) <> '', VALUES(category_name), category_name),
+      source = VALUES(source), last_seen_at = VALUES(last_seen_at)
+  `, [rows.map(row => [row.id, row.name, String(source || "").slice(0, 32), new Date()])]);
+}
+
+async function readBrowseCategoryOptions() {
+  await ensureAppMysqlSchema();
+  const [rows] = await getMysqlPool().query(`
+    SELECT category_id, category_name FROM amazon_browse_categories
+    ORDER BY category_name, category_id
+  `);
+  return rows.map(row => ({ id: String(row.category_id), name: String(row.category_name || "") }));
 }
 
 function calculateFactoryInventoryValue(product) {
@@ -2348,9 +3265,36 @@ async function ensureFactoryInventoryProductCatalog(db) {
 
 async function buildFactoryInventoryView(db, options = {}) {
   const fbaCatalogByAsin = options.fbaCatalogByAsin || await buildFbaProductCatalog(db);
-  const parentAsinMetadata = await readParentAsinMetadataMap();
   const storedProducts = (Array.isArray(db.factoryInventory?.products) ? db.factoryInventory.products : [])
     .map(item => normalizeFactoryProduct(item));
+  let fbaMetadataRows = [];
+  try {
+    fbaMetadataRows = await readFbaSkuMetadataRows();
+  } catch {
+    fbaMetadataRows = [];
+  }
+  const fbaMetadataByAsin = new Map(fbaMetadataRows.map(row => [normalizeAsin(row.asin), row]));
+  const parentCategoryDefaults = new Map();
+  for (const product of storedProducts) {
+    const fbaProduct = fbaCatalogByAsin.get(product.asin) || {};
+    const parentAsin = normalizeAsin(fbaProduct.parentAsin || product.parentAsin);
+    if (!parentAsin) continue;
+    const childMetadata = fbaMetadataByAsin.get(normalizeAsin(product.asin));
+    const classification = catalogClassification(childMetadata);
+    const group = parentCategoryDefaults.get(parentAsin) || { first: null, options: new Map() };
+    if (!group.first && classification.categoryId) group.first = { id: classification.categoryId, name: classification.categoryName || classification.categoryId };
+    if (classification.categoryId) group.options.set(classification.categoryId, classification.categoryName || classification.categoryId);
+    parentCategoryDefaults.set(parentAsin, group);
+  }
+  const existingParentMetadataRows = await readParentAsinMetadataRows();
+  for (const [parentAsin, group] of parentCategoryDefaults) {
+    const existing = existingParentMetadataRows.find(row => row.parentAsin === parentAsin);
+    if (!existing?.categoryId && group.first?.id) {
+      await upsertParentAsinCategory(parentAsin, group.first.id, group.first.name);
+    }
+  }
+  const parentMetadataRows = await readParentAsinMetadataRows();
+  const parentAsinMetadata = new Map(parentMetadataRows.map(row => [row.parentAsin, row]));
   const productsById = new Map();
   const rememberProduct = product => {
     const existing = productsById.get(product.id);
@@ -2387,13 +3331,19 @@ async function buildFactoryInventoryView(db, options = {}) {
     const productMovements = (movementsByProduct.get(product.id) || [])
       .sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.createdAt).localeCompare(String(a.createdAt)));
     const fbaProduct = fbaCatalogByAsin.get(product.asin) || {};
+    const parentAsin = String(fbaProduct.parentAsin || product.parentAsin || "").trim().toUpperCase();
+    const parentMetadata = parentAsinMetadata.get(parentAsin) || {};
+    const categoryGroup = parentCategoryDefaults.get(parentAsin) || { options: new Map() };
     const currentQuantity = Number(product.currentQuantity || 0);
     const inventoryValue = calculateFactoryInventoryValue(product);
     return {
       ...product,
       imageUrl: fbaProduct.imageUrl || "",
-      parentAsin: fbaProduct.parentAsin || product.parentAsin || "",
-      parentInternalName: parentAsinMetadata.get(String(fbaProduct.parentAsin || product.parentAsin || "").trim().toUpperCase()) || product.parentInternalName || "",
+      parentAsin,
+      parentInternalName: parentMetadata.internalName || product.parentInternalName || "",
+      parentCategoryId: parentMetadata.categoryId || "",
+      parentCategoryName: parentMetadata.categoryName || "",
+      parentCategoryOptions: [...categoryGroup.options].map(([id, name]) => ({ id, name })),
       sellerSku: fbaProduct.sellerSku || "",
       fnSku: fbaProduct.fnSku || "",
       title: fbaProduct.title || product.name || "",
@@ -3362,6 +4312,40 @@ function extractParentAsinFromCatalogItem(item) {
   return walk(item?.relationships) || "";
 }
 
+function extractCatalogBrowseClassification(item, summary = null) {
+  const primary = summary?.browseClassification || null;
+  const nodes = [];
+  const seenObjects = new Set();
+  const seenIds = new Set();
+  const addNode = value => {
+    if (!value || typeof value !== "object") return;
+    const id = String(value.classificationId || value.browseNodeId || value.nodeId || "").trim();
+    if (!id || seenIds.has(id)) return;
+    seenIds.add(id);
+    nodes.push({ id, name: String(value.displayName || value.classificationName || value.name || "").trim() });
+  };
+  const walk = value => {
+    if (!value || typeof value !== "object" || seenObjects.has(value)) return;
+    seenObjects.add(value);
+    addNode(value);
+    for (const child of Object.values(value)) {
+      if (child && typeof child === "object") {
+        if (Array.isArray(child)) child.forEach(walk);
+        else walk(child);
+      }
+    }
+  };
+  walk(primary);
+  walk(item?.classifications);
+  walk(item?.salesRanks);
+  return {
+    categoryId: String(primary?.classificationId || nodes[0]?.id || "").trim(),
+    categoryName: String(primary?.displayName || nodes[0]?.name || "").trim(),
+    categoryIds: nodes.map(node => node.id),
+    categoryNodes: nodes
+  };
+}
+
 async function fetchCatalogDetails(asins) {
   const config = getSpApiConfig();
   const enrichLimit = Number(process.env.AMZ_CATALOG_ENRICH_LIMIT || 300);
@@ -3377,17 +4361,19 @@ async function fetchCatalogDetails(asins) {
         marketplaceIds: config.marketplaceId,
         identifiers: identifiers.join(","),
         identifiersType: "ASIN",
-        includedData: "images,summaries,relationships"
+        includedData: "images,summaries,relationships,classifications,salesRanks"
       }, {
         logContext: `catalogBatch:${batchNumber}:asinCount:${identifiers.length}`
       });
       for (const item of data.items || []) {
         const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
+        const classification = extractCatalogBrowseClassification(item, summary);
         byAsin.set(item.asin, {
           parentAsin: extractParentAsinFromCatalogItem(item),
           title: summary?.itemName || "",
           brand: summary?.brand || "",
-          imageUrl: findCatalogImageLink(item.images)
+          imageUrl: findCatalogImageLink(item.images),
+          ...classification
         });
       }
     } catch (error) {
@@ -3401,16 +4387,18 @@ async function fetchCatalogDetails(asins) {
             marketplaceIds: config.marketplaceId,
             identifiers: asin,
             identifiersType: "ASIN",
-            includedData: "images,summaries,relationships"
+            includedData: "images,summaries,relationships,classifications,salesRanks"
           }, { retries: 1, retryDelayMs: 1600, logContext: `catalogSingleRetry:${batchNumber}:asinCount:1` });
           const item = (data.items || [])[0];
           if (!item) continue;
           const summary = Array.isArray(item.summaries) ? item.summaries[0] : null;
+          const classification = extractCatalogBrowseClassification(item, summary);
           byAsin.set(item.asin, {
             parentAsin: extractParentAsinFromCatalogItem(item),
             title: summary?.itemName || "",
             brand: summary?.brand || "",
-            imageUrl: findCatalogImageLink(item.images)
+            imageUrl: findCatalogImageLink(item.images),
+            ...classification
           });
         } catch {
           // Catalog enrichment is useful but should not block inventory.
@@ -5585,6 +6573,41 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
     list.push(campaign);
     campaignsByKeyword.set(String(row.keyword_id), list);
   }
+  const monitorAsins = [...new Set(adUnitRows.map(row => String(row.child_asin || "").toUpperCase()).filter(Boolean))];
+  let monitorRows = [];
+  if (monitorAsins.length) {
+    [monitorRows] = await pool.query(`
+      SELECT asin, normalized_keyword, monitor_status, last_synced_at, last_error
+      FROM sif_keyword_monitors
+      WHERE country_code = ? AND asin IN (?)
+    `, [String(profile.countryCode || "US").toUpperCase(), monitorAsins]);
+  }
+  const bidByKey = new Map();
+  if (monitorAsins.length) {
+    const [bidRows] = await pool.query(`
+      SELECT m.asin, m.normalized_keyword, b.*
+      FROM sif_keyword_monitors m
+      JOIN sif_keyword_bid_daily b ON b.monitor_id = m.id
+      JOIN (
+        SELECT monitor_id, MAX(date) max_date
+        FROM sif_keyword_bid_daily
+        GROUP BY monitor_id
+      ) latest ON latest.monitor_id = b.monitor_id AND latest.max_date = b.date
+      WHERE m.country_code = ? AND m.asin IN (?)
+    `, [String(profile.countryCode || "US").toUpperCase(), monitorAsins]);
+    const price = value => value === null || value === undefined ? null : Number(value);
+    for (const row of bidRows) {
+      bidByKey.set(`${String(row.asin).toUpperCase()}|${row.normalized_keyword}`, {
+        date: adsDateValue(row.date), mode: row.bid_mode || "legacy", matchStatus: row.match_status || "MATCHED",
+        categorySource: row.category_source || "CHILD", categoryId: row.category_id || "", categoryName: row.category_name || "",
+        productCount: row.category_product_count === null ? null : Number(row.category_product_count),
+        exact: { start: price(row.exact_start), median: price(row.exact_median), end: price(row.exact_end) },
+        phrase: { start: price(row.phrase_start), median: price(row.phrase_median), end: price(row.phrase_end) },
+        broad: { start: price(row.broad_start), median: price(row.broad_median), end: price(row.broad_end) }
+      });
+    }
+  }
+  const monitorByKey = new Map(monitorRows.map(row => [`${String(row.asin).toUpperCase()}|${row.normalized_keyword}`, row]));
   const keywords = keywordRows.map(row => {
     const campaigns = campaignsByKeyword.get(String(row.id)) || [];
     const metrics = campaigns.reduce((acc, campaign) => {
@@ -5592,7 +6615,14 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
       return acc;
     }, { impressions: 0, clicks: 0, spend: 0, orders: 0, units: 0, sales: 0 });
     metrics.acos = metrics.sales > 0 ? metrics.spend / metrics.sales : null;
-    return { id: String(row.id), parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns };
+    const childAsins = [...new Set(campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)).filter(Boolean))];
+    const monitoring = childAsins.map(asin => {
+      const monitor = monitorByKey.get(`${String(asin).toUpperCase()}|${normalizeSifKeyword(row.keyword_text)}`);
+      return { asin, status: monitor?.monitor_status || "INACTIVE", lastSyncedAt: monitor?.last_synced_at || null, error: monitor?.last_error || "", fixedBid: bidByKey.get(`${String(asin).toUpperCase()}|${normalizeSifKeyword(row.keyword_text)}`) || null };
+    });
+    const monitorStatus = monitoring.length && monitoring.every(item => item.status === "ACTIVE")
+      ? "ACTIVE" : monitoring.some(item => item.status === "ACTIVE") ? "PARTIAL" : "INACTIVE";
+    return { id: String(row.id), parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus };
   });
   return {
     profile,
@@ -5638,6 +6668,18 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     ? String(filters.childAsin).toUpperCase() : "ALL";
   const requestedMatchType = String(filters.matchType || "").toUpperCase();
   const matchType = availableMatchTypes.includes(requestedMatchType) ? requestedMatchType : "ALL";
+  const rankAsins = childAsin === "ALL" ? availableAsins.map(item => item.asin) : [childAsin];
+  let rankRows = [];
+  if (rankAsins.length) {
+    [rankRows] = await pool.query(`
+      SELECT d.date, MIN(d.natural_rank) natural_rank, MIN(d.sp_rank) sp_rank
+      FROM sif_keyword_rank_daily d
+      JOIN sif_keyword_monitors m ON m.id = d.monitor_id
+      WHERE m.country_code = ? AND m.normalized_keyword = ? AND m.asin IN (?)
+        AND d.date BETWEEN ? AND ?
+      GROUP BY d.date ORDER BY d.date
+    `, [String(profile.countryCode || "US").toUpperCase(), normalizeSifKeyword(keyword.keyword_text), rankAsins, startDate, endDate]);
+  }
   const where = ["c.keyword_id = ?", "c.profile_id = ?", "p.date BETWEEN ? AND ?"];
   const params = [keywordId, String(profile.profileId), startDate, endDate];
   if (childAsin !== "ALL") {
@@ -5720,6 +6762,7 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
   const bidEffectiveDate = adsDateValue(bidRows[0]?.effective_date);
   const adjustmentEffectiveDate = adsDateValue(adjustmentRows[0]?.effective_date);
   const performanceByDate = new Map(performanceRows.map(row => [adsDateValue(row.date), row]));
+  const rankByDate = new Map(rankRows.map(row => [adsDateValue(row.date), row]));
   const placementKey = value => {
     const placement = String(value || "").toUpperCase();
     if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP"].includes(placement)) return "top";
@@ -5738,6 +6781,7 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
   }
   const points = dates.map(date => {
     const row = performanceByDate.get(date);
+    const rank = rankByDate.get(date);
     const placements = placementByDate.get(date) || {};
     const clicks = Number(row?.clicks || 0);
     const spend = Number(row?.spend || 0);
@@ -5775,8 +6819,8 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
       ...placementMetrics("top"),
       ...placementMetrics("rest"),
       ...placementMetrics("product"),
-      naturalRank: null,
-      adRank: null
+      naturalRank: rank?.natural_rank === null || rank?.natural_rank === undefined ? null : Number(rank.natural_rank),
+      adRank: rank?.sp_rank === null || rank?.sp_rank === undefined ? null : Number(rank.sp_rank)
     };
   });
   return {
@@ -5785,7 +6829,7 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     filters: { childAsin, matchType },
     options: { childAsins: availableAsins, matchTypes: availableMatchTypes },
     points,
-    unavailableMetrics: ["naturalRank", "adRank"]
+    unavailableMetrics: []
   };
 }
 
@@ -5842,7 +6886,7 @@ async function ensureAdsCreationTemplate(profile) {
   };
 }
 
-async function createAdsKeywordDraft(body = {}) {
+async function createAdsKeywordDraft(body = {}, options = {}) {
   const profile = await requireSelectedAdsProfile();
   const parentAsin = String(body.parentAsin || "").trim().toUpperCase();
   const keywordText = normalizeAdsKeywordText(body.keyword);
@@ -5890,6 +6934,9 @@ async function createAdsKeywordDraft(body = {}) {
       AND u.child_asin = ? LIMIT 1
   `, [String(profile.profileId), parentAsin, normalizedKeyword, units[0].childAsin]);
   if (existingActive.length || existingUnit.length) throw new Error(`子 ASIN ${units[0].childAsin} 已存在关键词“${keywordText}”；请选择其他子 ASIN，或停止现有投放后再添加`);
+  if (!options.monitoringEnsured) {
+    await ensureSifKeywordPairsMonitored([{ asin: units[0].childAsin, keyword: keywordText }]);
+  }
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
@@ -5962,6 +7009,7 @@ async function createAndStartAdsKeywordBatch(body = {}) {
   const existingKeys = new Set(existing.map(row => `${String(row.normalized_keyword || "").toLocaleLowerCase("en-US")}|${String(row.child_asin || "").toUpperCase()}`));
   const conflict = planned.find(item => existingKeys.has(`${item.keyword.toLocaleLowerCase("en-US")}|${item.childAsin}`));
   if (conflict) throw new Error(`已存在或正在创建：关键词“${conflict.keyword}”对应子 ASIN ${conflict.childAsin}`);
+  await ensureSifKeywordPairsMonitored(planned.map(item => ({ asin: item.childAsin, keyword: item.keyword })));
   const common = {
     parentAsin: body.parentAsin,
     dailyBudget: body.dailyBudget,
@@ -5975,7 +7023,7 @@ async function createAndStartAdsKeywordBatch(body = {}) {
   const created = [];
   for (const item of keywords) {
     for (const unit of units) {
-      const result = await createAdsKeywordDraft({ ...common, keyword: item.keyword, group: item.group, units: [unit] });
+      const result = await createAdsKeywordDraft({ ...common, keyword: item.keyword, group: item.group, units: [unit] }, { monitoringEnsured: true });
       created.push(result);
     }
   }
@@ -6989,6 +8037,38 @@ async function sendGmailMessage({ to, subject, body, threadId }) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/sif-keywords/history") {
+    return sendJson(res, await readSifKeywordHistory({
+      asin: url.searchParams.get("asin") || "",
+      keyword: url.searchParams.get("keyword") || "",
+      startDate: url.searchParams.get("startDate") || "",
+      endDate: url.searchParams.get("endDate") || ""
+    }));
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/sif-keywords/workspace") {
+    return sendJson(res, await readSifKeywordWorkspace(url.searchParams.get("asin") || ""));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/sif-keywords/sync") {
+    const body = await parseBody(req);
+    return sendJson(res, await syncSifKeywordAsinNow(body.asin));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/sif-keywords/credentials") {
+    const body = await parseBody(req);
+    return sendJson(res, await saveSifCredentialsFromCurl(body.curl));
+  }
+
+  if (req.method === "DELETE" && url.pathname === "/api/sif-keywords/credentials") {
+    await deleteAppSecret(SECRET_KEYS.sifCredentials);
+    return sendJson(res, { authorized: false, configured: false, deleted: true });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/sif-keywords/subscriptions") {
+    return sendJson(res, await updateSifKeywordSubscription(await parseBody(req)));
+  }
+
   if (req.method === "GET" && url.pathname === "/api/gmail/auth-url") {
     return sendJson(res, { url: gmailAuthUrl() });
   }
@@ -7093,6 +8173,14 @@ async function handleApi(req, res, url) {
       childAsin: url.searchParams.get("childAsin") || "",
       matchType: url.searchParams.get("matchType") || ""
     }));
+  }
+
+  const adsKeywordMonitoringMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/monitoring$/);
+  if (req.method === "POST" && adsKeywordMonitoringMatch) {
+    return sendJson(res, await setAdsKeywordSifMonitoring(adsKeywordMonitoringMatch[1], true));
+  }
+  if (req.method === "DELETE" && adsKeywordMonitoringMatch) {
+    return sendJson(res, await setAdsKeywordSifMonitoring(adsKeywordMonitoringMatch[1], false));
   }
 
   const adsKeywordGroupMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/group$/);
@@ -7474,10 +8562,14 @@ async function handleApi(req, res, url) {
   if (req.method === "PUT" && factoryParentGroupMatch) {
     const parentKey = decodeURIComponent(factoryParentGroupMatch[1]).trim().toUpperCase();
     const body = await parseBody(req);
-    const parentInternalName = String(body.parentInternalName || "").trim();
     const db = await readDb();
     const catalog = await ensureFactoryInventoryProductCatalog(db);
-    await upsertParentAsinMetadata(parentKey, parentInternalName);
+    if (Object.prototype.hasOwnProperty.call(body, "parentInternalName")) {
+      await upsertParentAsinMetadata(parentKey, String(body.parentInternalName || "").trim());
+    }
+    if (Object.prototype.hasOwnProperty.call(body, "categoryId")) {
+      await upsertParentAsinCategory(parentKey, body.categoryId, body.categoryName);
+    }
     return sendJson(res, await buildFactoryInventoryView(db, { fbaCatalogByAsin: catalog.fbaCatalogByAsin }));
   }
 
@@ -7852,6 +8944,7 @@ await ensureAppMysqlSchema();
 server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
   if (process.env.AMZ_ADS_SYNC_ENABLED !== "0" && process.env.AMZ_ADS_SYNC_ENABLED !== "false") startAdsPerformanceSchedule();
+  if (process.env.SIF_SYNC_ENABLED !== "0" && process.env.SIF_SYNC_ENABLED !== "false") startSifKeywordSchedule();
   const scheduledFbaSyncEnabled = process.env.AMZ_FBA_SCHEDULE_ENABLED !== "0" && process.env.AMZ_FBA_SCHEDULE_ENABLED !== "false";
   if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
     setTimeout(async () => {

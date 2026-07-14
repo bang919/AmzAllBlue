@@ -43,6 +43,7 @@ let products = [];
 let factoryProducts = [];
 let factoryMovements = [];
 let factoryTotals = {};
+let factoryCategoryOptions = [];
 let adsProfiles = [];
 let selectedId = "";
 let selectedProductAsin = "";
@@ -68,6 +69,11 @@ let activeModule = "dashboard";
 let productsLoaded = false;
 let factoryLoaded = false;
 let adsLoaded = false;
+let sifWorkspaceData = { dates: [], keywords: [], asins: [] };
+let selectedSifAsin = "";
+let sifDetailState = { asin: "", keyword: "", startDate: "", endDate: "" };
+let sifDetailDatePickerOpen = false;
+let sifDetailDatePickerMonth = "";
 const MAIL_TEMPLATE_KEY = "amazonAggregator.mailTemplate.v1";
 const FBA_COLUMNS_KEY = "amazonAggregator.fbaColumns.v1";
 const FBA_SORT_KEY = "amazonAggregator.fbaSort.v1";
@@ -734,6 +740,9 @@ function switchModule(module) {
     if (!adsLoaded) refreshAds().catch(error => {
       $("#adsStatus").textContent = `Amazon Ads 检查失败：${error.message}`;
     });
+  }
+  if (module === "keywordMonitor") {
+    refreshSifWorkspace(selectedSifAsin).catch(error => showSifAuthorization(error.message));
   }
   if (module === "inventory") {
     renderFactoryInventory();
@@ -2190,6 +2199,11 @@ function renderFactoryInventory() {
       const product = visibleProducts[index];
       const key = getFactoryProductGroupKey(product);
       const parentInternalName = String(product.parentInternalName || "").trim();
+      const parentCategoryId = String(product.parentCategoryId || "").trim();
+      const availableCategories = [...(product.parentCategoryOptions || [])];
+      if (parentCategoryId && !availableCategories.some(item => String(item.id) === parentCategoryId)) {
+        availableCategories.push({ id: parentCategoryId, name: product.parentCategoryName || parentCategoryId });
+      }
       let span = 1;
       while (index + span < visibleProducts.length) {
         const next = visibleProducts[index + span];
@@ -2202,6 +2216,11 @@ function renderFactoryInventory() {
             ${product.parentAsin ? `<a href="https://www.amazon.com/dp/${escapeHtml(product.parentAsin)}" target="_blank" rel="noopener noreferrer">${escapeHtml(product.parentAsin)}</a>` : `<span>${escapeHtml(key || "-")}</span>`}
             <span class="factory-parent-divider">|</span>
             <input class="factory-parent-name-input" data-factory-parent-name data-parent-key="${escapeHtml(key)}" type="text" value="${escapeHtml(parentInternalName)}" placeholder="内部名">
+            <span class="factory-parent-divider">|</span>
+            <select class="factory-parent-category-select" data-factory-parent-category data-parent-key="${escapeHtml(key)}" title="选择父 ASIN 类目">
+              <option value="">清除父 ASIN 类目</option>
+              ${availableCategories.map(category => `<option value="${escapeHtml(category.id)}" data-category-name="${escapeHtml(category.name || "")}" ${String(category.id) === parentCategoryId ? "selected" : ""}>${escapeHtml(category.name || "未命名类目")} (${escapeHtml(category.id)})</option>`).join("")}
+            </select>
           </span>
         </td>
       `);
@@ -2312,11 +2331,35 @@ async function saveFactoryParentInternalName(input) {
     factoryProducts = data.products || [];
     factoryMovements = data.movements || [];
     factoryTotals = data.totals || {};
+    factoryCategoryOptions = data.categoryOptions || factoryCategoryOptions;
     renderFactoryInventory();
     $("#sandboxStatus").textContent = "父ASIN内部名已保存";
   } catch (error) {
     alert(error.message);
     input.disabled = false;
+  }
+}
+
+async function saveFactoryParentCategory(select) {
+  const parentKey = select?.dataset?.parentKey || "";
+  if (!parentKey) return;
+  const categoryId = String(select.value || "").trim();
+  const categoryName = categoryId ? String(select.selectedOptions?.[0]?.dataset?.categoryName || "").trim() : "";
+  select.disabled = true;
+  try {
+    const data = await api(`/api/factory-inventory/parent-groups/${encodeURIComponent(parentKey)}`, {
+      method: "PUT",
+      body: { categoryId, categoryName }
+    });
+    factoryProducts = data.products || [];
+    factoryMovements = data.movements || [];
+    factoryTotals = data.totals || {};
+    factoryCategoryOptions = data.categoryOptions || factoryCategoryOptions;
+    renderFactoryInventory();
+    $("#sandboxStatus").textContent = categoryId ? `父 ASIN 类目已保存：${categoryName}` : "父 ASIN 类目已清除";
+  } catch (error) {
+    alert(error.message);
+    select.disabled = false;
   }
 }
 
@@ -2506,6 +2549,7 @@ async function loadFactoryInventory() {
   factoryProducts = data.products || [];
   factoryMovements = data.movements || [];
   factoryTotals = data.totals || {};
+  factoryCategoryOptions = data.categoryOptions || [];
   factoryLoaded = true;
   renderFactoryInventory();
   renderDashboard();
@@ -2516,6 +2560,7 @@ function applyFactoryInventoryData(data) {
   factoryProducts = data.products || [];
   factoryMovements = data.movements || [];
   factoryTotals = data.totals || {};
+  factoryCategoryOptions = data.categoryOptions || factoryCategoryOptions;
   factoryLoaded = true;
   renderFactoryInventory();
   renderDashboard();
@@ -3316,8 +3361,8 @@ const ADS_HISTORY_METRICS = {
   orders: { label: "订单数", unit: "integer", color: "#16a34a" },
   units: { label: "销量", unit: "integer", color: "#0f766e" },
   sales: { label: "销售额", unit: "money", color: "#9333ea" },
-  naturalRank: { label: "关键词自然位（待接数据源）", unit: "rank", color: "#64748b", unavailable: true },
-  adRank: { label: "关键词广告位（待接数据源）", unit: "rank", color: "#475569", unavailable: true }
+  naturalRank: { label: "关键词自然位", unit: "rank", color: "#10b981" },
+  adRank: { label: "关键词广告位", unit: "rank", color: "#f97316" }
 };
 
 const ADS_HISTORY_POSITION_METRICS = [
@@ -3511,7 +3556,7 @@ function renderAdsKeywordRows() {
     const childAsins = [...new Set(keyword.campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)))];
     const keywordSubline = keyword.lifecycleStatus === "STOPPED"
       ? `停止时间：${adsStopTimeLabel(keyword.stoppedAt)}`
-      : `${formatNumber(keyword.metrics.impressions)} 曝光 · ${formatNumber(keyword.metrics.clicks)} 点击`;
+      : `${formatNumber(keyword.metrics.impressions)} 曝光 · ${formatNumber(keyword.metrics.clicks)} 点击 · ${formatNumber(keyword.metrics.orders)} 订单量`;
     return `<tr class="${keyword.id === selectedAdsKeywordId ? "selected" : ""}" data-ads-keyword-id="${keyword.id}">
       <td><strong>${escapeHtml(keyword.keyword)}</strong><span>${escapeHtml(keywordSubline)}</span></td>
       <td>${childAsins.length ? childAsins.map(asin => `<span class="ads-asin-chip">${escapeHtml(asin)}</span>`).join("") : "-"}</td>
@@ -3537,7 +3582,7 @@ function renderAdsHistoryPanel(keyword) {
       <label class="metric"><span><i class="ads-series-dot secondary"></i>指标二</span><select id="adsHistoryMetricB">${adsHistoryMetricOptions(adsHistoryState.metricB)}</select></label>
       <label class="date-range">日期范围<input id="adsHistoryDateRange" type="text" readonly value="${escapeHtml(adsHistoryState.startDate && adsHistoryState.endDate ? `${adsHistoryState.startDate} 至 ${adsHistoryState.endDate}` : "")}"></label>
       <button id="adsHistoryQueryBtn" class="primary" type="button">查询</button>
-      <small>最多显示 2 个指标；自然位和广告位待接排名数据源。</small>
+      <small>最多显示 2 个指标；自然位和广告位来自关键词监控每日历史。</small>
     </div>
     <div id="adsHistoryChart" class="ads-history-chart"><div class="ads-history-loading">正在读取历史数据…</div></div>
   </section>`;
@@ -3581,7 +3626,12 @@ function renderAdsDetailProducts(keyword) {
     return [`${childAsin}|${sellerSku}`, { childAsin, sellerSku, product: adsCampaignProduct(keyword, campaign) }];
   })).values()];
   if (!identities.length) return "";
-  return `<div class="ads-detail-products">${identities.map(({ childAsin, sellerSku, product }) => `<div class="ads-detail-product">${product?.imageUrl ? `<img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.internalName || childAsin)}" loading="lazy">` : `<span class="ads-detail-product-placeholder">无图</span>`}<div><strong>${escapeHtml(product?.internalName || "未设置内部名")}</strong><span>${escapeHtml(childAsin || "-")} · ${escapeHtml(sellerSku || "-")}</span></div></div>`).join("")}</div>`;
+  const money = value => value === null || value === undefined || value === "" ? "—" : `$${Number(value).toFixed(2)}`;
+  return `<div class="ads-detail-products">${identities.map(({ childAsin, sellerSku, product }) => {
+    const bid = keyword.monitoring?.find(item => String(item.asin || "").toUpperCase() === String(childAsin || "").toUpperCase())?.fixedBid;
+    const bidHtml = bid ? `<div class="ads-detail-bid"><span>竞价：</span><b>精准 ${money(bid.exact?.median ?? bid.exact?.start)}</b><b>词组 ${money(bid.phrase?.median ?? bid.phrase?.start)}</b><b>广泛 ${money(bid.broad?.median ?? bid.broad?.start)}</b></div>` : "";
+    return `<div class="ads-detail-product"><div class="ads-detail-product-main">${product?.imageUrl ? `<img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.internalName || childAsin)}" loading="lazy">` : `<span class="ads-detail-product-placeholder">无图</span>`}<div><strong>${escapeHtml(product?.internalName || "未设置内部名")}</strong><span>${escapeHtml(childAsin || "-")} · ${escapeHtml(sellerSku || "-")}</span></div></div>${bidHtml}</div>`;
+  }).join("")}</div>`;
 }
 
 function renderAdsDetail() {
@@ -3621,6 +3671,7 @@ function renderAdsDetail() {
       <div class="ads-detail-actions">
         ${keyword.lifecycleStatus === "STOPPED" ? `<span class="ads-stop-time">停止时间：${escapeHtml(adsStopTimeLabel(stoppedAt))}</span>` : ""}
         ${!creationComplete && keyword.lifecycleStatus !== "STOPPED" && keyword.lifecycleStatus !== "STOPPING" ? `${canDiscardPlan ? `<button class="danger" type="button" data-discard-ads-plan="${keyword.id}">关闭创建计划</button>` : ""}<button class="primary" type="button" data-preview-keyword="${keyword.id}">${canDiscardPlan ? "预览并创建" : "预览并续传"}</button>` : ""}
+        ${keyword.monitoring?.length ? `<button type="button" class="secondary-button ${keyword.monitorStatus === "ACTIVE" ? "ads-monitor-remove" : "ads-monitor-add"}" data-ads-keyword-monitoring="${keyword.id}" data-monitoring-action="${keyword.monitorStatus === "ACTIVE" ? "remove" : "add"}">${keyword.monitorStatus === "ACTIVE" ? "从关键词监控移除" : "加入关键词监控"}</button>` : ""}
         ${keywordCanOperate && activeCampaigns.length ? `<button type="button" data-ads-keyword-state="${keyword.id}" data-next-state="${keywordStateAction}">${keywordStateAction === "PAUSED" ? "暂停" : "开始"}</button><button class="danger" type="button" data-ads-keyword-stop="${keyword.id}">停止</button>` : ""}
       </div>
     </div>
@@ -3650,7 +3701,10 @@ function adsHistorySeriesPath(points, metricKey, bounds, maxValue) {
     const value = point[metricKey];
     if (value === null || value === undefined || !Number.isFinite(Number(value))) return null;
     const x = bounds.left + (index / denominator) * bounds.width;
-    const y = bounds.top + bounds.height - (Number(value) / Math.max(maxValue, 1e-9)) * bounds.height;
+    const ratio = Number(value) / Math.max(maxValue, 1e-9);
+    const y = ADS_HISTORY_METRICS[metricKey]?.unit === "rank"
+      ? bounds.top + ratio * bounds.height
+      : bounds.top + bounds.height - ratio * bounds.height;
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).filter(Boolean).join(" ");
 }
@@ -3678,8 +3732,8 @@ function renderAdsHistoryChart(data) {
       ${ticks.map(ratio => {
         const y = bounds.top + bounds.height - ratio * bounds.height;
         return `<line x1="${bounds.left}" y1="${y}" x2="${bounds.left + bounds.width}" y2="${y}" class="ads-chart-grid"></line>
-          <text x="${bounds.left - 8}" y="${y + 4}" text-anchor="end" class="ads-chart-axis primary">${escapeHtml(formatAdsHistoryValue(maxA * ratio, metricA, currency))}</text>
-          <text x="${bounds.left + bounds.width + 8}" y="${y + 4}" class="ads-chart-axis secondary">${escapeHtml(formatAdsHistoryValue(maxB * ratio, metricB, currency))}</text>`;
+          <text x="${bounds.left - 8}" y="${y + 4}" text-anchor="end" class="ads-chart-axis primary">${escapeHtml(formatAdsHistoryValue(maxA * (configA.unit === "rank" ? 1 - ratio : ratio), metricA, currency))}</text>
+          <text x="${bounds.left + bounds.width + 8}" y="${y + 4}" class="ads-chart-axis secondary">${escapeHtml(formatAdsHistoryValue(maxB * (configB.unit === "rank" ? 1 - ratio : ratio), metricB, currency))}</text>`;
       }).join("")}
       ${xIndexes.map(index => {
         const x = bounds.left + (index / Math.max(1, points.length - 1)) * bounds.width;
@@ -3692,7 +3746,8 @@ function renderAdsHistoryChart(data) {
         const circles = [];
         for (const [key, value, max, className] of [[metricA, point[metricA], maxA || 1, "primary"], [metricB, point[metricB], maxB || 1, "secondary"]]) {
           if (value === null || value === undefined || !Number.isFinite(Number(value))) continue;
-          const y = bounds.top + bounds.height - (Number(value) / Math.max(max, 1e-9)) * bounds.height;
+          const ratio = Number(value) / Math.max(max, 1e-9);
+          const y = ADS_HISTORY_METRICS[key]?.unit === "rank" ? bounds.top + ratio * bounds.height : bounds.top + bounds.height - ratio * bounds.height;
           circles.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6" class="ads-chart-point ${className}"><title>${escapeHtml(point.date)} · ${escapeHtml(ADS_HISTORY_METRICS[key].label)} ${escapeHtml(formatAdsHistoryValue(value, key, currency))}</title></circle>`);
         }
         return circles.join("");
@@ -4389,6 +4444,17 @@ $("#adsDetailPanel").addEventListener("click", event => {
     addAdsKeywordMatch(addMatchButton.dataset.keywordId, addMatchButton.dataset.addAdsMatch, addMatchButton).catch(error => alert(error.message));
     return;
   }
+  const monitoringButton = event.target.closest("[data-ads-keyword-monitoring]");
+  if (monitoringButton) {
+    const removing = monitoringButton.dataset.monitoringAction === "remove";
+    if (removing && !confirm("确定从关键词监控中移除该关键词吗？已有历史排名会保留。")) return;
+    setBusy(monitoringButton, true, removing ? "移除中" : "加入中");
+    api(`/api/ads/keywords/${monitoringButton.dataset.adsKeywordMonitoring}/monitoring`, { method: removing ? "DELETE" : "POST" })
+      .then(() => loadAdsWorkspace())
+      .catch(error => alert(error.message))
+      .finally(() => setBusy(monitoringButton, false, removing ? "从关键词监控移除" : "加入关键词监控"));
+    return;
+  }
   const keywordStateButton = event.target.closest("[data-ads-keyword-state]");
   if (keywordStateButton) {
     setAdsKeywordState(keywordStateButton.dataset.adsKeywordState, keywordStateButton.dataset.nextState, keywordStateButton);
@@ -4483,6 +4549,11 @@ $("#factoryMatrixBody").addEventListener("click", event => {
   }
 });
 $("#factoryMatrixBody").addEventListener("change", event => {
+  const parentCategorySelect = event.target?.closest?.("[data-factory-parent-category]");
+  if (parentCategorySelect) {
+    saveFactoryParentCategory(parentCategorySelect);
+    return;
+  }
   const parentNameInput = event.target?.closest?.("[data-factory-parent-name]");
   if (parentNameInput) {
     saveFactoryParentInternalName(parentNameInput);
@@ -4512,7 +4583,7 @@ $("#factoryMatrixBody").addEventListener("keydown", event => {
   input.blur();
 });
 $("#factoryMatrixBody").addEventListener("dragstart", event => {
-  if (event.target?.closest?.("button, input")) {
+  if (event.target?.closest?.("button, input, select")) {
     event.preventDefault();
     return;
   }
@@ -4764,6 +4835,417 @@ $("#adsHistoryDatePicker").addEventListener("click", event => {
   closeAdsHistoryDatePicker();
 });
 $("#adsHistoryDatePicker").addEventListener("pointerdown", event => event.stopPropagation());
+function showSifAuthorization(message = "") {
+  $("#sifCredentialPanel").hidden = false;
+  $("#sifWorkspace").hidden = true;
+  $("#sifReauthorizeBtn").hidden = true;
+  const status = $("#sifAuthStatus");
+  status.textContent = message ? "授权不可用" : "尚未授权";
+  status.classList.remove("ok");
+  status.classList.add("warn");
+  const errorNode = $("#sifCredentialError");
+  errorNode.hidden = !message;
+  errorNode.textContent = message || "";
+}
+
+function showSifWorkspace() {
+  $("#sifCredentialPanel").hidden = true;
+  $("#sifWorkspace").hidden = false;
+  $("#sifReauthorizeBtn").hidden = false;
+  const status = $("#sifAuthStatus");
+  status.textContent = "SIF 已连接";
+  status.classList.add("ok");
+  status.classList.remove("warn");
+  $("#sifCredentialError").hidden = true;
+}
+
+function sifRankForDate(keyword, date, type) {
+  const items = Array.isArray(keyword?.rankInfo) ? keyword.rankInfo : [];
+  const record = items.find(item => String(item?.[type]?.updateTime || "") === String(date));
+  return record?.[type] || null;
+}
+
+function sifLatestRankForAsin(asin, type = "nf") {
+  let best = null;
+  for (const keyword of sifWorkspaceData.keywords || []) {
+    for (const item of keyword.rankInfo || []) {
+      const rank = item?.[type];
+      if (rank?.asin === asin && rank.rank !== null && rank.rank !== "" && Number.isFinite(Number(rank.rank))) {
+        best = best === null ? Number(rank.rank) : Math.min(best, Number(rank.rank));
+      }
+    }
+  }
+  return best;
+}
+
+function renderSifAsins() {
+  const asins = [...new Set([selectedSifAsin, ...(sifWorkspaceData.asins || [])].filter(Boolean))];
+  $("#sifMonitorSummary").textContent = selectedSifAsin
+    ? `共监控 ${Number(sifWorkspaceData.asinNum || asins.length)} 个子 ASIN`
+    : "广告管理中暂无已添加关键词的子 ASIN";
+  $("#sifAddKeywordBtn").disabled = !selectedSifAsin;
+  $("#sifAsinTabs").innerHTML = asins.length ? asins.map(asin => {
+    const product = (sifWorkspaceData.asinProducts || []).find(item => item.asin === asin) || {};
+    return `<button type="button" class="sif-asin-card ${asin === selectedSifAsin ? "active" : ""}" data-sif-asin="${escapeHtml(asin)}">
+      ${product.imageUrl ? `<img src="${escapeHtml(product.imageUrl)}" alt="${escapeHtml(product.childName || asin)}" loading="lazy">` : `<span class="sif-asin-image-placeholder">无图</span>`}
+      <span class="sif-asin-card-copy"><span class="sif-asin-card-top"><strong>${escapeHtml(asin)}</strong><small>${asin === selectedSifAsin ? "当前" : "查看"}</small></span>
+      <span>父：${escapeHtml(product.parentName || product.parentAsin || "-")}</span><span>子：${escapeHtml(product.childName || asin)}</span></span>
+    </button>`;
+  }).join("") : '<div class="empty">请先在“广告管理”中为子 ASIN 添加关键词，完成后这里会自动出现。</div>';
+}
+
+function sifNumericValue(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sifFormatMetric(value) {
+  const number = sifNumericValue(value);
+  return number === null ? "—" : number.toLocaleString("zh-CN");
+}
+
+function sifTrendSvg(dates, series, tooltipItems, chartClass = "") {
+  const safeDates = Array.isArray(dates) ? dates : [];
+  if (safeDates.length < 2) return '<div class="sif-no-trend">暂无趋势</div>';
+  const width = 220;
+  const height = 64;
+  const paddingX = 6;
+  const paddingY = 7;
+  const plotWidth = width - paddingX * 2;
+  const plotHeight = height - paddingY * 2;
+  const xFor = index => paddingX + (index / Math.max(1, safeDates.length - 1)) * plotWidth;
+  const lines = series.map(item => {
+    const values = safeDates.map((_, index) => sifNumericValue(item.values?.[index]));
+    const valid = values.filter(value => value !== null);
+    if (!valid.length) return "";
+    const min = Math.min(...valid);
+    const max = Math.max(...valid);
+    const range = max - min || 1;
+    const yFor = value => paddingY + (item.lowerIsBetter ? (value - min) / range : (max - value) / range) * plotHeight;
+    const points = values.map((value, index) => value === null ? null : `${xFor(index).toFixed(1)},${yFor(value).toFixed(1)}`).filter(Boolean);
+    const circles = values.map((value, index) => value === null ? "" : `<circle cx="${xFor(index).toFixed(1)}" cy="${yFor(value).toFixed(1)}" r="1.8" fill="${item.color}"/>`).join("");
+    return `<polyline points="${points.join(" ")}" fill="none" stroke="${item.color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>${circles}`;
+  }).join("");
+  const hitWidth = plotWidth / Math.max(1, safeDates.length - 1);
+  const hits = safeDates.map((date, index) => {
+    const encoded = encodeURIComponent(JSON.stringify(tooltipItems[index] || { title: date, rows: [] }));
+    return `<rect class="sif-chart-hit" x="${Math.max(0, xFor(index) - hitWidth / 2).toFixed(1)}" y="0" width="${Math.min(width, hitWidth).toFixed(1)}" height="${height}" data-sif-chart-tooltip="${encoded}"/>`;
+  }).join("");
+  return `<svg class="sif-trend-svg ${chartClass}" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" role="img">${lines}${hits}</svg>`;
+}
+
+function renderSifSearchTrend(keyword) {
+  const history = keyword.estSearchesNumHistory || {};
+  const dates = Array.isArray(history.date) ? history.date : [];
+  const searches = Array.isArray(history.estSearchesNum) ? history.estSearchesNum : [];
+  const abaRanks = Array.isArray(history.searchesRank) ? history.searchesRank : [];
+  const festivals = Array.isArray(history.festivals) ? history.festivals : [];
+  const tooltips = dates.map((date, index) => ({
+    title: `${date}（美国时间）`,
+    rows: [
+      { label: "搜索量", value: sifFormatMetric(searches[index]), color: "#0ea5e9" },
+      { label: "ABA", value: sifFormatMetric(abaRanks[index]), color: "#f59e0b" }
+    ],
+    note: Array.isArray(festivals[index]) ? festivals[index].map(item => item?.name).filter(Boolean).join("、") : ""
+  }));
+  return `<div class="sif-trend-values"><span class="search">搜索量 ${sifFormatMetric(keyword.estSearchesNum)}</span><span class="aba">ABA ${sifFormatMetric(keyword.searchesRank)}</span></div>
+    ${sifTrendSvg(dates, [
+      { values: searches, color: "#0ea5e9", lowerIsBetter: false },
+      { values: abaRanks, color: "#f59e0b", lowerIsBetter: true }
+    ], tooltips, "search-trend")}`;
+}
+
+function renderSifRankingTrend(keyword) {
+  const history = keyword.listingRankHistory || {};
+  const dates = Array.isArray(history.date) ? history.date : [];
+  const naturalItems = Array.isArray(history.rank) ? history.rank : [];
+  const sponsoredItems = Array.isArray(history.adRank) ? history.adRank : [];
+  const natural = dates.map((_, index) => sifNumericValue(naturalItems[index]?.rank));
+  const sponsored = dates.map((_, index) => sifNumericValue(sponsoredItems[index]?.rank));
+  const latestNatural = [...natural].reverse().find(value => value !== null) ?? null;
+  const latestSponsored = [...sponsored].reverse().find(value => value !== null) ?? null;
+  const tooltips = dates.map((date, index) => ({
+    title: `${date}（美国时间）`,
+    rows: [
+      { label: "自然排名", value: natural[index] === null ? "未上榜" : `${sifFormatMetric(natural[index])}${naturalItems[index]?.asin ? `（${naturalItems[index].asin}）` : ""}`, color: "#10b981" },
+      { label: "SP 排名", value: sponsored[index] === null ? "未上榜" : `${sifFormatMetric(sponsored[index])}${sponsoredItems[index]?.asin ? `（${sponsoredItems[index].asin}）` : ""}`, color: "#f97316" }
+    ]
+  }));
+  return `<div class="sif-trend-values"><span class="natural">自然 ${sifFormatMetric(latestNatural)}</span><span class="sponsored">SP ${sifFormatMetric(latestSponsored)}</span></div>
+    ${sifTrendSvg(dates, [
+      { values: natural, color: "#10b981", lowerIsBetter: true },
+      { values: sponsored, color: "#f97316", lowerIsBetter: true }
+    ], tooltips, "ranking-trend")}`;
+}
+
+function renderSifRankLine(rank, label) {
+  const value = rank && rank.rank !== null && rank.rank !== "" && Number.isFinite(Number(rank.rank)) ? Number(rank.rank) : null;
+  const changeClass = rank?.changeType === "up" ? "improved" : rank?.changeType === "down" ? "declined" : "steady";
+  return `<div class="sif-rank-line ${changeClass}"><span>${label}</span><strong>${value ?? "—"}</strong><small>${escapeHtml(rank?.rankStr || "未上榜")}</small></div>`;
+}
+
+function renderSifFixedBid(bid) {
+  if (!bid) return '<div class="sif-fixed-bid pending">暂无竞价数据</div>';
+  if (bid.matchStatus === "NO_CATEGORY_MATCH") {
+    return '<div class="sif-fixed-bid unavailable"><b>暂无竞价</b></div>';
+  }
+  const price = value => value === null || value === undefined || !Number.isFinite(Number(value)) ? "—" : `$${Number(value).toFixed(2)}`;
+  const range = value => `${price(value?.start)}–${price(value?.end)}`;
+  const sourceLabel = bid.categorySource === "PARENT" ? "父 ASIN 类目" : "子 ASIN 类目";
+  const title = `固定模式（legacy）\n匹配来源 ${sourceLabel}\n精准范围 ${range(bid.exact)}\n词组范围 ${range(bid.phrase)}\n广泛范围 ${range(bid.broad)}${bid.categoryName ? `\n类目 ${bid.categoryName}` : ""}${bid.productCount === null || bid.productCount === undefined ? "" : `\n该类目收录商品 ${Number(bid.productCount).toLocaleString("zh-CN")}`}`;
+  return `<div class="sif-fixed-bid" title="${escapeHtml(title)}"><small class="sif-bid-category">类目：${escapeHtml(bid.categoryName || bid.categoryId || "未命名")}</small><span class="sif-bid-prices"><em>竞价：</em><b>精准 ${price(bid.exact?.median)}</b><b>词组 ${price(bid.phrase?.median)}</b><b>广泛 ${price(bid.broad?.median)}</b></span></div>`;
+}
+
+function renderSifRankings() {
+  const dates = (sifWorkspaceData.dates || []).slice(0, 60);
+  const query = $("#sifKeywordSearch").value.trim().toLowerCase();
+  const keywords = (sifWorkspaceData.keywords || []).filter(item => `${item.keyword || ""} ${item.translateKeyword || ""}`.toLowerCase().includes(query));
+  $("#sifKeywordSummary").textContent = `${keywords.length} 个关键词 · ${selectedSifAsin || "未选择 ASIN"}`;
+  $("#sifUpdateRange").textContent = dates.length ? `已保存 ${dates.length} 个排名日期 · 最多显示近 60 天` : "暂无数据库排名";
+  $("#sifRankingHead").innerHTML = `<tr><th class="sif-index-col">#</th><th class="sif-keyword-col">关键词</th><th class="sif-search-trend-col">搜索量 / ABA 趋势</th><th class="sif-ranking-trend-col">排名趋势</th><th class="sif-latest-col"><button type="button" data-sif-scroll-latest title="回到最新日期">⇤<span>最新</span></button></th>${dates.map((date, index) => `<th class="sif-date-col ${index === 0 ? "latest" : ""}">${index === 0 ? "今天 · " : ""}${escapeHtml(date)}<small>美国时间</small></th>`).join("")}<th class="sif-action-col">操作</th></tr>`;
+  $("#sifRankingRows").innerHTML = keywords.length ? keywords.map((keyword, index) => {
+    const cells = dates.map(date => {
+      const natural = sifRankForDate(keyword, date, "nf");
+      const sponsored = sifRankForDate(keyword, date, "sp");
+      return `<td class="sif-rank-cell">${renderSifRankLine(natural, "自然")}${renderSifRankLine(sponsored, "SP")}</td>`;
+    }).join("");
+    return `<tr>
+      <td class="sif-index-col">${index + 1}</td>
+      <td class="sif-keyword-cell"><button type="button" class="sif-keyword-open" data-sif-history-keyword="${escapeHtml(keyword.keyword || "")}"><strong>${escapeHtml(keyword.keyword || "-")}</strong><span>${escapeHtml(keyword.translateKeyword || "")}</span></button>${renderSifFixedBid(keyword.fixedBid)}</td>
+      <td class="sif-trend-cell">${renderSifSearchTrend(keyword)}</td>
+      <td class="sif-trend-cell">${renderSifRankingTrend(keyword)}</td>
+      <td class="sif-latest-col"></td>
+      ${cells}
+      <td class="sif-action-col"><button type="button" class="sif-delete-keyword" data-sif-keyword="${escapeHtml(keyword.keyword || "")}" title="停止监控">删除</button></td>
+    </tr>`;
+  }).join("") : `<tr><td colspan="${dates.length + 6}"><div class="empty">${query ? "没有匹配的关键词" : "当前子 ASIN 还没有监控关键词"}</div></td></tr>`;
+}
+
+function renderSifWorkspace() {
+  renderSifAsins();
+  renderSifRankings();
+}
+
+function updateSifDetailDateInput() {
+  const input = $("#sifDetailDateRange");
+  if (!input) return;
+  input.value = sifDetailState.startDate && sifDetailState.endDate
+    ? `${sifDetailState.startDate} 至 ${sifDetailState.endDate}`
+    : sifDetailState.startDate ? `${sifDetailState.startDate} 至 ...` : "";
+}
+
+function renderSifDetailDatePicker() {
+  const picker = $("#sifDetailDatePicker");
+  if (!picker || !sifDetailDatePickerOpen) return;
+  if (!sifDetailDatePickerMonth) sifDetailDatePickerMonth = (sifDetailState.endDate || marketplaceToday()).slice(0, 7);
+  const [year, month] = sifDetailDatePickerMonth.split("-").map(Number);
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const start = new Date(Date.UTC(year, month - 1, 1 - first.getUTCDay()));
+  const days = Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(start.getTime() + index * 86400000);
+    const value = date.toISOString().slice(0, 10);
+    const inMonth = date.getUTCMonth() === month - 1;
+    const inRange = sifDetailState.startDate && sifDetailState.endDate && value >= sifDetailState.startDate && value <= sifDetailState.endDate;
+    const endpoint = value === sifDetailState.startDate || value === sifDetailState.endDate;
+    const disabled = isDateDisabled(value);
+    return `<button type="button" class="date-picker-day ${inMonth ? "" : "other-month"} ${inRange ? "in-range" : ""} ${endpoint ? "selected" : ""}" data-sif-detail-date="${value}" ${disabled ? "disabled" : ""}><span>${date.getUTCDate()}</span></button>`;
+  }).join("");
+  picker.innerHTML = `<div class="date-picker-head"><button type="button" data-sif-detail-nav="-1">‹</button><div class="date-picker-title">${year}-${String(month).padStart(2, "0")}</div><button type="button" data-sif-detail-nav="1">›</button></div>
+    <div class="date-picker-week"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div>
+    <div class="date-picker-grid">${days}</div>
+    <div class="date-picker-quick"><button type="button" data-sif-detail-quick="last7">最近7天</button><button type="button" data-sif-detail-quick="last30">最近30天</button><button type="button" data-sif-detail-quick="last60">最近60天</button></div>
+    <div class="date-picker-legend"><span class="date-range-swatch"></span> 已选范围</div>`;
+}
+
+function openSifDetailDatePicker() {
+  const input = $("#sifDetailDateRange");
+  const picker = $("#sifDetailDatePicker");
+  if (!input || !picker) return;
+  sifDetailDatePickerOpen = true;
+  sifDetailDatePickerMonth = (sifDetailState.endDate || sifDetailState.startDate || marketplaceToday()).slice(0, 7);
+  picker.hidden = false;
+  renderSifDetailDatePicker();
+  const rect = input.getBoundingClientRect();
+  const pickerRect = picker.getBoundingClientRect();
+  picker.style.left = `${Math.min(Math.max(8, rect.left), Math.max(8, window.innerWidth - pickerRect.width - 8))}px`;
+  picker.style.top = `${Math.min(window.innerHeight - pickerRect.height - 8, rect.bottom + 6)}px`;
+}
+
+function closeSifDetailDatePicker() {
+  $("#sifDetailDatePicker").hidden = true;
+  sifDetailDatePickerOpen = false;
+}
+
+function renderSifHistoryChart(data) {
+  const chart = $("#sifHistoryChart");
+  const points = (data.points || []).filter(point => point.naturalRank !== null || point.spRank !== null);
+  if (!points.length) {
+    chart.innerHTML = '<div class="ads-history-empty">所选日期范围暂无排名数据</div>';
+    return;
+  }
+  const width = 920;
+  const height = 350;
+  const bounds = { left: 58, top: 24, width: 820, height: 268 };
+  const allRanks = points.flatMap(point => [point.naturalRank, point.spRank]).filter(value => value !== null).map(Number);
+  const maxRank = Math.max(10, ...allRanks);
+  const startMs = new Date(`${data.range.startDate}T00:00:00Z`).getTime();
+  const endMs = new Date(`${data.range.endDate}T00:00:00Z`).getTime();
+  const span = Math.max(86400000, endMs - startMs);
+  const xFor = date => bounds.left + ((new Date(`${date}T00:00:00Z`).getTime() - startMs) / span) * bounds.width;
+  const yFor = rank => bounds.top + ((Number(rank) - 1) / Math.max(1, maxRank - 1)) * bounds.height;
+  const line = key => points.filter(point => point[key] !== null).map(point => `${xFor(point.date).toFixed(1)},${yFor(point[key]).toFixed(1)}`).join(" ");
+  const ticks = [1, Math.max(2, Math.round(maxRank * 0.25)), Math.max(3, Math.round(maxRank * 0.5)), Math.max(4, Math.round(maxRank * 0.75)), maxRank];
+  const xDates = [...new Set([data.range.startDate, ...points.filter((_, index) => index % Math.max(1, Math.floor(points.length / 4)) === 0).map(point => point.date), data.range.endDate])].slice(0, 6);
+  chart.innerHTML = `<div class="ads-history-legend"><span><i style="background:#10b981"></i>自然排名</span><span><i style="background:#f97316"></i>SP 排名</span></div>
+    <svg class="sif-history-svg" viewBox="0 0 ${width} ${height}" role="img">
+      ${ticks.map(rank => `<line x1="${bounds.left}" y1="${yFor(rank)}" x2="${bounds.left + bounds.width}" y2="${yFor(rank)}" class="ads-chart-grid"></line><text x="${bounds.left - 9}" y="${yFor(rank) + 4}" text-anchor="end" class="ads-chart-axis">${rank}</text>`).join("")}
+      ${xDates.map(date => `<text x="${xFor(date)}" y="${bounds.top + bounds.height + 28}" text-anchor="middle" class="ads-chart-date">${escapeHtml(date.slice(5))}</text>`).join("")}
+      ${line("naturalRank") ? `<polyline points="${line("naturalRank")}" fill="none" stroke="#10b981" stroke-width="2.5"></polyline>` : ""}
+      ${line("spRank") ? `<polyline points="${line("spRank")}" fill="none" stroke="#f97316" stroke-width="2.5"></polyline>` : ""}
+      ${points.map(point => {
+        const payload = encodeURIComponent(JSON.stringify({ title: `${point.date}（美国时间）`, rows: [
+          { label: "自然排名", value: point.naturalRank === null ? "未上榜" : `${point.naturalRank}${point.naturalRankStr ? ` · ${point.naturalRankStr}` : ""}`, color: "#10b981" },
+          { label: "SP 排名", value: point.spRank === null ? "未上榜" : `${point.spRank}${point.spRankStr ? ` · ${point.spRankStr}` : ""}`, color: "#f97316" }
+        ] }));
+        return `<rect x="${xFor(point.date) - 6}" y="${bounds.top}" width="12" height="${bounds.height}" fill="transparent" data-sif-chart-tooltip="${payload}"></rect>${point.naturalRank !== null ? `<circle cx="${xFor(point.date)}" cy="${yFor(point.naturalRank)}" r="3" fill="#10b981"></circle>` : ""}${point.spRank !== null ? `<circle cx="${xFor(point.date)}" cy="${yFor(point.spRank)}" r="3" fill="#f97316"></circle>` : ""}`;
+      }).join("")}
+    </svg>`;
+}
+
+async function loadSifKeywordHistory() {
+  const chart = $("#sifHistoryChart");
+  chart.innerHTML = '<div class="ads-history-loading">正在读取排名历史…</div>';
+  const query = new URLSearchParams(sifDetailState);
+  try {
+    renderSifHistoryChart(await api(`/api/sif-keywords/history?${query}`));
+  } catch (error) {
+    chart.innerHTML = `<div class="ads-inline-error">${escapeHtml(error.message)}</div>`;
+  }
+}
+
+function openSifKeywordHistory(keyword) {
+  const dates = sifWorkspaceData.dates || [];
+  const endDate = dates[0] || marketplaceToday();
+  const startDate = dates.at(-1) || shiftDateValue(endDate, -59);
+  sifDetailState = { asin: selectedSifAsin, keyword, startDate, endDate };
+  $("#sifHistoryTitle").textContent = keyword;
+  $("#sifHistorySubtitle").textContent = `${selectedSifAsin} · 数据库排名历史`;
+  updateSifDetailDateInput();
+  $("#sifHistoryDialog").showModal();
+  loadSifKeywordHistory();
+}
+
+async function refreshSifWorkspace(asin = "") {
+  const status = $("#sifAuthStatus");
+  status.textContent = "正在验证 SIF";
+  status.classList.remove("ok", "warn");
+  const params = asin ? `?asin=${encodeURIComponent(asin)}` : "";
+  const result = await api(`/api/sif-keywords/workspace${params}`);
+  if (!result.authorized) {
+    showSifAuthorization(result.error || "");
+    return;
+  }
+  selectedSifAsin = result.selectedAsin || asin;
+  sifWorkspaceData = result.data || { dates: [], keywords: [], asins: [] };
+  showSifWorkspace();
+  renderSifWorkspace();
+}
+
+async function saveSifCredentials() {
+  const curl = $("#sifCurlInput").value.trim();
+  if (!curl) return showSifAuthorization("请先粘贴 SIF 关键词列表请求的 cURL");
+  const button = $("#sifSaveCredentialsBtn");
+  setBusy(button, true, "验证并保存");
+  $("#sifCredentialError").hidden = true;
+  try {
+    const result = await api("/api/sif-keywords/credentials", { method: "POST", body: { curl } });
+    selectedSifAsin = result.selectedAsin || "";
+    sifWorkspaceData = result.data || { dates: [], keywords: [], asins: [] };
+    $("#sifCurlInput").value = "";
+    showSifWorkspace();
+    renderSifWorkspace();
+  } catch (error) {
+    showSifAuthorization(error.message);
+  } finally {
+    setBusy(button, false, "验证并保存");
+  }
+}
+
+async function openSifAsin(asin) {
+  const normalized = String(asin || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{10}$/.test(normalized)) return;
+  await refreshSifWorkspace(normalized);
+}
+
+async function changeSifKeywordSubscription(keywords, type) {
+  const button = type === 1 ? $("#sifSubmitKeywordsBtn") : null;
+  setBusy(button, true, "添加监控");
+  try {
+    const result = await api("/api/sif-keywords/subscriptions", {
+      method: "POST",
+      body: { asin: selectedSifAsin, keywords, type }
+    });
+    if (type === 1) $("#sifKeywordDialog").close();
+    await refreshSifWorkspace(selectedSifAsin);
+    if (result.invalidKeywords?.length) alert(`以下关键词未能添加：\n${result.invalidKeywords.join("\n")}`);
+  } finally {
+    setBusy(button, false, "添加监控");
+  }
+}
+
+document.addEventListener("click", event => {
+  const asinButton = event.target.closest("[data-sif-asin]");
+  if (asinButton) openSifAsin(asinButton.dataset.sifAsin).catch(error => alert(error.message));
+  const historyButton = event.target.closest("[data-sif-history-keyword]");
+  if (historyButton) openSifKeywordHistory(historyButton.dataset.sifHistoryKeyword);
+  if (event.target.closest("[data-sif-scroll-latest]")) {
+    event.target.closest(".sif-table-wrap")?.scrollTo({ left: 0, behavior: "smooth" });
+  }
+  const deleteButton = event.target.closest("[data-sif-keyword]");
+  if (deleteButton) {
+    const keyword = deleteButton.dataset.sifKeyword;
+    if (confirm(`确定停止监控关键词“${keyword}”吗？`)) {
+      changeSifKeywordSubscription([keyword], 2).catch(error => alert(error.message));
+    }
+  }
+  if (event.target.closest("[data-close-sif-dialog]")) $("#sifKeywordDialog").close();
+  if (event.target.closest("[data-close-sif-history]")) {
+    closeSifDetailDatePicker();
+    $("#sifHistoryDialog").close();
+  }
+});
+
+document.addEventListener("pointermove", event => {
+  const tooltip = $("#sifChartTooltip");
+  const hit = event.target.closest?.("[data-sif-chart-tooltip]");
+  if (!hit) {
+    tooltip.hidden = true;
+    tooltip.dataset.current = "";
+    return;
+  }
+  const encoded = hit.dataset.sifChartTooltip || "";
+  if (tooltip.dataset.current !== encoded) {
+    try {
+      const data = JSON.parse(decodeURIComponent(encoded));
+      tooltip.innerHTML = `<strong>${escapeHtml(data.title || "")}</strong><div>${(data.rows || []).map(row => `<span><i style="background:${escapeHtml(row.color || "#64748b")}"></i><b>${escapeHtml(row.label || "")}</b><em>${escapeHtml(row.value || "—")}</em></span>`).join("")}</div>${data.note ? `<small>▲ ${escapeHtml(data.note)}</small>` : ""}`;
+      tooltip.dataset.current = encoded;
+    } catch {
+      tooltip.hidden = true;
+      return;
+    }
+  }
+  tooltip.hidden = false;
+  const gap = 14;
+  const rect = tooltip.getBoundingClientRect();
+  const left = Math.min(window.innerWidth - rect.width - 8, Math.max(8, event.clientX + gap));
+  const top = event.clientY + gap + rect.height <= window.innerHeight
+    ? event.clientY + gap
+    : Math.max(8, event.clientY - rect.height - gap);
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+});
+
 document.addEventListener("click", event => {
   const picker = $("#fbaDatePicker");
   if (!picker || picker.hidden) return;
@@ -4777,10 +5259,97 @@ document.addEventListener("click", event => {
   closeAdsHistoryDatePicker();
 });
 document.addEventListener("click", event => {
+  const picker = $("#sifDetailDatePicker");
+  if (!picker || picker.hidden) return;
+  if (picker.contains(event.target) || event.target?.id === "sifDetailDateRange") return;
+  closeSifDetailDatePicker();
+});
+document.addEventListener("click", event => {
   if (event.target.closest("[data-ads-group-picker]")) return;
   document.querySelectorAll("[data-ads-group-menu]").forEach(menu => { menu.hidden = true; });
   document.querySelectorAll("[data-ads-group-toggle]").forEach(toggle => toggle.setAttribute("aria-expanded", "false"));
 });
+$("#sifRefreshBtn").addEventListener("click", async () => {
+  const button = $("#sifRefreshBtn");
+  setBusy(button, true, "同步中");
+  try {
+    await api("/api/sif-keywords/sync", { method: "POST", body: { asin: selectedSifAsin } });
+    await refreshSifWorkspace(selectedSifAsin);
+  } catch (error) {
+    showSifAuthorization(error.message);
+  } finally {
+    setBusy(button, false, "刷新数据");
+  }
+});
+$("#sifReauthorizeBtn").addEventListener("click", () => {
+  showSifAuthorization("");
+  $("#sifAuthStatus").textContent = "更新授权";
+  $("#sifCurlInput").focus();
+});
+$("#sifClearCurlBtn").addEventListener("click", () => {
+  $("#sifCurlInput").value = "";
+  $("#sifCredentialError").hidden = true;
+  $("#sifCurlInput").focus();
+});
+$("#sifSaveCredentialsBtn").addEventListener("click", () => saveSifCredentials().catch(error => showSifAuthorization(error.message)));
+$("#sifKeywordSearch").addEventListener("input", renderSifRankings);
+$("#sifAddKeywordBtn").addEventListener("click", () => {
+  if (!selectedSifAsin) return alert("请先输入要监控的子 ASIN");
+  $("#sifKeywordDialogAsin").textContent = `添加到 ${selectedSifAsin}`;
+  $("#sifKeywordsInput").value = "";
+  $("#sifKeywordDialog").showModal();
+  $("#sifKeywordsInput").focus();
+});
+$("#sifKeywordForm").addEventListener("submit", event => {
+  event.preventDefault();
+  const keywords = $("#sifKeywordsInput").value.split(/\r?\n|,/).map(value => value.trim()).filter(Boolean);
+  if (!keywords.length) return alert("请至少输入一个关键词");
+  changeSifKeywordSubscription(keywords, 1).catch(error => alert(error.message));
+});
+$("#sifDetailDateRange").addEventListener("click", event => {
+  event.stopPropagation();
+  openSifDetailDatePicker();
+});
+$("#sifHistoryQueryBtn").addEventListener("click", () => {
+  if (!sifDetailState.startDate || !sifDetailState.endDate) return alert("请选择完整的日期范围");
+  loadSifKeywordHistory();
+});
+$("#sifDetailDatePicker").addEventListener("click", event => {
+  event.stopPropagation();
+  const nav = event.target?.closest?.("[data-sif-detail-nav]")?.dataset?.sifDetailNav;
+  if (nav) {
+    sifDetailDatePickerMonth = shiftMonth(sifDetailDatePickerMonth, Number(nav));
+    renderSifDetailDatePicker();
+    return;
+  }
+  const quick = event.target?.closest?.("[data-sif-detail-quick]")?.dataset?.sifDetailQuick;
+  if (quick) {
+    const days = quick === "last7" ? 7 : quick === "last30" ? 30 : 60;
+    const endDate = marketplaceToday();
+    sifDetailState.startDate = shiftDateValue(endDate, -(days - 1));
+    sifDetailState.endDate = endDate;
+    sifDetailDatePickerMonth = endDate.slice(0, 7);
+    updateSifDetailDateInput();
+    closeSifDetailDatePicker();
+    return;
+  }
+  const dayButton = event.target?.closest?.("[data-sif-detail-date]");
+  const date = dayButton?.dataset?.sifDetailDate;
+  if (!date || !sifDetailDatePickerOpen || dayButton?.disabled || isDateDisabled(date)) return;
+  if (!sifDetailState.startDate || sifDetailState.endDate || date < sifDetailState.startDate) {
+    sifDetailState.startDate = date;
+    sifDetailState.endDate = "";
+    sifDetailDatePickerMonth = date.slice(0, 7);
+    updateSifDetailDateInput();
+    renderSifDetailDatePicker();
+    return;
+  }
+  sifDetailState.endDate = date;
+  updateSifDetailDateInput();
+  closeSifDetailDatePicker();
+});
+$("#sifDetailDatePicker").addEventListener("pointerdown", event => event.stopPropagation());
+$("#sifHistoryDialog").addEventListener("close", closeSifDetailDatePicker);
 $("#globalSearch").addEventListener("input", () => {
   const value = $("#globalSearch").value;
   if (activeModule === "products") {
@@ -4792,6 +5361,9 @@ $("#globalSearch").addEventListener("input", () => {
   } else if (activeModule === "inventory") {
     $("#factorySearch").value = value;
     renderFactoryInventory();
+  } else if (activeModule === "keywordMonitor") {
+    $("#sifKeywordSearch").value = value;
+    renderSifRankings();
   }
 });
 document.querySelectorAll(".module-tab").forEach(tab => {

@@ -21,6 +21,7 @@
           <button class="module-tab" data-module="products">FBA库存</button>
           <button class="module-tab" data-module="inventory">工厂库存</button>
           <button class="module-tab" data-module="ads">广告管理</button>
+          <button class="module-tab" data-module="keywordMonitor">关键词监控</button>
           <button class="module-tab" data-module="influencers">红人营销</button>
           <button class="module-tab" data-module="orders">订单管理</button>
           <button class="module-tab" data-module="settings">系统设置</button>
@@ -239,6 +240,96 @@
               <button id="adsConfirmOperationBtn" type="button" class="primary">我已核对，确认创建</button>
             </div>
           </dialog>
+        </section>
+
+        <section id="keywordMonitorPage" class="module-page">
+          <div class="page-head keyword-monitor-head">
+            <div>
+              <h1>关键词监控</h1>
+              <p>通过 SIF 跟踪子 ASIN 的自然排名、广告排名和搜索热度</p>
+            </div>
+            <div class="actions slim">
+              <span id="sifAuthStatus" class="ads-auth-status">检查中</span>
+              <button id="sifReauthorizeBtn" class="secondary-button" type="button" hidden>重新授权</button>
+              <button id="sifRefreshBtn" type="button">刷新数据</button>
+            </div>
+          </div>
+
+          <section id="sifCredentialPanel" class="panel sif-credential-panel" hidden>
+            <div class="sif-credential-title">
+              <div class="sif-lock-icon" aria-hidden="true">⌁</div>
+              <div><h2>连接 SIF 账户</h2><p>授权信息仅在服务端加密保存，页面不会回显。</p></div>
+            </div>
+            <ol class="sif-auth-steps">
+              <li>打开 <a href="https://www.sif.com/dailyrank?country=US" target="_blank" rel="noopener noreferrer">SIF 关键词排名页面</a> 并登录。</li>
+              <li>按 F12 打开开发者工具，切换到“网络”，在 SIF 页面执行任意操作。</li>
+              <li>任选一个 SIF API 请求，右键选择“复制”→“复制为 cURL (bash)”，粘贴到下方即可。只要请求中带有 <code>authorization</code> 即可识别身份。</li>
+            </ol>
+            <label class="sif-curl-field">
+              <span>粘贴 cURL 命令</span>
+              <textarea id="sifCurlInput" rows="9" spellcheck="false" autocomplete="off" placeholder="curl 'https://www.sif.com/api/...' -H 'authorization: ...' ..."></textarea>
+            </label>
+            <p id="sifCredentialError" class="sif-form-error" hidden></p>
+            <div class="sif-credential-actions">
+              <button id="sifClearCurlBtn" class="secondary-button" type="button">清空</button>
+              <button id="sifSaveCredentialsBtn" class="primary" type="button">验证并保存</button>
+            </div>
+          </section>
+
+          <div id="sifWorkspace" class="sif-workspace" hidden>
+            <section class="panel sif-asins-panel">
+              <div class="sif-section-head">
+                <div><strong id="sifMonitorSummary">正在读取监控商品</strong><span>自动读取“广告管理”中已添加关键词的子 ASIN</span></div>
+              </div>
+              <div id="sifAsinTabs" class="sif-asin-tabs"></div>
+            </section>
+
+            <section class="panel sif-ranking-panel">
+              <div class="sif-ranking-toolbar">
+                <div><strong id="sifKeywordSummary">0 个关键词</strong><span id="sifUpdateRange">近 7 天排名</span></div>
+                <div class="sif-ranking-actions">
+                  <input id="sifKeywordSearch" placeholder="搜索关键词或中文翻译">
+                  <button id="sifAddKeywordBtn" class="primary" type="button">添加关键词</button>
+                </div>
+              </div>
+              <div class="sif-table-wrap">
+                <table class="sif-ranking-table">
+                  <thead id="sifRankingHead"></thead>
+                  <tbody id="sifRankingRows"></tbody>
+                </table>
+              </div>
+            </section>
+          </div>
+
+          <dialog id="sifKeywordDialog" class="ads-dialog sif-keyword-dialog">
+            <form id="sifKeywordForm" method="dialog">
+              <div class="ads-dialog-head">
+                <div><strong>添加监控关键词</strong><span id="sifKeywordDialogAsin">添加到当前子 ASIN</span></div>
+                <button type="button" data-close-sif-dialog aria-label="关闭">×</button>
+              </div>
+              <div class="ads-dialog-body">
+                <label>关键词（每行一个）<textarea id="sifKeywordsInput" rows="8" placeholder="wall hanging storage bags"></textarea></label>
+                <p class="hint">SIF 会校验可添加的关键词；无效关键词会在提交后提示。</p>
+              </div>
+              <div class="ads-dialog-actions">
+                <button type="button" class="secondary-button" data-close-sif-dialog>取消</button>
+                <button id="sifSubmitKeywordsBtn" type="submit" class="primary">添加监控</button>
+              </div>
+            </form>
+          </dialog>
+          <dialog id="sifHistoryDialog" class="ads-dialog sif-history-dialog">
+            <div class="ads-dialog-head">
+              <div><strong id="sifHistoryTitle">关键词排名历史</strong><span id="sifHistorySubtitle"></span></div>
+              <button type="button" data-close-sif-history aria-label="关闭">×</button>
+            </div>
+            <div class="sif-history-toolbar">
+              <label>日期范围<input id="sifDetailDateRange" type="text" readonly></label>
+              <button id="sifHistoryQueryBtn" class="primary" type="button">查询</button>
+            </div>
+            <div id="sifHistoryChart" class="sif-history-chart"><div class="ads-history-loading">正在读取排名历史…</div></div>
+            <div id="sifDetailDatePicker" class="date-picker-popover" hidden></div>
+          </dialog>
+          <div id="sifChartTooltip" class="sif-chart-tooltip" hidden></div>
         </section>
 
         <section id="influencersPage" class="module-page">
