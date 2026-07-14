@@ -3557,11 +3557,8 @@ function renderAdsKeywordRows() {
     const keywordSubline = keyword.lifecycleStatus === "STOPPED"
       ? `停止时间：${adsStopTimeLabel(keyword.stoppedAt)}`
       : `${formatNumber(keyword.metrics.impressions)} 曝光 · ${formatNumber(keyword.metrics.clicks)} 点击 · ${formatNumber(keyword.metrics.orders)} 订单量`;
-    const aiReminder = hasAdsAiReminder(keyword)
-      ? `<button type="button" class="ads-ai-reminder" data-ads-ai-reminder="${keyword.id}" title="有待 AI 分析的广告信号" aria-label="查看 AI 广告建议">!</button>`
-      : "";
     return `<tr class="${keyword.id === selectedAdsKeywordId ? "selected" : ""}" data-ads-keyword-id="${keyword.id}">
-      <td><div class="ads-keyword-name"><strong>${escapeHtml(keyword.keyword)}</strong>${aiReminder}</div><span>${escapeHtml(keywordSubline)}</span></td>
+      <td><strong>${escapeHtml(keyword.keyword)}</strong><span>${escapeHtml(keywordSubline)}</span></td>
       <td>${childAsins.length ? childAsins.map(asin => `<span class="ads-asin-chip">${escapeHtml(asin)}</span>`).join("") : "-"}</td>
       <td><span class="ads-group-badge ${keyword.group.toLowerCase()}">${adsGroupLabel(keyword.group)}</span></td>
       <td>${renderAdsMatchCell(keyword, "EXACT")}</td><td>${renderAdsMatchCell(keyword, "PHRASE")}</td><td>${renderAdsMatchCell(keyword, "BROAD")}</td>
@@ -3572,26 +3569,12 @@ function renderAdsKeywordRows() {
   }).join("");
 }
 
-function hasAdsAiReminder(keyword) {
-  if (keyword.lifecycleStatus !== "ACTIVE") return false;
-  const metrics = keyword.metrics || {};
-  const impressions = Number(metrics.impressions || 0);
-  const clicks = Number(metrics.clicks || 0);
-  const acos = Number(metrics.acos);
-  return impressions === 0 || (clicks >= 5 && (!Number.isFinite(acos) || acos > 0.3));
-}
-
 function renderAdsAiPanel(keyword, currency) {
   const metrics = keyword.metrics || {};
   const impressions = Number(metrics.impressions || 0);
   const clicks = Number(metrics.clicks || 0);
   const acos = Number(metrics.acos);
-  const hasReminder = hasAdsAiReminder(keyword);
-  const diagnosis = impressions === 0
-    ? "最近所选周期暂无曝光，建议优先检查竞价、预算和投放状态。"
-    : clicks >= 5 && (!Number.isFinite(acos) || acos > 0.3)
-      ? "已有点击但转化效率偏弱，建议先控制 ACOS，再决定是否提高竞价。"
-      : "当前未发现需要优先处理的强信号；接入 AI 后将持续分析趋势。";
+  const diagnosis = "AI 尚未接入，接入后会结合你设定的目标与历史表现进行分析。";
   const suggestedBid = keyword.campaigns.flatMap(campaign => campaign.units).map(unit => Number(unit.bid || 0)).filter(Boolean)[0];
   return `<aside class="ads-ai-panel" id="adsAiPanel">
     <div class="ads-ai-panel-head"><div><span class="ads-ai-kicker">AI 广告助手</span><strong>调整目标与建议</strong><p>先设定你的经营目标，AI 接入后会结合历史数据给出可确认的操作。</p></div><span class="ads-ai-status">准备中</span></div>
@@ -3601,7 +3584,7 @@ function renderAdsAiPanel(keyword, currency) {
       <div class="ads-ai-goal-examples"><button type="button" data-ads-ai-goal="到搜索首页">到搜索首页</button><button type="button" data-ads-ai-goal="控制 ACOS 在 30% 以下">ACOS ≤ 30%</button><button type="button" data-ads-ai-goal="优先恢复曝光">恢复曝光</button></div>
     </section>
     <section class="ads-ai-section">
-      <div class="ads-ai-section-title"><strong>AI 分析</strong><span>${hasReminder ? "发现信号" : "持续观察"}</span></div>
+      <div class="ads-ai-section-title"><strong>AI 分析</strong><span>等待接入</span></div>
       <div class="ads-ai-analysis"><i aria-hidden="true">⌁</i><p>${escapeHtml(diagnosis)}</p></div>
       <div class="ads-ai-data-chips"><span>曝光 ${formatNumber(impressions)}</span><span>点击 ${formatNumber(clicks)}</span><span>ACOS ${adsPercent(Number.isFinite(acos) ? acos : null)}</span></div>
     </section>
@@ -4384,9 +4367,6 @@ $("#adsKeywordRows").addEventListener("click", event => {
   selectedAdsKeywordId = row.dataset.adsKeywordId;
   renderAdsKeywordRows();
   renderAdsDetail();
-  if (event.target.closest("[data-ads-ai-reminder]")) {
-    requestAnimationFrame(() => $("#adsAiPanel")?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
-  }
 });
 $("#adsKeywordFormBody").addEventListener("change", event => {
   if (event.target.id === "adsFormParentAsin") {

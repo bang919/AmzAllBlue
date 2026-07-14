@@ -2909,10 +2909,6 @@ h2 {
 .ads-keyword-table td:first-child strong,
 .ads-keyword-table td:first-child span { display: block; }
 .ads-keyword-table td:first-child span { margin-top: 4px; color: var(--muted); font-size: 10px; }
-.ads-keyword-name { display: flex; align-items: center; gap: 6px; min-width: 0; }
-.ads-ai-reminder { display: inline-grid; flex: 0 0 auto; place-items: center; width: 17px; height: 17px; min-height: 17px; margin: 0; padding: 0; border: 0; border-radius: 999px; background: #f59e0b; color: #fff; box-shadow: none; font-size: 12px; font-weight: 800; line-height: 1; }
-.ads-ai-reminder:hover { background: #d97706; transform: none; }
-
 .ads-asin-chip { display: inline-block; margin: 1px 2px 1px 0; padding: 3px 6px; border-radius: 5px; background: #f1f5f9; color: #334155; font-size: 10px; }
 .ads-group-badge,
 .ads-match-pill,
