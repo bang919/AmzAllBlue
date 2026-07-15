@@ -162,12 +162,18 @@
               <span>只读取和管理这个广告组合</span>
             </div>
             <div class="ads-range-actions">
-              <label>开始日期<input id="adsStartDate" type="date"></label>
-              <label>结束日期<input id="adsEndDate" type="date"></label>
+              <label class="date-picker-field ads-date-range-field">
+                日期范围
+                <input id="adsDateRange" type="text" readonly>
+                <input id="adsStartDate" type="hidden">
+                <input id="adsEndDate" type="hidden">
+              </label>
               <button id="adsSyncBtn" class="secondary-button" type="button">同步广告数据</button>
               <button id="adsAddKeywordBtn" class="primary" type="button">添加关键词</button>
             </div>
           </section>
+
+          <div id="adsDatePicker" class="date-picker-popover" hidden></div>
 
           <div id="adsProductTabs" class="ads-product-tabs"></div>
 
@@ -242,7 +248,7 @@
 
           <dialog id="adsAiStrategyDialog" class="ads-dialog ads-ai-strategy-dialog">
             <div class="ads-dialog-head">
-              <div><strong>调整 AI 策略规则</strong><span>规则按版本保存；新的分析使用最新版本，历史分析保留当时的完整快照</span></div>
+              <div><strong>调整 AI 策略规则</strong><span>规则只保存当前配置；每次历史分析仍保留当时的完整输入快照</span></div>
               <button type="button" data-close-ads-ai-strategy aria-label="关闭">×</button>
             </div>
             <div id="adsAiStrategyBody" class="ads-dialog-body"></div>
@@ -250,6 +256,17 @@
               <span id="adsAiStrategyVersion" class="ads-ai-strategy-version"></span>
               <button type="button" class="secondary-button" data-close-ads-ai-strategy>取消</button>
               <button id="adsAiSaveStrategyBtn" type="button" class="primary">确认</button>
+            </div>
+          </dialog>
+
+          <dialog id="adsAiHistoryDialog" class="ads-dialog ads-ai-history-dialog">
+            <div class="ads-dialog-head">
+              <div><strong>AI 分析历史</strong><span id="adsAiHistorySubtitle">按每次分析查看目标、分析、建议行动和当时输入快照</span></div>
+              <button type="button" data-close-ads-ai-history aria-label="关闭">×</button>
+            </div>
+            <div id="adsAiHistoryBody" class="ads-dialog-body"><div class="ads-history-loading">正在读取分析历史…</div></div>
+            <div class="ads-dialog-actions">
+              <button type="button" class="secondary-button" data-close-ads-ai-history>关闭</button>
             </div>
           </dialog>
         </section>
@@ -463,9 +480,13 @@
         </section>
 
         <section id="settingsPage" class="module-page">
-          <section class="panel placeholder-panel">
-            <h1>系统设置</h1>
-              <p>SP-API 凭证从本地 <code>.env</code> 读取，不会在页面展示密钥内容。</p>
+          <section class="panel system-settings-panel">
+            <div class="system-settings-head">
+              <div><h1>系统设置</h1><p>集中管理后台自动请求与每日记录任务。所有每日执行时间均为北京时间。</p></div>
+              <button id="saveSystemSchedulesBtn" class="primary" type="button">保存定时计划</button>
+            </div>
+            <div class="system-settings-note">SP-API、Amazon Ads 和 SIF 凭证仍从本地安全配置读取，此处不会展示密钥内容。</div>
+            <div id="systemScheduleList" class="system-schedule-list"><div class="empty">正在读取定时计划…</div></div>
           </section>
         </section>
       </main>

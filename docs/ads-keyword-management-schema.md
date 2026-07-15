@@ -13,6 +13,8 @@
 | `ads_ad_units` | Campaign 下一个子 ASIN/Seller SKU 的 Ad Group、Product Ad 和 Target，保存创建批次与稳定对象键 |
 | `ads_performance_daily` | Ad Group 投放单元的每日表现 |
 | `ads_placement_performance_daily` | Campaign 按广告位置拆分的每日表现 |
+| `ads_ad_unit_settings_daily` | 投放单元每天最后一次成功出价与状态快照 |
+| `ads_campaign_settings_daily` | Campaign 每天最后一次成功预算、位置加价与状态快照 |
 | `ads_sync_jobs` | 异步报表申请、轮询和限流重试任务 |
 | `ads_sync_dates` | 日期范围完成状态及日期选择器标记 |
 | `ads_operations` | 创建、改名和启停操作的预览、确认及执行状态 |
@@ -20,7 +22,8 @@
 | `ads_ai_strategy_versions` | 每个 Profile 的当前 AI 策略规则；保存时替换旧规则，不保留历史版本 |
 | `ads_ai_keyword_goals` | 单个关键词的手动调整目标和约束 |
 | `ads_ai_analysis_runs` | 每次 AI 分析的输入快照、标准输出、模型和校验状态 |
-| `ads_ai_batch_runs` | 每日批量分析的触发时间、关键词集合与一次 CCAI 请求的审计记录 |
+| `ads_ai_batch_runs` | 每日批量父任务、关键词集合、动态 CCAI 子批次与执行汇总的审计记录 |
+| `system_schedule_settings` | 后台业务定时任务开关、北京时间/间隔及最近运行状态 |
 | `ads_ai_recommendations` | AI 建议、人工决定、执行结果和复盘时间 |
 | `ads_ai_recommendation_events` | 建议生成、拒绝、确认、执行和失败的不可变事件流水 |
 
@@ -64,11 +67,11 @@ ads_keywords
 
 ## AI 分析与执行审计
 
-每次 AI 分析先写入 `ads_ai_analysis_runs`，保存策略版本、关键词目标、近 30 天完整指标数组、建议竞价、最近建议与执行历史。CCAI 返回内容必须通过服务端 JSON 结构、对象归属、当前值和策略安全边界校验，校验失败的分析保存为 `FAILED`，不产生建议。
+每次 AI 分析先写入 `ads_ai_analysis_runs`，保存策略版本、关键词目标、近 30 天完整指标数组、建议竞价，以及按策略设置天数带入的近期 AI 分析与建议行动状态。近期 AI 历史采用压缩格式：每个关键词最多 3 次分析、每次最多 1 条建议，避免每日批量分析在大量关键词时超出上下文或产生不可控成本。CCAI 返回内容必须通过服务端 JSON 结构、对象归属、当前值和策略安全边界校验，校验失败的分析保存为 `FAILED`，不产生建议。
 
 新分析成功后，上一轮仍未处理的建议转为 `SUPERSEDED`。真正可展示的提醒只统计 `PENDING` 建议。用户拒绝、确认和执行均写入 `ads_ai_recommendation_events`；执行前再次核对数据库当前值，若竞价、预算、位置加价、状态或分组已经变化，则拒绝执行过期建议。
 
-建议状态包括 `PENDING`、`EXECUTING`、`EXECUTED`、`FAILED`、`REJECTED` 和 `SUPERSEDED`。任何真实广告操作均要求用户逐条确认，AI 策略中的 `requireManualConfirmation` 由服务端强制保持为真。
+建议状态包括 `PENDING`、`EXECUTING`、`EXECUTED`、`FAILED`、`REJECTED`、`ACKNOWLEDGED` 和 `SUPERSEDED`。真实广告操作根据当前审批模式决定逐条确认或自动执行，但始终受服务端安全边界约束并写入事件流水。分析历史通过 `ads_ai_analysis_runs.input_payload` 回溯当时的完整输入状态。
 
 ## 数据保留
 

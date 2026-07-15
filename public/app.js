@@ -71,6 +71,8 @@ let activeModule = "dashboard";
 let productsLoaded = false;
 let factoryLoaded = false;
 let adsLoaded = false;
+let systemSchedulesLoaded = false;
+let systemSchedules = [];
 let sifWorkspaceData = { dates: [], keywords: [], asins: [] };
 let selectedSifAsin = "";
 let sifDetailState = { asin: "", keyword: "", startDate: "", endDate: "" };
@@ -90,6 +92,9 @@ let datePickerMonth = "";
 const adsHistoryDateStatus = new Map();
 let adsHistoryDatePickerOpen = false;
 let adsHistoryDatePickerMonth = "";
+const adsDateStatus = new Map();
+let adsDatePickerOpen = false;
+let adsDatePickerMonth = "";
 let fbaVisibleColumns = new Set();
 let fbaSort = { key: "totalGoodsQuantity", direction: "desc" };
 let fbaColumnFilters = {};
@@ -752,7 +757,57 @@ function switchModule(module) {
       $("#sandboxStatus").textContent = `工厂库存读取失败：${error.message}`;
     });
   }
+  if (module === "settings" && !systemSchedulesLoaded) loadSystemSchedules().catch(error => {
+    $("#systemScheduleList").innerHTML = `<div class="empty">定时计划读取失败：${escapeHtml(error.message)}</div>`;
+  });
   if (module === "dashboard") renderDashboard();
+}
+
+function systemScheduleStatus(task) {
+  if (!task.lastStartedAt) return "尚未执行";
+  if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}`;
+  if (task.lastStatus === "RUNNING") return `正在执行 · ${formatDate(task.lastStartedAt)}`;
+  return `上次触发：${formatDate(task.lastStartedAt)}`;
+}
+
+function renderSystemSchedules() {
+  const list = $("#systemScheduleList");
+  if (!list) return;
+  list.innerHTML = systemSchedules.map(task => `
+    <section class="system-schedule-card ${task.enabled ? "enabled" : ""}" data-system-schedule="${escapeHtml(task.key)}">
+      <label class="system-schedule-switch"><input data-system-schedule-enabled type="checkbox" ${task.enabled ? "checked" : ""}><span></span></label>
+      <div class="system-schedule-copy"><strong>${escapeHtml(task.label)}</strong><p>${escapeHtml(task.description)}</p><small class="${task.lastStatus === "FAILED" ? "failed" : ""}">${escapeHtml(systemScheduleStatus(task))}</small></div>
+      ${task.scheduleType === "DAILY"
+        ? `<label class="system-schedule-value">执行时间（北京时间）<input data-system-schedule-time type="time" value="${escapeHtml(task.timeBeijing || "09:00")}"></label>`
+        : `<label class="system-schedule-value">执行间隔（分钟）<input data-system-schedule-interval type="number" min="${Number(task.minIntervalMinutes || 1)}" step="1" value="${Number(task.intervalMinutes || 60)}"></label>`}
+    </section>`).join("");
+}
+
+async function loadSystemSchedules() {
+  const data = await api("/api/system/schedules");
+  systemSchedules = data.tasks || [];
+  systemSchedulesLoaded = true;
+  renderSystemSchedules();
+}
+
+async function saveSystemSchedules(button) {
+  const tasks = [...document.querySelectorAll("[data-system-schedule]")].map(card => {
+    const existing = systemSchedules.find(item => item.key === card.dataset.systemSchedule) || {};
+    return {
+      key: card.dataset.systemSchedule,
+      enabled: Boolean(card.querySelector("[data-system-schedule-enabled]")?.checked),
+      timeBeijing: card.querySelector("[data-system-schedule-time]")?.value || existing.timeBeijing,
+      intervalMinutes: Number(card.querySelector("[data-system-schedule-interval]")?.value || existing.intervalMinutes || 0)
+    };
+  });
+  setBusy(button, true, "保存中");
+  try {
+    const data = await api("/api/system/schedules", { method: "PUT", body: { tasks } });
+    systemSchedules = data.tasks || [];
+    renderSystemSchedules();
+  } finally {
+    setBusy(button, false, "保存定时计划");
+  }
 }
 
 function asMoney(value, currency = "USD") {
@@ -2977,6 +3032,89 @@ function closeDatePicker() {
   dateRangePickerOpen = false;
 }
 
+function updateAdsDateRangeInput() {
+  const startDate = $("#adsStartDate")?.value || "";
+  const endDate = $("#adsEndDate")?.value || "";
+  const input = $("#adsDateRange");
+  if (!input) return;
+  input.value = startDate && endDate ? `${startDate} 至 ${endDate}` : (startDate ? `${startDate} 至 ...` : "");
+}
+
+function isAdsDateInSelectedRange(value) {
+  const startDate = $("#adsStartDate")?.value || "";
+  const endDate = $("#adsEndDate")?.value || "";
+  return isValidDateValue(startDate) && isValidDateValue(endDate) && value >= startDate && value <= endDate;
+}
+
+async function loadAdsDateStatus() {
+  try {
+    const data = await api("/api/ads/dates");
+    adsDateStatus.clear();
+    for (const item of data.dates || []) adsDateStatus.set(item.date, item);
+  } catch {
+    // Date markers are helpful but should not block range selection.
+  }
+}
+
+function renderAdsDatePicker() {
+  const picker = $("#adsDatePicker");
+  if (!picker || !adsDatePickerOpen) return;
+  const startDate = $("#adsStartDate")?.value || "";
+  const endDate = $("#adsEndDate")?.value || "";
+  const selectedDate = endDate || startDate || marketplaceToday();
+  if (!adsDatePickerMonth) adsDatePickerMonth = selectedDate.slice(0, 7);
+  const [year, month] = adsDatePickerMonth.split("-").map(Number);
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const start = new Date(Date.UTC(year, month - 1, 1 - first.getUTCDay()));
+  const days = Array.from({ length: 42 }, (_, index) => {
+    const date = new Date(start.getTime() + index * 86400000);
+    const value = date.toISOString().slice(0, 10);
+    const inMonth = date.getUTCMonth() === month - 1;
+    const dateStatus = adsDateStatus.get(value);
+    const hasCompleteData = Boolean(dateStatus?.complete);
+    const hasPartialData = Boolean(dateStatus?.partial && !dateStatus.complete);
+    const inRange = isAdsDateInSelectedRange(value);
+    const endpoint = value === startDate || value === endDate;
+    const disabled = isDateDisabled(value);
+    const dataLabel = hasCompleteData ? "广告组与广告位表现均已同步" : hasPartialData ? "部分广告表现已同步" : "";
+    return `<button type="button" class="date-picker-day ${inMonth ? "" : "other-month"} ${hasCompleteData ? "has-data" : ""} ${hasPartialData ? "partial-data" : ""} ${inRange ? "in-range" : ""} ${endpoint ? "selected" : ""}" data-ads-date="${value}" title="${escapeHtml(disabled ? "未来日期不可选" : dataLabel)}" ${disabled ? "disabled" : ""}><span>${date.getUTCDate()}</span></button>`;
+  }).join("");
+  picker.innerHTML = `
+    <div class="date-picker-head"><button type="button" data-ads-date-nav="-1">‹</button><div class="date-picker-title">${year}-${String(month).padStart(2, "0")}</div><button type="button" data-ads-date-nav="1">›</button></div>
+    <div class="date-picker-week"><span>日</span><span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span></div>
+    <div class="date-picker-grid">${days}</div>
+    <div class="date-picker-quick">
+      <button type="button" data-ads-date-quick="today">今天</button><button type="button" data-ads-date-quick="yesterday">昨天</button>
+      <button type="button" data-ads-date-quick="last7">最近7天</button><button type="button" data-ads-date-quick="last30">最近30天</button>
+      <button type="button" data-ads-date-quick="last30Exclude2">最近30天（不含近2天）</button>
+    </div>
+    <div class="date-picker-legend"><span class="date-data-dot"></span> 广告表现同步成功 <span class="date-range-swatch"></span> 已选范围</div>`;
+}
+
+async function openAdsDatePicker() {
+  const input = $("#adsDateRange");
+  const picker = $("#adsDatePicker");
+  if (!input || !picker) return;
+  adsDatePickerOpen = true;
+  adsDatePickerMonth = ($("#adsEndDate")?.value || $("#adsStartDate")?.value || marketplaceToday()).slice(0, 7);
+  await loadAdsDateStatus();
+  const rect = input.getBoundingClientRect();
+  picker.hidden = false;
+  renderAdsDatePicker();
+  const pickerRect = picker.getBoundingClientRect();
+  const margin = 8;
+  picker.style.left = `${Math.min(Math.max(margin, rect.left), Math.max(margin, window.innerWidth - pickerRect.width - margin))}px`;
+  const belowTop = rect.bottom + 6;
+  const aboveTop = rect.top - pickerRect.height - 6;
+  picker.style.top = `${belowTop + pickerRect.height + margin <= window.innerHeight ? belowTop : Math.max(margin, aboveTop)}px`;
+}
+
+function closeAdsDatePicker() {
+  const picker = $("#adsDatePicker");
+  if (picker) picker.hidden = true;
+  adsDatePickerOpen = false;
+}
+
 function updateAdsHistoryDateRangeInput() {
   const input = $("#adsHistoryDateRange");
   if (!input) return;
@@ -3353,6 +3491,7 @@ function adsStopTimeLabel(value) {
 
 const ADS_HISTORY_METRICS = {
   bid: { label: "出价", unit: "money", color: "#2563eb" },
+  dailyBudget: { label: "日预算", unit: "money", color: "#0f766e" },
   topOfSearchAdjustment: { label: "顶部加价", unit: "percent", color: "#7c3aed" },
   restOfSearchAdjustment: { label: "其余搜索加价", unit: "percent", color: "#0ea5e9" },
   productPageAdjustment: { label: "商品页加价", unit: "percent", color: "#ec4899" },
@@ -3405,7 +3544,7 @@ function resetAdsHistoryState(keyword) {
 
 function adsHistoryMetricOptions(selected) {
   const option = ([key, metric]) => `<option value="${key}" ${key === selected ? "selected" : ""} ${metric.unavailable ? "disabled" : ""}>${escapeHtml(metric.label)}</option>`;
-  const overall = ["bid", "topOfSearchAdjustment", "restOfSearchAdjustment", "productPageAdjustment", "actualCpc", "impressions", "clicks", "spend", "orders", "units", "sales", "naturalRank", "adRank"]
+  const overall = ["bid", "dailyBudget", "topOfSearchAdjustment", "restOfSearchAdjustment", "productPageAdjustment", "actualCpc", "impressions", "clicks", "spend", "orders", "units", "sales", "naturalRank", "adRank"]
     .map(key => [key, ADS_HISTORY_METRICS[key]]);
   const positionGroup = (label, prefix) => ADS_HISTORY_POSITION_METRICS.map(([suffix]) => [`${prefix}${suffix}`, ADS_HISTORY_METRICS[`${prefix}${suffix}`]]);
   return `<optgroup label="综合">${overall.map(option).join("")}</optgroup>`
@@ -3597,7 +3736,7 @@ function renderAdsAiPanel(keyword, currency) {
       <div class="ads-ai-section-title"><strong>建议行动</strong><span id="adsAiRecommendationCount">读取中</span></div>
       <div id="adsAiRecommendations"><div class="ads-ai-action-empty"><strong>正在读取建议</strong><p>仅实际 AI 建议会出现在这里。</p></div></div>
     </section>
-    <button type="button" class="ads-ai-playbook-button" data-ads-ai-strategy>调整 AI 策略规则</button>
+    <div class="ads-ai-panel-footer-actions"><button type="button" class="ads-ai-playbook-button" data-ads-ai-strategy>调整 AI 策略规则</button><button type="button" class="ads-ai-history-button" data-ads-ai-history>查看分析历史</button></div>
   </aside>`;
 }
 
@@ -3923,7 +4062,7 @@ function renderAdsAiKeywordState(data) {
     }
   }
   const pending = (data.recommendations || []).filter(item => item.status === "PENDING" && item.actionType !== "REQUEST_MORE_DATA");
-  const visible = (data.recommendations || []).filter(item => ["PENDING", "EXECUTING", "EXECUTED", "FAILED", "REJECTED", "ACKNOWLEDGED"].includes(item.status)).slice(0, 12);
+  const visible = (data.recommendations || []).filter(item => ["PENDING", "EXECUTING", "EXECUTED", "FAILED", "REJECTED", "ACKNOWLEDGED"].includes(item.status)).slice(0, 1);
   const count = $("#adsAiRecommendationCount");
   if (count) count.textContent = pending.length ? `${pending.length} 条待处理` : "暂无待处理";
   const analyzeButton = $("[data-ads-ai-analyze]");
@@ -3999,6 +4138,7 @@ function renderAdsAiStrategyForm(strategy) {
     <section class="ads-ai-strategy-section"><div><strong>全局分析规则</strong><span>这些说明会和每次分析数据一起发送给 AI</span></div><label>总规则<textarea id="adsAiGeneralRules" rows="5">${escapeHtml(rules.generalText)}</textarea></label></section>
     <section class="ads-ai-strategy-section"><div><strong>安全边界</strong><span>服务端会再次校验；AI 不能突破这些限制</span></div><div class="ads-ai-limit-grid">
       <label>分析窗口（天）<input data-ads-ai-limit="analysisWindowDays" type="number" min="7" max="90" value="${limits.analysisWindowDays}"></label>
+      <label title="仅带入压缩摘要：每个关键词最多 3 次分析、每次最多 1 条建议；填 0 则不带入。">带入近期 AI 记录（天）<small>0 = 不带入；每词最多 3 次压缩分析和 1 条建议</small><input data-ads-ai-limit="recentAiHistoryDays" type="number" min="0" max="30" step="1" value="${limits.recentAiHistoryDays ?? 7}"></label>
       <label>最短观察期（天）<input data-ads-ai-limit="minObservationDays" type="number" min="1" max="30" value="${limits.minObservationDays}"></label>
       <label>最高竞价<input data-ads-ai-limit="maxBid" type="number" min="0.02" step="0.01" value="${limits.maxBid}"></label>
       <label>单次最多调价<input data-ads-ai-limit="maxBidChangeAmount" type="number" min="0.01" step="0.01" value="${limits.maxBidChangeAmount}"></label>
@@ -4009,7 +4149,7 @@ function renderAdsAiStrategyForm(strategy) {
       <label>库存安全线（天）<input data-ads-ai-limit="inventorySafetyDays" type="number" min="0" max="365" step="1" value="${limits.inventorySafetyDays}"></label>
       <label class="ads-ai-required-confirmation"><input type="checkbox" checked disabled> 所有真实调整必须人工确认</label>
     </div></section>
-    <section class="ads-ai-strategy-section"><div><strong>每日批量分析</strong><span>在广告 Profile 所在时区，用一次后台批量任务分析所有填写了调整目标的关键词。</span></div><div class="ads-ai-schedule-fields"><label class="ads-ai-schedule-enabled"><input id="adsAiDailyBatchEnabled" type="checkbox" ${schedule.dailyBatchEnabled ? "checked" : ""}> 每天自动分析</label><label>执行时间<input id="adsAiDailyBatchTime" type="time" value="${escapeHtml(schedule.dailyBatchTime)}"></label></div><div class="ads-ai-approval-setting"><strong>处理建议行动</strong><span>AI 只负责判断；服务端会按此模式决定是否调用 Amazon Ads 执行接口。</span><div class="ads-ai-approval-options"><label class="${schedule.approvalMode === "MANUAL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="MANUAL" ${schedule.approvalMode === "MANUAL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>请求批准</strong><small>所有行动都需用户批准</small></span></label><label class="${schedule.approvalMode === "RISK_ONLY" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="RISK_ONLY" ${schedule.approvalMode === "RISK_ONLY" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>替我审批</strong><small>仅竞价自动执行，风险操作请求批准</small></span></label><label class="${schedule.approvalMode === "AUTO_ALL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="AUTO_ALL" ${schedule.approvalMode === "AUTO_ALL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>完全批准</strong><small>自动执行所有通过安全边界的行动</small></span></label></div></div></section>
+    <section class="ads-ai-strategy-section"><div><strong>每日批量分析</strong><span>统一按北京时间，用一次后台批量任务分析所有填写了调整目标的关键词。</span></div><div class="ads-ai-schedule-fields"><label class="ads-ai-schedule-enabled"><input id="adsAiDailyBatchEnabled" type="checkbox" ${schedule.dailyBatchEnabled ? "checked" : ""}> 每天自动分析</label><label>执行时间（北京时间）<input id="adsAiDailyBatchTime" type="time" value="${escapeHtml(schedule.dailyBatchTime)}"></label></div><div class="ads-ai-approval-setting"><strong>处理建议行动</strong><span>AI 只负责判断；服务端会按此模式决定是否调用 Amazon Ads 执行接口。</span><div class="ads-ai-approval-options"><label class="${schedule.approvalMode === "MANUAL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="MANUAL" ${schedule.approvalMode === "MANUAL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>请求批准</strong><small>所有行动都需用户批准</small></span></label><label class="${schedule.approvalMode === "RISK_ONLY" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="RISK_ONLY" ${schedule.approvalMode === "RISK_ONLY" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>替我审批</strong><small>仅竞价自动执行，风险操作请求批准</small></span></label><label class="${schedule.approvalMode === "AUTO_ALL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="AUTO_ALL" ${schedule.approvalMode === "AUTO_ALL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>完全批准</strong><small>自动执行所有通过安全边界的行动</small></span></label></div></div></section>
     ${groupSection("NORMAL")}${groupSection("PROMOTED")}${groupSection("STABLE")}
   </div>`;
   $("#adsAiStrategyVersion").textContent = "";
@@ -4021,6 +4161,84 @@ async function openAdsAiStrategyDialog() {
   dialog.showModal();
   const data = await api("/api/ads/ai/strategy");
   renderAdsAiStrategyForm(data.strategy);
+}
+
+function adsAiHistoryRunStatus(status) {
+  return { RUNNING: "分析中", COMPLETE: "分析完成", FAILED: "分析失败" }[status] || status || "未知";
+}
+
+function adsAiModelLabel(model) {
+  return String(model || "") === "RULE_ENGINE" ? "规则预判" : String(model || "");
+}
+
+function renderAdsAiHistory(data) {
+  const body = $("#adsAiHistoryBody");
+  $("#adsAiHistorySubtitle").textContent = `${data.keyword?.text || "关键词"} · 每次分析均可回看当时输入快照`;
+  if (!data.runs?.length) {
+    body.innerHTML = `<div class="ads-empty-inline"><strong>暂无分析历史</strong><span>完成第一次 AI 分析后会显示在这里。</span></div>`;
+    return;
+  }
+  const rows = data.runs.map(run => {
+    const goalText = run.goal?.text || "当时未设置调整目标";
+    const contextMeta = [run.context?.group ? `分组 ${adsGroupLabel(run.context.group)}` : "", run.context?.dataCutoff ? `数据截止 ${run.context.dataCutoff}` : "", run.context?.analysisWindowDays ? `分析 ${run.context.analysisWindowDays} 天` : ""].filter(Boolean).join(" · ");
+    const signals = (run.signals || []).slice(0, 5).map(signal => `<li class="${escapeHtml(signal.severity || "info")}">${escapeHtml(signal.summary || "")}</li>`).join("");
+    const analysis = run.analysisSummary
+      ? `<p>${escapeHtml(run.analysisSummary)}</p>${signals ? `<ul>${signals}</ul>` : ""}`
+      : `<p class="ads-ai-history-muted">${escapeHtml(run.error || (run.status === "RUNNING" ? "分析仍在进行中" : "本次分析没有可展示的总结"))}</p>`;
+    const recommendations = (run.recommendations || []).length
+      ? run.recommendations.map(item => `<div class="ads-ai-history-recommendation"><strong>${escapeHtml(adsAiActionLabel(item.actionType))}</strong><span class="ads-ai-history-action-status">${escapeHtml(adsAiStatusLabel(item.status))}</span><p>${escapeHtml(item.reason || "")}</p>${item.error ? `<small>错误：${escapeHtml(item.error)}</small>` : ""}</div>`).join("")
+      : `<p class="ads-ai-history-muted">本次没有建议行动</p>`;
+    return `<tbody class="ads-ai-history-run">
+      <tr>
+        <td rowspan="3" class="ads-ai-history-time"><strong>${escapeHtml(formatDate(run.startedAt || run.createdAt))}</strong><span>${escapeHtml(adsAiModelLabel(run.model))}</span><button type="button" data-ads-ai-snapshot="${escapeHtml(run.id)}" ${run.snapshotAvailable ? "" : "disabled"}>查看当时快照</button></td>
+        <td><div class="ads-ai-history-cell"><strong>调整目标与建议</strong><p>${escapeHtml(goalText)}</p>${contextMeta ? `<small>${escapeHtml(contextMeta)}</small>` : ""}</div></td>
+        <td rowspan="3" class="ads-ai-history-status"><span class="${String(run.status || "").toLowerCase()}">${escapeHtml(adsAiHistoryRunStatus(run.status))}</span>${run.completedAt ? `<small>${escapeHtml(formatDate(run.completedAt))}</small>` : ""}</td>
+      </tr>
+      <tr><td><div class="ads-ai-history-cell"><strong>AI 分析</strong>${analysis}</div></td></tr>
+      <tr><td><div class="ads-ai-history-cell"><strong>建议行动</strong>${recommendations}</div></td></tr>
+    </tbody>`;
+  }).join("");
+  body.innerHTML = `<div class="ads-ai-history-table-wrap"><table class="ads-ai-history-table"><thead><tr><th>分析时间</th><th>分析内容</th><th>状态</th></tr></thead>${rows}</table></div><section id="adsAiHistorySnapshot" class="ads-ai-history-snapshot" hidden></section>`;
+}
+
+async function openAdsAiHistoryDialog(keywordId) {
+  const dialog = $("#adsAiHistoryDialog");
+  $("#adsAiHistoryBody").innerHTML = `<div class="ads-history-loading">正在读取分析历史…</div>`;
+  dialog.showModal();
+  const data = await api(`/api/ads/keywords/${keywordId}/ai/history?limit=30`);
+  if (!dialog.open || currentAdsKeyword()?.id !== keywordId) return;
+  renderAdsAiHistory(data);
+}
+
+function renderAdsAiSnapshot(data) {
+  const input = data.input || {};
+  const context = input.context || {};
+  const state = input.currentState || {};
+  const currency = context.currency || adsWorkspace.profile?.currencyCode || "USD";
+  const summary = input.performanceSummary?.last30Days || {};
+  const campaigns = state.campaigns || [];
+  const units = state.adUnits || [];
+  const inventory = state.inventory || {};
+  const snapshot = $("#adsAiHistorySnapshot");
+  if (!snapshot) return;
+  snapshot.hidden = false;
+  snapshot.innerHTML = `<div class="ads-ai-snapshot-head"><div><strong>当时输入快照</strong><span>${escapeHtml(data.run?.keyword || "")} · 数据截止 ${escapeHtml(context.dataCutoff || "-")}</span></div><button type="button" data-close-ads-ai-snapshot>收起</button></div>
+    <div class="ads-ai-snapshot-metrics">
+      <div><span>曝光</span><strong>${formatNumber(summary.impressions || 0)}</strong></div><div><span>点击</span><strong>${formatNumber(summary.clicks || 0)}</strong></div><div><span>订单</span><strong>${formatNumber(summary.orders || 0)}</strong></div><div><span>花费</span><strong>${asMoney(summary.spend || 0, currency)}</strong></div><div><span>销售额</span><strong>${asMoney(summary.sales || 0, currency)}</strong></div><div><span>ACOS</span><strong>${adsPercent(summary.acos)}</strong></div>
+    </div>
+    <div class="ads-ai-snapshot-grid"><section><strong>当时 Campaign 设置</strong>${campaigns.length ? `<div class="ads-ai-snapshot-table-wrap"><table><thead><tr><th>匹配</th><th>预算</th><th>顶部</th><th>其余</th><th>商品页</th><th>状态</th></tr></thead><tbody>${campaigns.map(item => `<tr><td>${escapeHtml(adsMatchLabel(item.matchType))}</td><td>${asMoney(item.dailyBudget, currency)}</td><td>${formatNumber(item.topOfSearchAdjustment)}%</td><td>${formatNumber(item.restOfSearchAdjustment)}%</td><td>${formatNumber(item.productPageAdjustment)}%</td><td>${escapeHtml(adsStateLabel(item.state))}</td></tr>`).join("")}</tbody></table></div>` : `<p>无 Campaign 数据</p>`}</section>
+      <section><strong>当时出价与库存</strong>${units.length ? `<div class="ads-ai-snapshot-table-wrap"><table><thead><tr><th>子 ASIN</th><th>匹配对象</th><th>出价</th><th>状态</th></tr></thead><tbody>${units.map(item => `<tr><td>${escapeHtml(item.childAsin || "-")}</td><td>${escapeHtml(item.sellerSku || "-")}</td><td>${asMoney(item.bid, currency)}</td><td>${escapeHtml(adsStateLabel(item.state))}</td></tr>`).join("")}</tbody></table></div>` : `<p>无投放单元数据</p>`}<small>库存状态：${escapeHtml(inventory.status || "未知")} · 安全线 ${formatNumber(inventory.safetyDays || 0)} 天</small></section></div>
+    <details class="ads-ai-snapshot-raw"><summary>查看完整 JSON 快照</summary><pre>${escapeHtml(JSON.stringify(input, null, 2))}</pre></details>`;
+  snapshot.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function loadAdsAiSnapshot(runId, button) {
+  setBusy(button, true, "读取中");
+  try {
+    renderAdsAiSnapshot(await api(`/api/ads/ai/runs/${encodeURIComponent(runId)}`));
+  } finally {
+    setBusy(button, false, "查看当时快照");
+  }
 }
 
 async function saveAdsAiStrategy(button) {
@@ -4074,6 +4292,7 @@ async function loadAdsWorkspace(options = {}) {
   if (workspaceData.range) {
     if ($("#adsStartDate") && !$("#adsStartDate").value) $("#adsStartDate").value = workspaceData.range.startDate;
     if ($("#adsEndDate") && !$("#adsEndDate").value) $("#adsEndDate").value = workspaceData.range.endDate;
+    updateAdsDateRangeInput();
   }
   renderAdsWorkspace();
 }
@@ -4544,8 +4763,14 @@ $("#fbaReplenishmentToggleBtn").addEventListener("click", async () => {
 $("#adsAuthBtn").addEventListener("click", authorizeAds);
 $("#adsRefreshBtn").addEventListener("click", () => refreshAds().catch(error => alert(error.message)));
 $("#adsProfileSelect").addEventListener("change", event => selectAdsProfile(event.target.value).catch(error => alert(error.message)));
+$("#adsDateRange").addEventListener("click", () => openAdsDatePicker());
 $("#adsSyncBtn").addEventListener("click", syncAdsPerformance);
 $("#adsAddKeywordBtn").addEventListener("click", openAdsKeywordDialog);
+$("#saveSystemSchedulesBtn").addEventListener("click", event => saveSystemSchedules(event.currentTarget).catch(error => alert(error.message)));
+$("#systemScheduleList").addEventListener("change", event => {
+  const card = event.target.closest("[data-system-schedule]");
+  if (card && event.target.matches("[data-system-schedule-enabled]")) card.classList.toggle("enabled", event.target.checked);
+});
 $("#adsKeywordSearch").addEventListener("input", renderAdsKeywordRows);
 $("#adsKeywordForm").addEventListener("submit", saveAdsKeywordDraft);
 $("#adsProductTabs").addEventListener("click", event => {
@@ -4645,6 +4870,11 @@ $("#adsDetailPanel").addEventListener("click", event => {
   const strategyButton = event.target.closest("[data-ads-ai-strategy]");
   if (strategyButton) {
     openAdsAiStrategyDialog().catch(error => alert(error.message));
+    return;
+  }
+  const historyButton = event.target.closest("[data-ads-ai-history]");
+  if (historyButton) {
+    openAdsAiHistoryDialog(selectedAdsKeywordId).catch(error => alert(error.message));
     return;
   }
   const saveGoalButton = event.target.closest("[data-ads-ai-save-goal]");
@@ -4816,7 +5046,19 @@ $("#adsDiscardPlanPreviewBtn").addEventListener("click", event => discardAdsCrea
 document.querySelectorAll("[data-close-ads-dialog]").forEach(button => button.addEventListener("click", () => $("#adsKeywordDialog").close()));
 document.querySelectorAll("[data-close-ads-preview]").forEach(button => button.addEventListener("click", () => $("#adsPreviewDialog").close()));
 document.querySelectorAll("[data-close-ads-ai-strategy]").forEach(button => button.addEventListener("click", () => $("#adsAiStrategyDialog").close()));
+document.querySelectorAll("[data-close-ads-ai-history]").forEach(button => button.addEventListener("click", () => $("#adsAiHistoryDialog").close()));
 $("#adsAiSaveStrategyBtn").addEventListener("click", event => saveAdsAiStrategy(event.currentTarget).catch(error => alert(error.message)));
+$("#adsAiHistoryBody").addEventListener("click", event => {
+  const snapshotButton = event.target.closest("[data-ads-ai-snapshot]");
+  if (snapshotButton) {
+    loadAdsAiSnapshot(snapshotButton.dataset.adsAiSnapshot, snapshotButton).catch(error => alert(error.message));
+    return;
+  }
+  if (event.target.closest("[data-close-ads-ai-snapshot]")) {
+    const snapshot = $("#adsAiHistorySnapshot");
+    if (snapshot) snapshot.hidden = true;
+  }
+});
 $("#adsAiStrategyBody").addEventListener("change", event => {
   const input = event.target.closest("input[name=adsAiApprovalMode]");
   if (!input) return;
@@ -5121,6 +5363,44 @@ $("#fbaDatePicker").addEventListener("click", event => {
 $("#fbaDatePicker").addEventListener("pointerdown", event => {
   event.stopPropagation();
 });
+$("#adsDatePicker").addEventListener("click", event => {
+  event.stopPropagation();
+  const nav = event.target?.closest?.("[data-ads-date-nav]")?.dataset?.adsDateNav;
+  if (nav) {
+    adsDatePickerMonth = shiftMonth(adsDatePickerMonth, Number(nav));
+    renderAdsDatePicker();
+    return;
+  }
+  const quickType = event.target?.closest?.("[data-ads-date-quick]")?.dataset?.adsDateQuick;
+  if (quickType) {
+    const range = quickDateRange(quickType);
+    $("#adsStartDate").value = range.startDate;
+    $("#adsEndDate").value = range.endDate;
+    adsDatePickerMonth = range.endDate.slice(0, 7);
+    updateAdsDateRangeInput();
+    closeAdsDatePicker();
+    return;
+  }
+  const dayButton = event.target?.closest?.("[data-ads-date]");
+  const date = dayButton?.dataset?.adsDate;
+  if (!date || !adsDatePickerOpen || dayButton?.disabled || isDateDisabled(date)) return;
+  const startInput = $("#adsStartDate");
+  const endInput = $("#adsEndDate");
+  const startDate = startInput?.value || "";
+  const endDate = endInput?.value || "";
+  if (!startDate || endDate || date < startDate) {
+    startInput.value = date;
+    endInput.value = "";
+    adsDatePickerMonth = date.slice(0, 7);
+    updateAdsDateRangeInput();
+    renderAdsDatePicker();
+    return;
+  }
+  endInput.value = date;
+  updateAdsDateRangeInput();
+  closeAdsDatePicker();
+});
+$("#adsDatePicker").addEventListener("pointerdown", event => event.stopPropagation());
 $("#adsHistoryDatePicker").addEventListener("click", event => {
   event.stopPropagation();
   const nav = event.target?.closest?.("[data-ads-history-date-nav]")?.dataset?.adsHistoryDateNav;
@@ -5571,6 +5851,12 @@ document.addEventListener("click", event => {
   if (!picker || picker.hidden) return;
   if (picker.contains(event.target) || event.target?.id === "salesDateRange") return;
   closeDatePicker();
+});
+document.addEventListener("click", event => {
+  const picker = $("#adsDatePicker");
+  if (!picker || picker.hidden) return;
+  if (picker.contains(event.target) || event.target?.id === "adsDateRange") return;
+  closeAdsDatePicker();
 });
 document.addEventListener("click", event => {
   const picker = $("#adsHistoryDatePicker");

@@ -20,12 +20,23 @@ const ADS_TOKEN_PATH = join(DATA_DIR, "ads-token.json");
 const ADS_PROFILE_PATH = join(DATA_DIR, "ads-profile.json");
 const ADS_MANAGED_PORTFOLIO_NAME = "AmzAllBlue_ERP";
 const ADS_AI_PROMPT_VERSION = "ads-ai-v1";
+const ADS_AI_SCHEDULE_TIME_ZONE = "Asia/Shanghai";
 const ADS_AI_ACTION_TYPES = new Set([
   "NO_ACTION", "CHANGE_BID", "CHANGE_PLACEMENT_ADJUSTMENT", "CHANGE_DAILY_BUDGET",
   "PAUSE_CAMPAIGN", "RESUME_CAMPAIGN", "MOVE_GROUP", "REQUEST_MORE_DATA"
 ]);
 const ADS_AI_GROUPS = new Set(["NORMAL", "PROMOTED", "STABLE"]);
 const ADS_AI_APPROVAL_MODES = new Set(["MANUAL", "RISK_ONLY", "AUTO_ALL"]);
+const SYSTEM_SCHEDULE_TIME_ZONE = "Asia/Shanghai";
+const SYSTEM_SCHEDULE_TASKS = Object.freeze({
+  FBA_TODAY_SALES: { label: "FBA 当日销量", type: "INTERVAL", enabled: true, intervalMinutes: 60, minInterval: 15, description: "请求 SP-API 当日销量，并更新 FBA 日销量事实数据。" },
+  FBA_CURRENT_INVENTORY: { label: "FBA 当前库存", type: "INTERVAL", enabled: true, intervalMinutes: 360, minInterval: 60, description: "请求 SP-API 当前库存和商品资料，更新当天库存快照。" },
+  FBA_HISTORY_BACKFILL: { label: "FBA 历史数据补齐", type: "DAILY", enabled: true, time: "16:30", description: "补齐最近 30 天库存与销量缺口；已冻结的历史库存不会被覆盖。" },
+  ADS_TODAY_PERFORMANCE: { label: "广告当日表现", type: "INTERVAL", enabled: true, intervalMinutes: 60, minInterval: 5, description: "请求 Amazon Ads 当日曝光、点击、花费、订单和销售额，并记录当天最新广告设置。" },
+  ADS_ROLLING_PERFORMANCE: { label: "广告近 30 天回补", type: "DAILY", enabled: true, time: "16:45", description: "重新请求最近 30 天广告日报，校正 Amazon 延迟归因的数据。" },
+  SIF_KEYWORD_DATA: { label: "关键词排名与建议竞价", type: "DAILY", enabled: true, time: "10:15", description: "请求 SIF 关键词自然位、广告位和建议竞价，保存每日历史。" },
+  ADS_AI_ANALYSIS: { label: "广告 AI 批量分析", type: "DAILY", enabled: false, time: "09:00", description: "批量分析所有已设置调整目标的关键词，保存 AI 分析与建议行动。" }
+});
 const SECRET_KEYS = {
   gmailToken: "gmail_token",
   adsToken: "amazon_ads_token",
@@ -52,6 +63,7 @@ let adsHourlySyncTimer = null;
 let adsRollingSyncTimer = null;
 let sifDailySyncTimer = null;
 let adsAiDailyScheduleTimer = null;
+let systemScheduleTimer = null;
 const adsAiAnalysisJobs = new Map();
 
 function loadEnvFile() {
@@ -418,6 +430,39 @@ async function ensureAdsMysqlSchema(pool) {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_ad_unit_settings_daily (
+      date DATE NOT NULL,
+      ad_unit_id BIGINT UNSIGNED NOT NULL,
+      bid DECIMAL(14, 2) NOT NULL,
+      desired_state VARCHAR(16) NOT NULL,
+      amazon_state VARCHAR(16) NULL,
+      captured_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (ad_unit_id, date),
+      KEY idx_ads_ad_unit_settings_daily_date (date),
+      CONSTRAINT fk_ads_ad_unit_settings_daily_unit FOREIGN KEY (ad_unit_id) REFERENCES ads_ad_units (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ads_campaign_settings_daily (
+      date DATE NOT NULL,
+      campaign_id BIGINT UNSIGNED NOT NULL,
+      daily_budget DECIMAL(14, 2) NOT NULL,
+      top_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      rest_of_search_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      product_page_adjustment INT UNSIGNED NOT NULL DEFAULT 0,
+      desired_state VARCHAR(16) NOT NULL,
+      amazon_state VARCHAR(16) NULL,
+      captured_at DATETIME NOT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (campaign_id, date),
+      KEY idx_ads_campaign_settings_daily_date (date),
+      CONSTRAINT fk_ads_campaign_settings_daily_campaign FOREIGN KEY (campaign_id) REFERENCES ads_campaigns (id) ON UPDATE RESTRICT ON DELETE RESTRICT
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS ads_sync_jobs (
       id VARCHAR(64) NOT NULL,
       profile_id VARCHAR(64) NOT NULL,
@@ -738,6 +783,23 @@ async function ensureAppMysqlSchema() {
       PRIMARY KEY (secret_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS system_schedule_settings (
+      task_key VARCHAR(64) NOT NULL,
+      enabled TINYINT(1) NOT NULL DEFAULT 1,
+      schedule_type VARCHAR(16) NOT NULL,
+      time_beijing CHAR(5) NULL,
+      interval_minutes INT UNSIGNED NULL,
+      last_run_key VARCHAR(32) NULL,
+      last_started_at DATETIME NULL,
+      last_completed_at DATETIME NULL,
+      last_status VARCHAR(16) NULL,
+      last_error TEXT NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      PRIMARY KEY (task_key)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
   await ensureAdsMysqlSchema(pool);
   appMysqlSchemaReady = true;
   return true;
@@ -808,6 +870,74 @@ async function writeAppSecret(secretKey, value) {
 async function deleteAppSecret(secretKey) {
   await ensureAppMysqlSchema();
   await getMysqlPool().query("DELETE FROM app_secrets WHERE secret_key = ?", [secretKey]);
+}
+
+async function ensureSystemScheduleDefaults() {
+  const pool = getMysqlPool();
+  const envEnabled = value => !["0", "false"].includes(String(value || "").toLowerCase());
+  for (const [taskKey, task] of Object.entries(SYSTEM_SCHEDULE_TASKS)) {
+    let definition = task;
+    let enabled = task.enabled;
+    if (taskKey.startsWith("FBA_")) enabled = enabled && envEnabled(process.env.AMZ_FBA_SCHEDULE_ENABLED);
+    if (taskKey.startsWith("ADS_") && taskKey !== "ADS_AI_ANALYSIS") enabled = enabled && envEnabled(process.env.AMZ_ADS_SYNC_ENABLED);
+    if (taskKey === "SIF_KEYWORD_DATA") enabled = enabled && envEnabled(process.env.SIF_SYNC_ENABLED);
+    if (taskKey === "ADS_AI_ANALYSIS") {
+      const [strategyRows] = await pool.query("SELECT rules_payload FROM ads_ai_strategy_versions ORDER BY created_at DESC LIMIT 1");
+      const schedule = sanitizeAdsAiStrategyRules(parseMysqlJson(strategyRows[0]?.rules_payload)).schedule;
+      enabled = schedule.dailyBatchEnabled && envEnabled(process.env.ADS_AI_DAILY_ANALYSIS_ENABLED);
+      definition = { ...task, time: schedule.dailyBatchTime || task.time };
+    }
+    await pool.query(`
+      INSERT IGNORE INTO system_schedule_settings (task_key, enabled, schedule_type, time_beijing, interval_minutes)
+      VALUES (?, ?, ?, ?, ?)
+    `, [taskKey, enabled ? 1 : 0, definition.type, definition.time || null, definition.intervalMinutes || null]);
+  }
+}
+
+function mapSystemSchedule(row) {
+  const definition = SYSTEM_SCHEDULE_TASKS[row.task_key];
+  return {
+    key: row.task_key,
+    label: definition?.label || row.task_key,
+    description: definition?.description || "",
+    scheduleType: row.schedule_type,
+    enabled: Boolean(row.enabled),
+    timeBeijing: row.time_beijing || "",
+    intervalMinutes: Number(row.interval_minutes || 0),
+    minIntervalMinutes: Number(definition?.minInterval || 1),
+    lastRunKey: row.last_run_key || "",
+    lastStartedAt: row.last_started_at,
+    lastCompletedAt: row.last_completed_at,
+    lastStatus: row.last_status || "",
+    lastError: row.last_error || ""
+  };
+}
+
+async function readSystemSchedules() {
+  await ensureSystemScheduleDefaults();
+  const [rows] = await getMysqlPool().query("SELECT * FROM system_schedule_settings ORDER BY FIELD(task_key, 'FBA_TODAY_SALES','FBA_CURRENT_INVENTORY','FBA_HISTORY_BACKFILL','ADS_TODAY_PERFORMANCE','ADS_ROLLING_PERFORMANCE','SIF_KEYWORD_DATA','ADS_AI_ANALYSIS')");
+  return { timeZone: SYSTEM_SCHEDULE_TIME_ZONE, tasks: rows.filter(row => SYSTEM_SCHEDULE_TASKS[row.task_key]).map(mapSystemSchedule) };
+}
+
+async function updateSystemSchedules(input = {}) {
+  await ensureSystemScheduleDefaults();
+  const pool = getMysqlPool();
+  const tasks = Array.isArray(input.tasks) ? input.tasks : [];
+  for (const item of tasks) {
+    const taskKey = String(item.key || "");
+    const definition = SYSTEM_SCHEDULE_TASKS[taskKey];
+    if (!definition) continue;
+    if (definition.type === "DAILY") {
+      const time = String(item.timeBeijing || definition.time || "");
+      if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error(`${definition.label}的执行时间不合法`);
+      await pool.query("UPDATE system_schedule_settings SET enabled = ?, time_beijing = ?, schedule_type = 'DAILY' WHERE task_key = ?", [item.enabled ? 1 : 0, time, taskKey]);
+    } else {
+      const interval = Math.max(Number(definition.minInterval || 1), Math.round(Number(item.intervalMinutes || definition.intervalMinutes)));
+      if (!Number.isFinite(interval)) throw new Error(`${definition.label}的执行间隔不合法`);
+      await pool.query("UPDATE system_schedule_settings SET enabled = ?, interval_minutes = ?, schedule_type = 'INTERVAL' WHERE task_key = ?", [item.enabled ? 1 : 0, interval, taskKey]);
+    }
+  }
+  return readSystemSchedules();
 }
 
 function parseSifCurl(curlText) {
@@ -1700,6 +1830,7 @@ function defaultAdsAiStrategyRules() {
     globalLimits: {
       requireManualConfirmation: true,
       analysisWindowDays: 30,
+      recentAiHistoryDays: 7,
       minObservationDays: 3,
       maxBid: 5,
       maxBidChangeAmount: 0.2,
@@ -1760,6 +1891,7 @@ function sanitizeAdsAiStrategyRules(value) {
     globalLimits: {
       requireManualConfirmation: true,
       analysisWindowDays: Math.round(adsAiNumber(sourceLimits.analysisWindowDays, limits.analysisWindowDays, 7, 90)),
+      recentAiHistoryDays: Math.round(adsAiNumber(sourceLimits.recentAiHistoryDays, limits.recentAiHistoryDays, 0, 30)),
       minObservationDays: Math.round(adsAiNumber(sourceLimits.minObservationDays, limits.minObservationDays, 1, 30)),
       maxBid: adsAiNumber(sourceLimits.maxBid, limits.maxBid, 0.02, 100),
       maxBidChangeAmount: adsAiNumber(sourceLimits.maxBidChangeAmount, limits.maxBidChangeAmount, 0.01, 20),
@@ -6979,8 +7111,8 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     GROUP BY p.date, p.placement
     ORDER BY p.date
   `, placementParams);
-  const settingWhere = ["c.keyword_id = ?", "c.profile_id = ?"];
-  const settingParams = [keywordId, String(profile.profileId)];
+  const settingWhere = ["c.keyword_id = ?", "c.profile_id = ?", "s.date BETWEEN ? AND ?"];
+  const settingParams = [keywordId, String(profile.profileId), startDate, endDate];
   if (childAsin !== "ALL") {
     settingWhere.push("u.child_asin = ?");
     settingParams.push(childAsin);
@@ -6990,13 +7122,15 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     settingParams.push(matchType);
   }
   const [bidRows] = await pool.query(`
-    SELECT AVG(u.bid) bid, MIN(c.start_date) effective_date
-    FROM ads_ad_units u
+    SELECT s.date, AVG(s.bid) bid
+    FROM ads_ad_unit_settings_daily s
+    JOIN ads_ad_units u ON u.id = s.ad_unit_id
     JOIN ads_campaigns c ON c.id = u.campaign_id
     WHERE ${settingWhere.join(" AND ")}
+    GROUP BY s.date ORDER BY s.date
   `, settingParams);
-  const campaignWhere = ["c.keyword_id = ?", "c.profile_id = ?"];
-  const campaignParams = [keywordId, String(profile.profileId)];
+  const campaignWhere = ["c.keyword_id = ?", "c.profile_id = ?", "s.date BETWEEN ? AND ?"];
+  const campaignParams = [keywordId, String(profile.profileId), startDate, endDate];
   if (matchType !== "ALL") {
     campaignWhere.push("c.match_type = ?");
     campaignParams.push(matchType);
@@ -7006,19 +7140,21 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     campaignParams.push(childAsin);
   }
   const [adjustmentRows] = await pool.query(`
-    SELECT AVG(c.top_of_search_adjustment) top_of_search_adjustment,
-      AVG(c.rest_of_search_adjustment) rest_of_search_adjustment,
-      AVG(c.product_page_adjustment) product_page_adjustment,
-      MIN(c.start_date) effective_date
-    FROM ads_campaigns c
+    SELECT s.date, AVG(s.daily_budget) daily_budget, AVG(s.top_of_search_adjustment) top_of_search_adjustment,
+      AVG(s.rest_of_search_adjustment) rest_of_search_adjustment,
+      AVG(s.product_page_adjustment) product_page_adjustment
+    FROM ads_campaign_settings_daily s
+    JOIN ads_campaigns c ON c.id = s.campaign_id
     WHERE ${campaignWhere.join(" AND ")}
+    GROUP BY s.date ORDER BY s.date
   `, campaignParams);
-  const currentBid = Number(bidRows[0]?.bid || 0);
-  const currentTopAdjustment = Number(adjustmentRows[0]?.top_of_search_adjustment || 0);
-  const currentRestOfSearchAdjustment = Number(adjustmentRows[0]?.rest_of_search_adjustment || 0);
-  const currentProductPageAdjustment = Number(adjustmentRows[0]?.product_page_adjustment || 0);
-  const bidEffectiveDate = adsDateValue(bidRows[0]?.effective_date);
-  const adjustmentEffectiveDate = adsDateValue(adjustmentRows[0]?.effective_date);
+  const bidByDate = new Map(bidRows.map(row => [adsDateValue(row.date), Number(row.bid)]));
+  const adjustmentByDate = new Map(adjustmentRows.map(row => [adsDateValue(row.date), {
+    dailyBudget: Number(row.daily_budget),
+    top: Number(row.top_of_search_adjustment),
+    rest: Number(row.rest_of_search_adjustment),
+    product: Number(row.product_page_adjustment)
+  }]));
   const performanceByDate = new Map(performanceRows.map(row => [adsDateValue(row.date), row]));
   const rankByDate = new Map(rankRows.map(row => [adsDateValue(row.date), row]));
   const placementKey = value => {
@@ -7040,6 +7176,7 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
   const points = dates.map(date => {
     const row = performanceByDate.get(date);
     const rank = rankByDate.get(date);
+    const adjustments = adjustmentByDate.get(date);
     const placements = placementByDate.get(date) || {};
     const clicks = Number(row?.clicks || 0);
     const spend = Number(row?.spend || 0);
@@ -7063,10 +7200,11 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
     };
     return {
       date,
-      bid: bidEffectiveDate && date >= bidEffectiveDate ? currentBid : null,
-      topOfSearchAdjustment: adjustmentEffectiveDate && date >= adjustmentEffectiveDate ? currentTopAdjustment : null,
-      restOfSearchAdjustment: adjustmentEffectiveDate && date >= adjustmentEffectiveDate ? currentRestOfSearchAdjustment : null,
-      productPageAdjustment: adjustmentEffectiveDate && date >= adjustmentEffectiveDate ? currentProductPageAdjustment : null,
+      bid: bidByDate.has(date) ? bidByDate.get(date) : null,
+      dailyBudget: adjustments ? adjustments.dailyBudget : null,
+      topOfSearchAdjustment: adjustments ? adjustments.top : null,
+      restOfSearchAdjustment: adjustments ? adjustments.rest : null,
+      productPageAdjustment: adjustments ? adjustments.product : null,
       actualCpc: clicks > 0 ? spend / clicks : null,
       impressions: Number(row?.impressions || 0),
       clicks,
@@ -7093,6 +7231,14 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
 
 async function readLatestAdsAiStrategy(profileId) {
   const pool = getMysqlPool();
+  const applySystemSchedule = async rules => {
+    const [scheduleRows] = await pool.query("SELECT enabled, time_beijing FROM system_schedule_settings WHERE task_key = 'ADS_AI_ANALYSIS'");
+    if (scheduleRows[0]) {
+      rules.schedule.dailyBatchEnabled = Boolean(scheduleRows[0].enabled);
+      rules.schedule.dailyBatchTime = scheduleRows[0].time_beijing || rules.schedule.dailyBatchTime;
+    }
+    return rules;
+  };
   const [rows] = await pool.query(`
     SELECT version, rules_payload, created_at
     FROM ads_ai_strategy_versions
@@ -7100,9 +7246,10 @@ async function readLatestAdsAiStrategy(profileId) {
     ORDER BY version DESC LIMIT 1
   `, [String(profileId)]);
   if (rows[0]) {
+    const rules = await applySystemSchedule(sanitizeAdsAiStrategyRules(parseMysqlJson(rows[0].rules_payload)));
     return {
       version: Number(rows[0].version),
-      rules: sanitizeAdsAiStrategyRules(parseMysqlJson(rows[0].rules_payload)),
+      rules,
       createdAt: rows[0].created_at
     };
   }
@@ -7111,7 +7258,7 @@ async function readLatestAdsAiStrategy(profileId) {
     INSERT INTO ads_ai_strategy_versions (profile_id, version, rules_payload, created_by)
     VALUES (?, 1, CAST(? AS JSON), 'SYSTEM')
   `, [String(profileId), JSON.stringify(rules)]);
-  return { version: 1, rules, createdAt: new Date() };
+  return { version: 1, rules: await applySystemSchedule(rules), createdAt: new Date() };
 }
 
 async function saveAdsAiStrategy(body = {}) {
@@ -7128,6 +7275,11 @@ async function saveAdsAiStrategy(body = {}) {
       VALUES (?, ?, CAST(? AS JSON), 'USER')
     `, [String(profile.profileId), version, JSON.stringify(rules)]);
     await connection.commit();
+    await pool.query(`
+      INSERT INTO system_schedule_settings (task_key, enabled, schedule_type, time_beijing)
+      VALUES ('ADS_AI_ANALYSIS', ?, 'DAILY', ?)
+      ON DUPLICATE KEY UPDATE enabled = VALUES(enabled), time_beijing = VALUES(time_beijing)
+    `, [rules.schedule.dailyBatchEnabled ? 1 : 0, rules.schedule.dailyBatchTime]);
     return { version, rules };
   } catch (error) {
     await connection.rollback().catch(() => {});
@@ -7208,6 +7360,7 @@ async function buildAdsAiAnalysisInput(keywordId) {
   const strategy = await readLatestAdsAiStrategy(profile.profileId);
   const goal = await readAdsAiKeywordGoal(keyword.id, profile.profileId);
   const analysisWindowDays = Number(strategy.rules.globalLimits.analysisWindowDays || 30);
+  const recentAiHistoryDays = Number(strategy.rules.globalLimits.recentAiHistoryDays || 0);
   const historyDays = Math.max(30, analysisWindowDays);
   const analysisEndDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
   const history = await readAdsKeywordHistory(keyword.id, {
@@ -7263,14 +7416,56 @@ async function buildAdsAiAnalysisInput(keywordId) {
       WHERE m.country_code = ? AND m.normalized_keyword = ? AND m.asin IN (?)
     `, [String(profile.countryCode || "US").toUpperCase(), normalizeSifKeyword(keyword.keyword_text), monitorAsins]);
   }
-  const historyStart = addDays(history.range.endDate, -29);
-  const [recentRecommendationRows] = await pool.query(`
-    SELECT r.*, a.output_payload, a.completed_at analysis_completed_at
-    FROM ads_ai_recommendations r
-    JOIN ads_ai_analysis_runs a ON a.id = r.analysis_run_id
-    WHERE r.keyword_id = ? AND r.profile_id = ? AND r.created_at >= ?
-    ORDER BY r.created_at DESC LIMIT 50
-  `, [keyword.id, String(profile.profileId), `${historyStart} 00:00:00`]);
+  let recentAiHistory = [];
+  if (recentAiHistoryDays > 0) {
+    const recentAiHistoryStart = addDays(analysisEndDate, -(recentAiHistoryDays - 1));
+    // 批量分析时每个关键词仅保留最近 3 次压缩记录，避免 100 个关键词时把上下文无限放大。
+    const [recentRunRows] = await pool.query(`
+      SELECT id, status, model_name, output_payload, validation_error, started_at, completed_at
+      FROM ads_ai_analysis_runs
+      WHERE keyword_id = ? AND profile_id = ? AND started_at >= ? AND status IN ('COMPLETE', 'FAILED')
+      ORDER BY started_at DESC LIMIT 3
+    `, [keyword.id, String(profile.profileId), `${recentAiHistoryStart} 00:00:00`]);
+    const recentRunIds = recentRunRows.map(row => row.id);
+    const recommendationsByRun = new Map();
+    if (recentRunIds.length) {
+      const [recentRecommendationRows] = await pool.query(`
+        SELECT * FROM ads_ai_recommendations
+        WHERE analysis_run_id IN (?)
+        ORDER BY created_at DESC
+      `, [recentRunIds]);
+      for (const row of recentRecommendationRows) {
+        const key = String(row.analysis_run_id);
+        const list = recommendationsByRun.get(key) || [];
+        if (list.length >= 1) continue;
+        list.push({
+          actionType: row.action_type,
+          after: parseMysqlJson(row.after_payload) || {},
+          status: row.status,
+          reason: String(row.reason_text || "").trim().slice(0, 240),
+          risk: String(row.risk_text || "").trim().slice(0, 120),
+          confidence: Number(row.confidence || 0),
+          observeDays: Number(row.observe_days || 0),
+          error: String(row.last_error || "").trim().slice(0, 160)
+        });
+        recommendationsByRun.set(key, list);
+      }
+    }
+    recentAiHistory = recentRunRows.map(row => {
+      const output = parseMysqlJson(row.output_payload) || {};
+      return {
+        analyzedAt: row.completed_at || row.started_at,
+        status: row.status,
+        model: row.model_name || "",
+        analysisSummary: String(output.analysisSummary || "").trim().slice(0, 360),
+        signals: Array.isArray(output.signals)
+          ? output.signals.slice(0, 2).map(signal => ({ severity: signal.severity, summary: String(signal.summary || "").trim().slice(0, 120) }))
+          : [],
+        recommendations: recommendationsByRun.get(String(row.id)) || [],
+        error: String(row.validation_error || "").trim().slice(0, 200)
+      };
+    });
+  }
   const availablePoints = history.points.slice(-historyDays);
   const points = availablePoints.slice(-analysisWindowDays);
   const last7 = availablePoints.slice(-7);
@@ -7295,6 +7490,7 @@ async function buildAdsAiAnalysisInput(keywordId) {
       profileId: String(profile.profileId), countryCode: profile.countryCode || "US", currency: profile.currencyCode || "USD",
       keywordId: String(keyword.id), parentAsin: keyword.parent_asin, keyword: keyword.keyword_text,
       group: keyword.keyword_group, dataCutoff: history.range.endDate, analysisWindowDays,
+      recentAiHistoryDays,
       strategyVersion: strategy.version, promptVersion: ADS_AI_PROMPT_VERSION
     },
     strategy: { ...strategy.rules, keywordGoal: goal },
@@ -7326,18 +7522,77 @@ async function buildAdsAiAnalysisInput(keywordId) {
       }
     },
     dailyHistory: points,
-    recentAiHistory: recentRecommendationRows.map(row => ({
-      recommendationId: row.id, actionType: row.action_type, target: parseMysqlJson(row.target_payload) || {},
-      before: parseMysqlJson(row.before_payload), after: parseMysqlJson(row.after_payload), reason: row.reason_text,
-      risk: row.risk_text || "", confidence: Number(row.confidence || 0), observeDays: Number(row.observe_days || 0),
-      status: row.status, executionResult: parseMysqlJson(row.execution_result), error: row.last_error || "",
-      createdAt: row.created_at, executedAt: row.executed_at, reviewDueAt: row.review_due_at, reviewedAt: row.reviewed_at
-    }))
+    recentAiHistory: {
+      days: recentAiHistoryDays,
+      maxRuns: 3,
+      entries: recentAiHistory
+    }
   };
 }
 
 function adsAiApproxEqual(left, right) {
   return Math.abs(Number(left) - Number(right)) < 0.0001;
+}
+
+function buildAdsAiDeterministicPrecheck(input) {
+  const campaigns = Array.isArray(input.currentState?.campaigns) ? input.currentState.campaigns : [];
+  const adUnits = Array.isArray(input.currentState?.adUnits) ? input.currentState.adUnits : [];
+  const summary = input.performanceSummary?.last30Days || {};
+  const observeDays = Number(input.strategy?.globalLimits?.minObservationDays || 3);
+  if (!campaigns.length || !adUnits.length) {
+    return {
+      analysisSummary: "规则预判发现当前关键词没有完整的可分析广告对象。需要先完成或修复 Campaign 与投放单元的创建、同步和启用状态，再进行出价、预算或位置加价判断。",
+      signals: [{
+        code: "MISSING_AD_OBJECTS",
+        severity: "critical",
+        summary: "缺少有效 Campaign 或投放单元，当前无法形成可靠的广告调整建议。",
+        evidence: ["currentState.campaigns", "currentState.adUnits"]
+      }],
+      recommendations: [{
+        actionType: "REQUEST_MORE_DATA",
+        target: {}, before: {}, after: {},
+        reason: "请先确认 Campaign、Ad Group、Product Ad 和 Keyword Target 已创建成功、同步完成且具备投放资格，然后重新分析。",
+        risk: "在广告对象不完整时调整竞价或预算，可能无法生效，也无法根据表现验证结果。",
+        evidence: ["currentState.campaigns", "currentState.adUnits"],
+        confidence: 1,
+        observeDays
+      }]
+    };
+  }
+  const hasNoTraffic = ["impressions", "clicks", "spend", "orders", "units", "sales"]
+    .every(key => Number(summary[key] || 0) === 0);
+  if (!hasNoTraffic) return null;
+  const observedConfigurationDays = (Array.isArray(input.dailyHistory) ? input.dailyHistory : []).filter(point =>
+    [point.bid, point.topOfSearchAdjustment, point.restOfSearchAdjustment, point.productPageAdjustment]
+      .some(value => value !== null && value !== undefined)
+  ).length;
+  // 零流量但已满足最短观察期时仍交给 AI，让模型结合建议竞价、排名和投放资格判断是否应该调整。
+  if (observedConfigurationDays >= observeDays) return null;
+  return {
+    analysisSummary: `规则预判发现最近 30 天没有广告曝光、点击、花费、订单或销售额，且当前配置只观察到 ${observedConfigurationDays} 天，尚未达到最短 ${observeDays} 天观察期。当前无法评价 CTR、CPC、转化率与 ACOS，应先排查投放资格并继续观察。`,
+    signals: [{
+      code: "NO_AD_TRAFFIC",
+      severity: "warning",
+        summary: `最近 30 天全部广告表现指标为 0，当前配置观察 ${observedConfigurationDays}/${observeDays} 天。`,
+        evidence: ["performanceSummary.last30Days", "dailyHistory"]
+    }],
+    recommendations: [{
+      actionType: "REQUEST_MORE_DATA",
+      target: {}, before: {}, after: {},
+        reason: `请确认活动、广告组、商品广告和关键词均具备投放资格，商品可售并拥有 Buy Box，预算未受限，关键词未受审核或相关性限制；至少完成 ${observeDays} 天观察后再判断是否调整竞价和位置加价。`,
+      risk: "在零流量原因未排除前直接提高竞价或位置加价，可能无法解决曝光问题，或在恢复投放后放大无效花费。",
+      evidence: ["performanceSummary.last30Days", "dailyHistory", "currentState.campaigns", "currentState.adUnits"],
+      confidence: 0.99,
+      observeDays
+    }]
+  };
+}
+
+async function executeAdsAiDeterministicPrecheckRun(runId, input, rawOutput) {
+  await getMysqlPool().query("UPDATE ads_ai_analysis_runs SET model_name = 'RULE_ENGINE' WHERE id = ?", [runId]);
+  const output = validateAdsAiOutput(rawOutput, input);
+  await persistAdsAiAnalysisOutput(runId, input, output);
+  return output;
 }
 
 function isAdsAiJsonObject(value) {
@@ -7567,7 +7822,7 @@ async function executeAdsAiAnalysisRun(runId, input) {
     const content = await callOpenAI([
       {
         role: "system",
-        content: `你是 Amazon Ads 关键词投放分析器。只能根据输入 JSON 和策略规则判断，不得虚构数据。所有真实调整都必须人工确认。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{\"analysisSummary\":\"string\",\"signals\":[{\"code\":\"string\",\"severity\":\"info|warning|critical\",\"summary\":\"string\",\"evidence\":[\"输入字段路径\"]}],\"recommendations\":[{\"actionType\":\"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION\",\"target\":{\"keywordId\":\"string 可选\",\"campaignId\":\"string 可选\",\"adUnitId\":\"string 可选\"},\"before\":{},\"after\":{},\"reason\":\"string\",\"risk\":\"string\",\"evidence\":[\"输入字段路径\"],\"confidence\":0.0,\"observeDays\":3}]}\n必须使用输入中真实存在的本地 ID。CHANGE_BID 使用 before/after.bid；位置加价使用 topOfSearchAdjustment/restOfSearchAdjustment/productPageAdjustment；预算使用 dailyBudget；启停使用 state；分组使用 group。若证据不足，返回 REQUEST_MORE_DATA 或空 recommendations。`
+        content: `你是 Amazon Ads 关键词投放分析器。只能根据输入 JSON 和策略规则判断，不得虚构数据。所有真实调整都必须人工确认。若 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{\"analysisSummary\":\"string\",\"signals\":[{\"code\":\"string\",\"severity\":\"info|warning|critical\",\"summary\":\"string\",\"evidence\":[\"输入字段路径\"]}],\"recommendations\":[{\"actionType\":\"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION\",\"target\":{\"keywordId\":\"string 可选\",\"campaignId\":\"string 可选\",\"adUnitId\":\"string 可选\"},\"before\":{},\"after\":{},\"reason\":\"string\",\"risk\":\"string\",\"evidence\":[\"输入字段路径\"],\"confidence\":0.0,\"observeDays\":3}]}\n必须使用输入中真实存在的本地 ID。CHANGE_BID 使用 before/after.bid；位置加价使用 topOfSearchAdjustment/restOfSearchAdjustment/productPageAdjustment；预算使用 dailyBudget；启停使用 state；分组使用 group。若证据不足，返回 REQUEST_MORE_DATA 或空 recommendations。`
       },
       { role: "user", content: JSON.stringify(input) }
     ], true);
@@ -7619,7 +7874,10 @@ async function startAdsAiAnalysis(keywordId) {
   if (runningRows[0]) return readAdsAiKeywordState(keyword.id, runningRows[0].id);
 
   const run = await createAdsAiAnalysisRun(keyword.id);
-  const job = executeAdsAiAnalysisRun(run.runId, run.input)
+  const precheck = buildAdsAiDeterministicPrecheck(run.input);
+  const job = (precheck
+    ? executeAdsAiDeterministicPrecheckRun(run.runId, run.input, precheck)
+    : executeAdsAiAnalysisRun(run.runId, run.input))
     .catch(error => console.error(`AI analysis ${run.runId} failed: ${error.message}`))
     .finally(() => adsAiAnalysisJobs.delete(String(keyword.id)));
   adsAiAnalysisJobs.set(String(keyword.id), job);
@@ -7630,9 +7888,14 @@ async function expireStaleAdsAiAnalysisRuns(profileId, keywordId = null) {
   const timeoutMinutes = Math.max(5, Number(process.env.ADS_AI_RUNNING_TIMEOUT_MINUTES || 15));
   const where = ["profile_id = ?", "status = 'RUNNING'", "started_at < DATE_SUB(NOW(), INTERVAL ? MINUTE)"];
   const params = [String(profileId), timeoutMinutes];
+  const activeKeywordIds = [...adsAiAnalysisJobs.keys()].map(String);
   if (keywordId !== null) {
+    if (activeKeywordIds.includes(String(keywordId))) return;
     where.push("keyword_id = ?");
     params.push(keywordId);
+  } else if (activeKeywordIds.length) {
+    where.push("keyword_id NOT IN (?)");
+    params.push(activeKeywordIds);
   }
   await getMysqlPool().query(`
     UPDATE ads_ai_analysis_runs
@@ -7647,7 +7910,7 @@ async function executeAdsAiBatchAnalysisRuns(runs) {
     const content = await callOpenAI([
       {
         role: "system",
-        content: `你是 Amazon Ads 每日批量关键词投放分析器。只能根据每个关键词各自的输入 JSON 和策略规则判断，不得在关键词之间混用数据。所有真实调整都必须人工确认。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{"results":[{"keywordId":"输入中的 keywordId","analysisSummary":"string","signals":[{"code":"string","severity":"info|warning|critical","summary":"string","evidence":["输入字段路径"]}],"recommendations":[{"actionType":"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION","target":{},"before":{},"after":{},"reason":"string","risk":"string","evidence":["输入字段路径"],"confidence":0.0,"observeDays":3}]}]}\n每个输入关键词必须恰好返回一个同 keywordId 的结果。必须使用输入中真实存在的本地 ID。证据不足时返回 REQUEST_MORE_DATA 或空 recommendations。`
+        content: `你是 Amazon Ads 每日批量关键词投放分析器。只能根据每个关键词各自的输入 JSON 和策略规则判断，不得在关键词之间混用数据。所有真实调整都必须人工确认。若某关键词的 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{"results":[{"keywordId":"输入中的 keywordId","analysisSummary":"string","signals":[{"code":"string","severity":"info|warning|critical","summary":"string","evidence":["输入字段路径"]}],"recommendations":[{"actionType":"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION","target":{},"before":{},"after":{},"reason":"string","risk":"string","evidence":["输入字段路径"],"confidence":0.0,"observeDays":3}]}]}\n每个输入关键词必须恰好返回一个同 keywordId 的结果。必须使用输入中真实存在的本地 ID。证据不足时返回 REQUEST_MORE_DATA 或空 recommendations。`
       },
       { role: "user", content: JSON.stringify({ analyses: runs.map(run => run.input) }) }
     ], true);
@@ -7675,6 +7938,7 @@ async function executeAdsAiBatchAnalysisRuns(runs) {
         const { keywordId, ...rawKeywordOutput } = result;
         const output = validateAdsAiOutput(rawKeywordOutput, run.input);
         await persistAdsAiAnalysisOutput(run.runId, run.input, output);
+        await autoExecuteAdsAiRecommendations(run.runId, run.input);
         completed.push({ keywordId, runId: run.runId, status: "COMPLETE" });
       } catch (error) {
         await failAdsAiAnalysisRun(run.runId, result || outputForAudit, error);
@@ -7688,10 +7952,105 @@ async function executeAdsAiBatchAnalysisRuns(runs) {
   }
 }
 
+function splitAdsAiBatchRuns(runs) {
+  const maxKeywords = Math.round(adsAiNumber(process.env.ADS_AI_BATCH_MAX_KEYWORDS, 5, 1, 10));
+  const maxInputChars = Math.round(adsAiNumber(process.env.ADS_AI_BATCH_MAX_INPUT_CHARS, 90_000, 30_000, 500_000));
+  const chunks = [];
+  let current = [];
+  let currentChars = 32;
+  for (const run of runs) {
+    const inputChars = JSON.stringify(run.input).length + 2;
+    if (current.length && (current.length >= maxKeywords || currentChars + inputChars > maxInputChars)) {
+      chunks.push({ runs: current, inputChars: currentChars });
+      current = [];
+      currentChars = 32;
+    }
+    current.push(run);
+    currentChars += inputChars;
+  }
+  if (current.length) chunks.push({ runs: current, inputChars: currentChars });
+  return { chunks, limits: { maxKeywords, maxInputChars } };
+}
+
+async function executeChunkedAdsAiBatchAnalysisRuns(runs) {
+  const precheckedRuns = [];
+  const modelRuns = [];
+  for (const run of runs) {
+    const precheck = buildAdsAiDeterministicPrecheck(run.input);
+    if (precheck) precheckedRuns.push({ ...run, precheck });
+    else modelRuns.push(run);
+  }
+  const results = [];
+  const chunkResults = [];
+  for (const run of precheckedRuns) {
+    try {
+      await executeAdsAiDeterministicPrecheckRun(run.runId, run.input, run.precheck);
+      results.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "COMPLETE", source: "RULE_ENGINE" });
+    } catch (error) {
+      await failAdsAiAnalysisRun(run.runId, run.precheck, error).catch(() => {});
+      results.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "FAILED", source: "RULE_ENGINE", error: error.message });
+    }
+  }
+  const plan = splitAdsAiBatchRuns(modelRuns);
+  for (let index = 0; index < plan.chunks.length; index += 1) {
+    const chunk = plan.chunks[index];
+    const keywordIds = chunk.runs.map(run => run.input.context.keywordId);
+    try {
+      const result = await executeAdsAiBatchAnalysisRuns(chunk.runs);
+      results.push(...result.results.map(item => ({ ...item, source: "CCAI", chunk: index + 1 })));
+      const chunkFailedCount = result.results.filter(item => item.status === "FAILED").length;
+      chunkResults.push({
+        index: index + 1,
+        status: chunkFailedCount ? (chunkFailedCount === result.results.length ? "FAILED" : "PARTIAL") : "COMPLETE",
+        keywordIds,
+        inputChars: chunk.inputChars,
+        failedCount: chunkFailedCount,
+        output: result.rawOutput
+      });
+    } catch (error) {
+      const failed = chunk.runs.map(run => ({
+        keywordId: run.input.context.keywordId, runId: run.runId, status: "FAILED", source: "CCAI", chunk: index + 1, error: error.message
+      }));
+      results.push(...failed);
+      chunkResults.push({ index: index + 1, status: "FAILED", keywordIds, inputChars: chunk.inputChars, error: error.message });
+    }
+  }
+  const completeCount = results.filter(item => item.status === "COMPLETE").length;
+  const failedCount = results.length - completeCount;
+  return {
+    status: failedCount === 0 ? "COMPLETE" : completeCount > 0 ? "PARTIAL" : "FAILED",
+    summary: {
+      keywordCount: runs.length,
+      ruleEngineCount: precheckedRuns.length,
+      ccaiKeywordCount: modelRuns.length,
+      ccaiChunkCount: plan.chunks.length,
+      completeCount,
+      failedCount,
+      limits: plan.limits
+    },
+    results,
+    chunks: chunkResults
+  };
+}
+
 async function startDailyAdsAiBatch(profile, scheduleDate) {
   const pool = getMysqlPool();
   const batchId = randomUUID();
   let runs = [];
+  // 时区规则切换或部署重启时，避免 20 小时内重复产生一轮付费 DAILY 分析。
+  const [recentBatchRows] = await pool.query(`
+    SELECT id FROM ads_ai_batch_runs
+    WHERE profile_id = ? AND trigger_source = 'DAILY' AND started_at >= DATE_SUB(NOW(), INTERVAL 20 HOUR)
+    ORDER BY started_at DESC LIMIT 1
+  `, [String(profile.profileId)]);
+  if (recentBatchRows[0]) {
+    await pool.query(`
+      INSERT IGNORE INTO ads_ai_batch_runs (
+        id, profile_id, trigger_source, schedule_date, status, output_payload, last_error, completed_at
+      ) VALUES (?, ?, 'DAILY', ?, 'SKIPPED', CAST(? AS JSON), ?, NOW())
+    `, [batchId, String(profile.profileId), scheduleDate, JSON.stringify({ reason: "RECENTLY_RUN", previousBatchId: recentBatchRows[0].id }), "20 小时内已有每日分析，已避免时区切换造成重复扣费"]);
+    return { started: false, reason: "RECENTLY_RUN" };
+  }
   const [batchInsert] = await pool.query(`
     INSERT IGNORE INTO ads_ai_batch_runs (id, profile_id, trigger_source, schedule_date, status)
     VALUES (?, ?, 'DAILY', ?, 'RUNNING')
@@ -7726,9 +8085,10 @@ async function startDailyAdsAiBatch(profile, scheduleDate) {
       await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify({ results: [] }), batchId]);
       return { started: false, reason: "NO_ELIGIBLE_KEYWORDS" };
     }
-    const job = executeAdsAiBatchAnalysisRuns(runs)
+    const job = executeChunkedAdsAiBatchAnalysisRuns(runs)
       .then(async result => {
-        await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify(result), batchId]);
+        const lastError = result.status === "COMPLETE" ? null : `${result.summary.failedCount} 个关键词分析失败`;
+        await pool.query("UPDATE ads_ai_batch_runs SET status = ?, output_payload = CAST(? AS JSON), last_error = ?, completed_at = NOW() WHERE id = ?", [result.status, JSON.stringify(result), lastError, batchId]);
       })
       .catch(async error => {
         await pool.query("UPDATE ads_ai_batch_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, batchId]);
@@ -7750,7 +8110,7 @@ async function runDueDailyAdsAiBatch() {
   if (!profile?.profileId) return;
   const strategy = await readLatestAdsAiStrategy(profile.profileId);
   if (!strategy.rules.schedule?.dailyBatchEnabled) return;
-  const timeZone = profile.timezone || US_MARKETPLACE_TIME_ZONE;
+  const timeZone = ADS_AI_SCHEDULE_TIME_ZONE;
   const now = getZonedParts(new Date(), timeZone);
   const nowTime = `${String(now.hour).padStart(2, "0")}:${String(now.minute).padStart(2, "0")}`;
   if (nowTime < strategy.rules.schedule.dailyBatchTime) return;
@@ -7798,12 +8158,95 @@ async function readAdsAiKeywordState(keywordId, preferredRunId = "") {
   const [recommendationRows] = await pool.query(`
     SELECT * FROM ads_ai_recommendations
     WHERE keyword_id = ? AND profile_id = ?
-    ORDER BY created_at DESC LIMIT 30
+    ORDER BY created_at DESC, id DESC LIMIT 30
   `, [keyword.id, String(profile.profileId)]);
   return {
     configured: Boolean(process.env.OPENAI_API_KEY),
     keyword: { id: String(keyword.id), text: keyword.keyword_text, group: keyword.keyword_group },
     goal, strategy, latestRun, recommendations: recommendationRows.map(mapAdsAiRecommendation)
+  };
+}
+
+async function readAdsAiAnalysisHistory(keywordId, requestedLimit = 20) {
+  const { profile, keyword } = await requireAdsAiKeyword(keywordId);
+  const pool = getMysqlPool();
+  const limit = Math.round(adsAiNumber(requestedLimit, 20, 1, 50));
+  const [runRows] = await pool.query(`
+    SELECT id, status, model_name, prompt_version, strategy_version, input_payload, output_payload,
+      validation_error, started_at, completed_at, created_at
+    FROM ads_ai_analysis_runs
+    WHERE keyword_id = ? AND profile_id = ?
+    ORDER BY created_at DESC LIMIT ?
+  `, [keyword.id, String(profile.profileId), limit]);
+  const runIds = runRows.map(row => row.id);
+  let recommendationRows = [];
+  if (runIds.length) {
+    [recommendationRows] = await pool.query(`
+      SELECT * FROM ads_ai_recommendations
+      WHERE analysis_run_id IN (?)
+      ORDER BY created_at ASC, id ASC
+    `, [runIds]);
+  }
+  const recommendationsByRun = new Map();
+  for (const row of recommendationRows) {
+    const list = recommendationsByRun.get(row.analysis_run_id) || [];
+    list.push(mapAdsAiRecommendation(row));
+    recommendationsByRun.set(row.analysis_run_id, list);
+  }
+  return {
+    keyword: { id: String(keyword.id), text: keyword.keyword_text, group: keyword.keyword_group },
+    runs: runRows.map(row => {
+      const input = parseMysqlJson(row.input_payload) || {};
+      const output = parseMysqlJson(row.output_payload) || {};
+      return {
+        id: row.id,
+        status: row.status,
+        model: row.model_name || "",
+        promptVersion: row.prompt_version || "",
+        strategyVersion: Number(row.strategy_version || 1),
+        startedAt: row.started_at,
+        completedAt: row.completed_at,
+        createdAt: row.created_at,
+        error: row.validation_error || "",
+        goal: input.strategy?.keywordGoal || { text: "", constraints: {} },
+        context: input.context || {},
+        analysisSummary: String(output.analysisSummary || ""),
+        signals: Array.isArray(output.signals) ? output.signals : [],
+        recommendations: recommendationsByRun.get(row.id) || [],
+        snapshotAvailable: Boolean(row.input_payload)
+      };
+    })
+  };
+}
+
+async function readAdsAiAnalysisSnapshot(runId) {
+  const profile = await requireSelectedAdsProfile();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT r.id, r.keyword_id, r.status, r.model_name, r.prompt_version, r.strategy_version,
+      r.input_payload, r.output_payload, r.validation_error, r.started_at, r.completed_at,
+      k.keyword_text
+    FROM ads_ai_analysis_runs r
+    JOIN ads_keywords k ON k.id = r.keyword_id
+    WHERE r.id = ? AND r.profile_id = ?
+    LIMIT 1
+  `, [runId, String(profile.profileId)]);
+  if (!rows[0]) throw new Error("分析历史不存在");
+  const [recommendationRows] = await pool.query(`
+    SELECT * FROM ads_ai_recommendations
+    WHERE analysis_run_id = ? ORDER BY created_at ASC, id ASC
+  `, [runId]);
+  const row = rows[0];
+  return {
+    run: {
+      id: row.id, keywordId: String(row.keyword_id), keyword: row.keyword_text,
+      status: row.status, model: row.model_name || "", promptVersion: row.prompt_version || "",
+      strategyVersion: Number(row.strategy_version || 1), error: row.validation_error || "",
+      startedAt: row.started_at, completedAt: row.completed_at
+    },
+    input: parseMysqlJson(row.input_payload) || {},
+    output: parseMysqlJson(row.output_payload) || {},
+    recommendations: recommendationRows.map(mapAdsAiRecommendation)
   };
 }
 
@@ -8492,6 +8935,44 @@ async function stopAdsKeyword(keywordId) {
   }
 }
 
+async function captureAdsSettingsDaily(profile, dateValue = "") {
+  const profileId = String(profile?.profileId || profile || "");
+  if (!profileId) return { campaigns: 0, units: 0 };
+  const timeZone = profile?.timezone || US_MARKETPLACE_TIME_ZONE;
+  const date = String(dateValue || formatDateInTimeZone(new Date(), timeZone)).slice(0, 10);
+  const pool = getMysqlPool();
+  const [campaignResult] = await pool.query(`
+    INSERT INTO ads_campaign_settings_daily (
+      date, campaign_id, daily_budget, top_of_search_adjustment, rest_of_search_adjustment,
+      product_page_adjustment, desired_state, amazon_state, captured_at
+    )
+    SELECT ?, id, daily_budget, top_of_search_adjustment, rest_of_search_adjustment,
+      product_page_adjustment, desired_state, amazon_state, NOW()
+    FROM ads_campaigns
+    WHERE profile_id = ? AND amazon_campaign_id IS NOT NULL AND sync_status = 'SYNCED'
+    ON DUPLICATE KEY UPDATE
+      daily_budget = VALUES(daily_budget),
+      top_of_search_adjustment = VALUES(top_of_search_adjustment),
+      rest_of_search_adjustment = VALUES(rest_of_search_adjustment),
+      product_page_adjustment = VALUES(product_page_adjustment),
+      desired_state = VALUES(desired_state),
+      amazon_state = VALUES(amazon_state),
+      captured_at = VALUES(captured_at)
+  `, [date, profileId]);
+  const [unitResult] = await pool.query(`
+    INSERT INTO ads_ad_unit_settings_daily (date, ad_unit_id, bid, desired_state, amazon_state, captured_at)
+    SELECT ?, id, bid, desired_state, amazon_state, NOW()
+    FROM ads_ad_units
+    WHERE profile_id = ? AND amazon_ad_group_id IS NOT NULL AND sync_status = 'SYNCED'
+    ON DUPLICATE KEY UPDATE
+      bid = VALUES(bid),
+      desired_state = VALUES(desired_state),
+      amazon_state = VALUES(amazon_state),
+      captured_at = VALUES(captured_at)
+  `, [date, profileId]);
+  return { date, campaigns: Number(campaignResult.affectedRows || 0), units: Number(unitResult.affectedRows || 0) };
+}
+
 async function updateAdsCampaignSettings(campaignLocalId, body = {}) {
   const profile = await requireSelectedAdsProfile();
   const pool = getMysqlPool();
@@ -8508,7 +8989,10 @@ async function updateAdsCampaignSettings(campaignLocalId, body = {}) {
     SET daily_budget = ?, top_of_search_adjustment = ?, rest_of_search_adjustment = ?, product_page_adjustment = ?, sync_status = 'PENDING'
     WHERE id = ?`, [dailyBudget, topAdjustment, restAdjustment, productPageAdjustment, campaign.id]);
   const updated = { ...campaign, daily_budget: dailyBudget, top_of_search_adjustment: topAdjustment, rest_of_search_adjustment: restAdjustment, product_page_adjustment: productPageAdjustment };
-  if (!campaign.amazon_campaign_id) return { localOnly: true };
+  if (!campaign.amazon_campaign_id) {
+    await captureAdsSettingsDaily(profile);
+    return { localOnly: true };
+  }
   await assertAdsWriteBoundary(profile.profileId);
   try {
     await adsV3Update("/sp/campaigns", "spCampaign", "campaigns", {
@@ -8517,6 +9001,7 @@ async function updateAdsCampaignSettings(campaignLocalId, body = {}) {
       dynamicBidding: { strategy: "LEGACY_FOR_SALES", placementBidding: adsPlacementBidding(updated) }
     });
     await pool.query("UPDATE ads_campaigns SET sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [campaign.id]);
+    await captureAdsSettingsDaily(profile);
     return { dailyBudget, topOfSearchAdjustment: topAdjustment, restOfSearchAdjustment: restAdjustment, productPageAdjustment };
   } catch (error) {
     await pool.query("UPDATE ads_campaigns SET sync_status = 'INCOMPLETE', failed_step = 'UPDATE_SETTINGS', last_error = ? WHERE id = ?", [error.message, campaign.id]);
@@ -8535,7 +9020,10 @@ async function updateAdsAdUnitBid(unitLocalId, body = {}) {
   const bid = Number(body.bid);
   if (!(bid > 0)) throw new Error("出价必须大于 0");
   await pool.query("UPDATE ads_ad_units SET bid = ?, sync_status = 'PENDING' WHERE id = ?", [bid, unit.id]);
-  if (!unit.amazon_ad_group_id || !unit.amazon_target_id) return { bid, localOnly: true };
+  if (!unit.amazon_ad_group_id || !unit.amazon_target_id) {
+    await captureAdsSettingsDaily(profile);
+    return { bid, localOnly: true };
+  }
   await assertAdsWriteBoundary(profile.profileId);
   try {
     await adsV3Update("/sp/adGroups", "spAdGroup", "adGroups", {
@@ -8545,6 +9033,7 @@ async function updateAdsAdUnitBid(unitLocalId, body = {}) {
       keywordId: String(unit.amazon_target_id), campaignId: String(unit.amazon_campaign_id), adGroupId: String(unit.amazon_ad_group_id), bid
     });
     await pool.query("UPDATE ads_ad_units SET sync_status = 'SYNCED', failed_step = NULL, last_error = NULL WHERE id = ?", [unit.id]);
+    await captureAdsSettingsDaily(profile);
     return { bid };
   } catch (error) {
     await pool.query("UPDATE ads_ad_units SET sync_status = 'INCOMPLETE', failed_step = 'UPDATE_BID', last_error = ? WHERE id = ?", [error.message, unit.id]);
@@ -8912,6 +9401,8 @@ async function enqueueAdsSync(startDate, endDate) {
   if (!Number(managedRows[0]?.count || 0)) return { jobs: [], message: "还没有已创建的受管广告，无需同步" };
   const safeEnd = String(endDate || formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE)).slice(0, 10);
   const safeStart = String(startDate || addDays(safeEnd, -29)).slice(0, 10);
+  const profileToday = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+  if (profileToday >= safeStart && profileToday <= safeEnd) await captureAdsSettingsDaily(profile, profileToday);
   const jobs = [];
   // 关键词历史图只依赖 Ad Group 的每日表现；一个报表覆盖当前 Profile 内所有受管 Ad Group，
   // 再由本地 ID 映射汇总到子 ASIN 和关键词。展示位置数据改为后续单独同步，避免每次同步多等一份报表。
@@ -8973,6 +9464,76 @@ function startAdsPerformanceSchedule() {
   adsRollingSyncTimer = setInterval(runRolling, dailyMs);
   setTimeout(runToday, Number(process.env.AMZ_ADS_STARTUP_SYNC_DELAY_MS || 90_000));
   setTimeout(runRolling, Number(process.env.AMZ_ADS_STARTUP_ROLLING_DELAY_MS || 180_000));
+}
+
+async function executeSystemScheduledTask(taskKey) {
+  if (taskKey === "FBA_TODAY_SALES") {
+    const today = formatDateInTimeZone();
+    return enqueueFbaSyncJob({ reason: "scheduled_today_sales", dates: [today], inventoryDates: [], forceNewReport: true, syncCurrentInventory: false, syncHistoricalInventory: false, syncSales: true, syncCatalog: false });
+  }
+  if (taskKey === "FBA_CURRENT_INVENTORY") {
+    const today = formatDateInTimeZone();
+    return enqueueFbaSyncJob({ reason: "scheduled_current_inventory", dates: [today], inventoryDates: [today], syncCurrentInventory: true, syncHistoricalInventory: false, syncSales: false, syncCatalog: true });
+  }
+  if (taskKey === "FBA_HISTORY_BACKFILL") {
+    const endDate = addDays(formatDateInTimeZone(), -1);
+    const dates = dateRangeInclusive(addDays(endDate, -29), endDate);
+    return enqueueFbaSyncJob({ reason: "scheduled_history_backfill", dates, inventoryDates: dates, forceNewReport: true, syncCurrentInventory: false, syncHistoricalInventory: true, syncSales: true, syncCatalog: false });
+  }
+  if (taskKey === "ADS_TODAY_PERFORMANCE") {
+    const profile = await readAdsProfileSelection();
+    if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
+    const today = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+    await captureAdsSettingsDaily(profile, today);
+    return enqueueAdsSync(today, today);
+  }
+  if (taskKey === "ADS_ROLLING_PERFORMANCE") {
+    const profile = await readAdsProfileSelection();
+    if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
+    const endDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+    await captureAdsSettingsDaily(profile, endDate);
+    return enqueueAdsSync(addDays(endDate, -29), endDate);
+  }
+  if (taskKey === "SIF_KEYWORD_DATA") return syncAllSifKeywordRanks();
+  if (taskKey === "ADS_AI_ANALYSIS") {
+    const profile = await readAdsProfileSelection();
+    if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
+    return startDailyAdsAiBatch(profile, formatDateInTimeZone(new Date(), SYSTEM_SCHEDULE_TIME_ZONE));
+  }
+  return { skipped: true, reason: "UNKNOWN_TASK" };
+}
+
+async function runSystemScheduleTick() {
+  const pool = getMysqlPool();
+  const settings = await readSystemSchedules();
+  const now = new Date();
+  const beijing = getZonedParts(now, SYSTEM_SCHEDULE_TIME_ZONE);
+  const dateKey = formatDateInTimeZone(now, SYSTEM_SCHEDULE_TIME_ZONE);
+  const timeKey = `${String(beijing.hour).padStart(2, "0")}:${String(beijing.minute).padStart(2, "0")}`;
+  for (const task of settings.tasks) {
+    if (!task.enabled) continue;
+    const lastStartedMs = task.lastStartedAt ? new Date(task.lastStartedAt).getTime() : 0;
+    const due = task.scheduleType === "DAILY"
+      ? timeKey >= task.timeBeijing && task.lastRunKey !== dateKey
+      : !lastStartedMs || now.getTime() - lastStartedMs >= task.intervalMinutes * 60_000;
+    if (!due) continue;
+    const runKey = task.scheduleType === "DAILY" ? dateKey : now.toISOString();
+    await pool.query("UPDATE system_schedule_settings SET last_run_key = ?, last_started_at = NOW(), last_status = 'RUNNING', last_error = NULL WHERE task_key = ?", [runKey, task.key]);
+    Promise.resolve(executeSystemScheduledTask(task.key)).then(async () => {
+      await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'COMPLETE', last_error = NULL WHERE task_key = ?", [task.key]);
+    }).catch(async error => {
+      await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ? WHERE task_key = ?", [error.message, task.key]);
+      console.error(`System schedule ${task.key} failed: ${error.message}`);
+    });
+  }
+}
+
+function startSystemSchedule() {
+  if (["0", "false"].includes(String(process.env.SYSTEM_SCHEDULE_ENABLED || "").toLowerCase())) return;
+  if (systemScheduleTimer) return;
+  const tick = () => runSystemScheduleTick().catch(error => console.error(`System schedule tick failed: ${error.message}`));
+  tick();
+  systemScheduleTimer = setInterval(tick, 60_000);
 }
 
 async function markGmailMessagesRead(messageIds = []) {
@@ -9102,6 +9663,14 @@ async function sendGmailMessage({ to, subject, body, threadId }) {
 }
 
 async function handleApi(req, res, url) {
+  if (req.method === "GET" && url.pathname === "/api/system/schedules") {
+    return sendJson(res, await readSystemSchedules());
+  }
+
+  if (req.method === "PUT" && url.pathname === "/api/system/schedules") {
+    return sendJson(res, await updateSystemSchedules(await parseBody(req)));
+  }
+
   if (req.method === "GET" && url.pathname === "/api/sif-keywords/history") {
     return sendJson(res, await readSifKeywordHistory({
       asin: url.searchParams.get("asin") || "",
@@ -9255,6 +9824,16 @@ async function handleApi(req, res, url) {
   }
   if (req.method === "PUT" && adsKeywordAiMatch) {
     return sendJson(res, await saveAdsAiKeywordGoal(adsKeywordAiMatch[1], await parseBody(req)));
+  }
+
+  const adsKeywordAiHistoryMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/ai\/history$/);
+  if (req.method === "GET" && adsKeywordAiHistoryMatch) {
+    return sendJson(res, await readAdsAiAnalysisHistory(adsKeywordAiHistoryMatch[1], url.searchParams.get("limit") || 20));
+  }
+
+  const adsAiRunSnapshotMatch = url.pathname.match(/^\/api\/ads\/ai\/runs\/([^/]+)$/);
+  if (req.method === "GET" && adsAiRunSnapshotMatch) {
+    return sendJson(res, await readAdsAiAnalysisSnapshot(adsAiRunSnapshotMatch[1]));
   }
 
   const adsKeywordAiAnalyzeMatch = url.pathname.match(/^\/api\/ads\/keywords\/(\d+)\/ai\/analyze$/);
@@ -10041,21 +10620,19 @@ await ensureDataDir();
 await ensureAppMysqlSchema();
 server.listen(PORT, () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
-  if (process.env.AMZ_ADS_SYNC_ENABLED !== "0" && process.env.AMZ_ADS_SYNC_ENABLED !== "false") startAdsPerformanceSchedule();
-  if (process.env.SIF_SYNC_ENABLED !== "0" && process.env.SIF_SYNC_ENABLED !== "false") startSifKeywordSchedule();
-  startDailyAdsAiBatchSchedule();
-  const scheduledFbaSyncEnabled = process.env.AMZ_FBA_SCHEDULE_ENABLED !== "0" && process.env.AMZ_FBA_SCHEDULE_ENABLED !== "false";
   if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
     setTimeout(async () => {
       try {
         await enqueueStartupFbaSyncJobs();
+        await ensureSystemScheduleDefaults();
+        await getMysqlPool().query("UPDATE system_schedule_settings SET last_started_at = NOW(), last_status = 'COMPLETE' WHERE task_key IN ('FBA_TODAY_SALES','FBA_CURRENT_INVENTORY')");
       } catch (error) {
         console.error(`FBA startup sync failed: ${error.message}`);
       } finally {
-        if (scheduledFbaSyncEnabled) scheduleNextFbaSync();
+        startSystemSchedule();
       }
     }, Number(process.env.AMZ_FBA_STARTUP_SYNC_DELAY_MS || 15000));
-  } else if (scheduledFbaSyncEnabled) {
-    scheduleNextFbaSync();
+  } else {
+    startSystemSchedule();
   }
 });
