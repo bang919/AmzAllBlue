@@ -193,6 +193,7 @@ async function ensureAdsMysqlSchema(pool) {
       keyword_text VARCHAR(255) NOT NULL,
       normalized_keyword VARCHAR(255) NOT NULL,
       monitor_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
+      sort_order INT NOT NULL DEFAULT 0,
       source VARCHAR(16) NOT NULL DEFAULT 'SIF',
       last_seen_at DATETIME NULL,
       last_synced_at DATETIME NULL,
@@ -201,10 +202,13 @@ async function ensureAdsMysqlSchema(pool) {
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       UNIQUE KEY uq_sif_keyword_monitor (country_code, asin, normalized_keyword),
+      KEY idx_sif_keyword_monitors_sort (country_code, asin, sort_order),
       KEY idx_sif_keyword_monitors_status (monitor_status, asin),
       KEY idx_sif_keyword_monitors_keyword (normalized_keyword)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query("ALTER TABLE sif_keyword_monitors ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER monitor_status").catch(() => {});
+  await pool.query("ALTER TABLE sif_keyword_monitors ADD KEY idx_sif_keyword_monitors_sort (country_code, asin, sort_order)").catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sif_keyword_rank_daily (
       monitor_id BIGINT UNSIGNED NOT NULL,
@@ -303,6 +307,7 @@ async function ensureAdsMysqlSchema(pool) {
       creation_batch VARCHAR(24) NOT NULL DEFAULT '',
       active_scope_key VARCHAR(512) NULL,
       keyword_group VARCHAR(16) NOT NULL DEFAULT 'NORMAL',
+      sort_order INT NOT NULL DEFAULT 0,
       lifecycle_status VARCHAR(16) NOT NULL DEFAULT 'ACTIVE',
       stopped_at DATETIME NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -310,6 +315,7 @@ async function ensureAdsMysqlSchema(pool) {
       PRIMARY KEY (id),
       UNIQUE KEY uq_ads_keywords_active_scope (active_scope_key),
       KEY idx_ads_keywords_parent_group (profile_id, parent_asin, keyword_group),
+      KEY idx_ads_keywords_parent_sort (profile_id, parent_asin, sort_order),
       KEY idx_ads_keywords_creation_batch (profile_id, creation_batch),
       KEY idx_ads_keywords_updated_at (updated_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
@@ -664,9 +670,11 @@ async function ensureAdsMysqlSchema(pool) {
   await pool.query("ALTER TABLE ads_campaigns ADD COLUMN stopped_at DATETIME NULL AFTER lifecycle_status").catch(() => {});
   await pool.query("ALTER TABLE ads_keywords ADD COLUMN creation_batch VARCHAR(24) NOT NULL DEFAULT '' AFTER normalized_keyword").catch(() => {});
   await pool.query("ALTER TABLE ads_keywords ADD COLUMN active_scope_key VARCHAR(512) NULL AFTER creation_batch").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD COLUMN sort_order INT NOT NULL DEFAULT 0 AFTER keyword_group").catch(() => {});
   await pool.query("ALTER TABLE ads_keywords ADD COLUMN stopped_at DATETIME NULL AFTER lifecycle_status").catch(() => {});
   await pool.query("UPDATE ads_keywords SET active_scope_key = CONCAT(profile_id, '|', parent_asin, '|', normalized_keyword) WHERE lifecycle_status = 'ACTIVE' AND active_scope_key IS NULL").catch(() => {});
   await pool.query("ALTER TABLE ads_keywords ADD UNIQUE KEY uq_ads_keywords_active_scope (active_scope_key)").catch(() => {});
+  await pool.query("ALTER TABLE ads_keywords ADD KEY idx_ads_keywords_parent_sort (profile_id, parent_asin, sort_order)").catch(() => {});
   await pool.query("ALTER TABLE ads_keywords ADD KEY idx_ads_keywords_creation_batch (profile_id, creation_batch)").catch(() => {});
   await pool.query("ALTER TABLE ads_keywords DROP INDEX uq_ads_keywords_scope").catch(() => {});
   await pool.query("ALTER TABLE ads_campaigns ADD COLUMN creation_batch VARCHAR(24) NOT NULL DEFAULT '' AFTER match_type").catch(() => {});
@@ -940,6 +948,22 @@ async function updateSystemSchedules(input = {}) {
   return readSystemSchedules();
 }
 
+async function runSystemScheduleTaskNow(taskKey) {
+  await ensureSystemScheduleDefaults();
+  const definition = SYSTEM_SCHEDULE_TASKS[taskKey];
+  if (!definition) throw new Error("未知定时任务");
+  const pool = getMysqlPool();
+  const runKey = `manual:${new Date().toISOString()}`;
+  await pool.query("UPDATE system_schedule_settings SET last_run_key = ?, last_started_at = NOW(), last_status = 'RUNNING', last_error = NULL WHERE task_key = ?", [runKey, taskKey]);
+  Promise.resolve(executeSystemScheduledTask(taskKey)).then(async () => {
+    await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'COMPLETE', last_error = NULL WHERE task_key = ?", [taskKey]);
+  }).catch(async error => {
+    await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ? WHERE task_key = ?", [error.message, taskKey]);
+    console.error(`Manual system schedule ${taskKey} failed: ${error.message}`);
+  });
+  return readSystemSchedules();
+}
+
 function parseSifCurl(curlText) {
   const source = String(curlText || "").trim();
   if (!source) throw new Error("请粘贴从 SIF 复制的 cURL 请求");
@@ -1050,7 +1074,7 @@ async function setSifMonitorStatuses(country, asin, keywords, status, { source =
   const now = new Date();
   await getMysqlPool().query(`
     INSERT INTO sif_keyword_monitors (
-      country_code, asin, keyword_text, normalized_keyword, monitor_status, source,
+      country_code, asin, keyword_text, normalized_keyword, monitor_status, sort_order, source,
       last_seen_at, last_synced_at, last_error
     ) VALUES ?
     ON DUPLICATE KEY UPDATE
@@ -1059,9 +1083,31 @@ async function setSifMonitorStatuses(country, asin, keywords, status, { source =
       last_seen_at = IF(VALUES(monitor_status) = 'ACTIVE', VALUES(last_seen_at), last_seen_at),
       last_synced_at = VALUES(last_synced_at), last_error = VALUES(last_error)
   `, [rows.map(([normalized, text]) => [
-    safeCountry, safeAsin, text, normalized, status, source,
+    safeCountry, safeAsin, text, normalized, status, 0, source,
     status === "ACTIVE" ? now : null, now, error
   ])]);
+  if (status === "ACTIVE") {
+    const normalizedOrder = rows.map(([normalized]) => normalized);
+    const [unordered] = await getMysqlPool().query(`
+      SELECT id, normalized_keyword FROM sif_keyword_monitors
+      WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE' AND sort_order = 0 AND normalized_keyword IN (?)
+    `, [safeCountry, safeAsin, normalizedOrder]);
+    const unorderedByKeyword = new Map(unordered.map(row => [row.normalized_keyword, row.id]));
+    if (unorderedByKeyword.size) {
+      const [maxRows] = await getMysqlPool().query(`
+        SELECT COALESCE(MAX(sort_order), 0) max_sort_order
+        FROM sif_keyword_monitors
+        WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE' AND sort_order > 0
+      `, [safeCountry, safeAsin]);
+      let order = Number(maxRows[0]?.max_sort_order || 0);
+      for (const normalized of normalizedOrder) {
+        const id = unorderedByKeyword.get(normalized);
+        if (!id) continue;
+        order += 10;
+        await getMysqlPool().query("UPDATE sif_keyword_monitors SET sort_order = ? WHERE id = ?", [order, id]);
+      }
+    }
+  }
   return rows.map(([normalized]) => normalized);
 }
 
@@ -1443,15 +1489,40 @@ async function readSifRankMatrix(asin, keywordTexts, maxDays = 60) {
     });
     byKeyword.set(row.normalized_keyword, list);
   }
+  for (const list of byKeyword.values()) {
+    for (let index = 0; index < list.length; index += 1) {
+      for (const type of ["nf", "sp"]) {
+        const current = list[index]?.[type];
+        const previous = list[index + 1]?.[type];
+        const currentRank = current?.rank;
+        const previousRank = previous?.rank;
+        const hasCurrentRank = currentRank !== null && currentRank !== "" && Number.isFinite(Number(currentRank));
+        const hasPreviousRank = previousRank !== null && previousRank !== "" && Number.isFinite(Number(previousRank));
+        if (!current || !hasCurrentRank || !hasPreviousRank) continue;
+        current.changeType = Number(currentRank) < Number(previousRank) ? "up" : Number(currentRank) > Number(previousRank) ? "down" : "noChange";
+      }
+    }
+  }
   return { dates, byKeyword };
 }
 
-function sifWorkspaceData(payloadData, adsProducts, matrix = { dates: [], byKeyword: new Map() }, bids = new Map()) {
-  const keywords = (payloadData?.keywords || []).map(keyword => ({
+async function readSifMonitorOrder(country, asin) {
+  const [rows] = await getMysqlPool().query(`
+    SELECT normalized_keyword, sort_order
+    FROM sif_keyword_monitors
+    WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE'
+  `, [String(country || "US").toUpperCase(), normalizeSifAsin(asin)]);
+  return new Map(rows.map(row => [row.normalized_keyword, Number(row.sort_order || 0)]));
+}
+
+function sifWorkspaceData(payloadData, adsProducts, matrix = { dates: [], byKeyword: new Map() }, bids = new Map(), order = new Map()) {
+  const keywords = (payloadData?.keywords || []).map((keyword, index) => ({
     ...keyword,
+    sortOrder: order.get(normalizeSifKeyword(keyword.keyword)) || 0,
+    sourceIndex: index,
     rankInfo: matrix.byKeyword.get(normalizeSifKeyword(keyword.keyword)) || [],
     fixedBid: bids.get(normalizeSifKeyword(keyword.keyword)) || null
-  }));
+  })).sort((a, b) => Number(a.sortOrder || 0) - Number(b.sortOrder || 0) || Number(a.sourceIndex || 0) - Number(b.sourceIndex || 0));
   return {
     ...(payloadData || {}),
     dates: matrix.dates,
@@ -1483,16 +1554,17 @@ async function readSifKeywordWorkspace(asin = "") {
     }
     const result = await listSifKeywords(credentials, selectedAsin);
     const keywordTexts = result.payload.data?.keywords?.map(item => item.keyword) || [];
-    const [matrix, bids] = await Promise.all([
+    const [matrix, bids, order] = await Promise.all([
       readSifRankMatrix(selectedAsin, keywordTexts, 60),
-      readSifLatestBids(selectedAsin, keywordTexts)
+      readSifLatestBids(selectedAsin, keywordTexts),
+      readSifMonitorOrder(credentials.country || "US", selectedAsin)
     ]);
     return {
       authorized: true,
       configured: true,
       country: credentials.country || "US",
       selectedAsin: result.selectedAsin,
-      data: sifWorkspaceData(result.payload.data, adsProducts, matrix, bids)
+      data: sifWorkspaceData(result.payload.data, adsProducts, matrix, bids, order)
     };
   } catch (error) {
     return { authorized: false, configured: true, error: error.message };
@@ -1561,10 +1633,11 @@ async function saveSifCredentialsFromCurl(curlText) {
   const result = selectedAsin ? await listSifKeywords(credentials, selectedAsin) : null;
   if (!result) await checkSifCredentials(credentials);
   const keywordTexts = result?.payload.data?.keywords?.map(item => item.keyword) || [];
-  const [matrix, bids] = result ? await Promise.all([
+  const [matrix, bids, order] = result ? await Promise.all([
     readSifRankMatrix(selectedAsin, keywordTexts, 60),
-    readSifLatestBids(selectedAsin, keywordTexts)
-  ]) : [null, new Map()];
+    readSifLatestBids(selectedAsin, keywordTexts),
+    readSifMonitorOrder(credentials.country || "US", selectedAsin)
+  ]) : [null, new Map(), new Map()];
   await writeAppSecret(SECRET_KEYS.sifCredentials, credentials);
   return {
     authorized: true,
@@ -1572,7 +1645,7 @@ async function saveSifCredentialsFromCurl(curlText) {
     requiresAdsAsin: !selectedAsin,
     country: credentials.country,
     selectedAsin: result?.selectedAsin || "",
-    data: result ? sifWorkspaceData(result.payload.data, adsProducts, matrix, bids) : { dates: [], keywords: [], asins: [], asinProducts: [], asinNum: 0, keywordNum: 0 }
+    data: result ? sifWorkspaceData(result.payload.data, adsProducts, matrix, bids, order) : { dates: [], keywords: [], asins: [], asinProducts: [], asinNum: 0, keywordNum: 0 }
   };
 }
 
@@ -1631,6 +1704,43 @@ async function updateSifKeywordSubscription({ asin, keywords, type }) {
     success: true,
     invalidKeywords
   };
+}
+
+async function saveSifKeywordOrder({ asin, keywords }) {
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) throw new Error("请先授权 SIF 账户");
+  const selectedAsin = normalizeSifAsin(asin);
+  const normalizedKeywords = [...new Set((Array.isArray(keywords) ? keywords : [])
+    .map(normalizeSifKeyword)
+    .filter(Boolean))];
+  if (!selectedAsin) throw new Error("缺少子 ASIN");
+  if (!normalizedKeywords.length) throw new Error("关键词顺序不能为空");
+  const country = String(credentials.country || "US").toUpperCase();
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT normalized_keyword FROM sif_keyword_monitors
+    WHERE country_code = ? AND asin = ? AND monitor_status = 'ACTIVE' AND normalized_keyword IN (?)
+  `, [country, selectedAsin, normalizedKeywords]);
+  const found = new Set(rows.map(row => row.normalized_keyword));
+  if (found.size !== normalizedKeywords.length) throw new Error("关键词监控列表已变化，请刷新后重试");
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (let index = 0; index < normalizedKeywords.length; index += 1) {
+      await connection.query(`
+        UPDATE sif_keyword_monitors
+        SET sort_order = ?
+        WHERE country_code = ? AND asin = ? AND normalized_keyword = ?
+      `, [(index + 1) * 10, country, selectedAsin, normalizedKeywords[index]]);
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+  return { ok: true };
 }
 
 async function ensureSifKeywordPairsMonitored(pairs = []) {
@@ -1828,7 +1938,6 @@ function defaultAdsAiStrategyRules() {
   return {
     generalText: "只针对 AmzAllBlue_ERP 内的广告对象提出建议。优先保护账户安全、利润和库存；数据不足时返回 REQUEST_MORE_DATA。任何建议必须说明证据、风险和观察期；真实广告调整是否需要逐条确认，由下方处理建议行动模式决定。",
     globalLimits: {
-      requireManualConfirmation: true,
       analysisWindowDays: 30,
       recentAiHistoryDays: 7,
       minObservationDays: 3,
@@ -1889,7 +1998,6 @@ function sanitizeAdsAiStrategyRules(value) {
   return {
     generalText: String(source.generalText || defaults.generalText).trim().slice(0, 12000),
     globalLimits: {
-      requireManualConfirmation: true,
       analysisWindowDays: Math.round(adsAiNumber(sourceLimits.analysisWindowDays, limits.analysisWindowDays, 7, 90)),
       recentAiHistoryDays: Math.round(adsAiNumber(sourceLimits.recentAiHistoryDays, limits.recentAiHistoryDays, 0, 30)),
       minObservationDays: Math.round(adsAiNumber(sourceLimits.minObservationDays, limits.minObservationDays, 1, 30)),
@@ -2991,6 +3099,39 @@ async function saveAdsParentAsinOrder(parentAsins) {
       await connection.query(
         "UPDATE parent_asin_metadata SET sort_order = ? WHERE parent_asin = ? AND internal_name <> ''",
         [index + 1, normalized[index]]
+      );
+    }
+    await connection.commit();
+  } catch (error) {
+    await connection.rollback();
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+async function saveAdsKeywordOrder(parentAsin, keywordIds) {
+  const profile = await requireSelectedAdsProfile();
+  const normalizedParentAsin = String(parentAsin || "").trim().toUpperCase();
+  const ids = [...new Set((Array.isArray(keywordIds) ? keywordIds : [])
+    .map(value => String(value || "").trim())
+    .filter(value => /^\d+$/.test(value)))];
+  if (!normalizedParentAsin) throw new Error("父 ASIN 不能为空");
+  if (!ids.length) throw new Error("关键词顺序不能为空");
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT id FROM ads_keywords
+    WHERE profile_id = ? AND parent_asin = ? AND lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING', 'STOPPED') AND id IN (?)
+  `, [String(profile.profileId), normalizedParentAsin, ids]);
+  const found = new Set(rows.map(row => String(row.id)));
+  if (found.size !== ids.length) throw new Error("关键词列表已变化，请刷新后重试");
+  const connection = await pool.getConnection();
+  try {
+    await connection.beginTransaction();
+    for (let index = 0; index < ids.length; index += 1) {
+      await connection.query(
+        "UPDATE ads_keywords SET sort_order = ? WHERE id = ? AND profile_id = ? AND parent_asin = ?",
+        [(index + 1) * 10, ids[index], String(profile.profileId), normalizedParentAsin]
       );
     }
     await connection.commit();
@@ -6833,7 +6974,7 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
   const safeEnd = (endDate || formatDateInTimeZone()).slice(0, 10);
   const safeStart = (startDate || addDays(safeEnd, -29)).slice(0, 10);
   const pool = getMysqlPool();
-  const [keywordRows] = await pool.query("SELECT * FROM ads_keywords WHERE profile_id = ? AND lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING', 'STOPPED') ORDER BY updated_at DESC, id DESC", [String(profile.profileId)]);
+  const [keywordRows] = await pool.query("SELECT * FROM ads_keywords WHERE profile_id = ? AND lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING', 'STOPPED') ORDER BY sort_order ASC, updated_at DESC, id DESC", [String(profile.profileId)]);
   const keywordIds = keywordRows.map(row => row.id);
   let campaignRows = [];
   let adUnitRows = [];
@@ -7012,7 +7153,7 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
       ? "ACTIVE" : monitoring.some(item => item.status === "ACTIVE") ? "PARTIAL" : "INACTIVE";
     const keywordKey = String(row.id);
     const latestRecommendation = aiLatestRecommendationByKeyword.get(keywordKey) || null;
-    return { id: keywordKey, parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(keywordKey) || 0, aiGoalSet: Boolean(aiGoalByKeyword.get(keywordKey)), aiAnalysisSummary: aiSummaryByKeyword.get(keywordKey) || "", aiSuggestionAction: latestRecommendation?.actionType || "", aiSuggestionReason: latestRecommendation?.reason || "" };
+    return { id: keywordKey, parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, sortOrder: Number(row.sort_order || 0), lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(keywordKey) || 0, aiGoalSet: Boolean(aiGoalByKeyword.get(keywordKey)), aiAnalysisSummary: aiSummaryByKeyword.get(keywordKey) || "", aiSuggestionAction: latestRecommendation?.actionType || "", aiSuggestionReason: latestRecommendation?.reason || "" };
   });
   return {
     profile,
@@ -7822,7 +7963,7 @@ async function executeAdsAiAnalysisRun(runId, input) {
     const content = await callOpenAI([
       {
         role: "system",
-        content: `你是 Amazon Ads 关键词投放分析器。只能根据输入 JSON 和策略规则判断，不得虚构数据。所有真实调整都必须人工确认。若 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{\"analysisSummary\":\"string\",\"signals\":[{\"code\":\"string\",\"severity\":\"info|warning|critical\",\"summary\":\"string\",\"evidence\":[\"输入字段路径\"]}],\"recommendations\":[{\"actionType\":\"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION\",\"target\":{\"keywordId\":\"string 可选\",\"campaignId\":\"string 可选\",\"adUnitId\":\"string 可选\"},\"before\":{},\"after\":{},\"reason\":\"string\",\"risk\":\"string\",\"evidence\":[\"输入字段路径\"],\"confidence\":0.0,\"observeDays\":3}]}\n必须使用输入中真实存在的本地 ID。CHANGE_BID 使用 before/after.bid；位置加价使用 topOfSearchAdjustment/restOfSearchAdjustment/productPageAdjustment；预算使用 dailyBudget；启停使用 state；分组使用 group。若证据不足，返回 REQUEST_MORE_DATA 或空 recommendations。`
+        content: `你是 Amazon Ads 关键词投放分析器。只能根据输入 JSON 和策略规则判断，不得虚构数据。真实调整是否自动执行由输入策略中的处理建议行动模式决定。若 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{\"analysisSummary\":\"string\",\"signals\":[{\"code\":\"string\",\"severity\":\"info|warning|critical\",\"summary\":\"string\",\"evidence\":[\"输入字段路径\"]}],\"recommendations\":[{\"actionType\":\"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION\",\"target\":{\"keywordId\":\"string 可选\",\"campaignId\":\"string 可选\",\"adUnitId\":\"string 可选\"},\"before\":{},\"after\":{},\"reason\":\"string\",\"risk\":\"string\",\"evidence\":[\"输入字段路径\"],\"confidence\":0.0,\"observeDays\":3}]}\n必须使用输入中真实存在的本地 ID。CHANGE_BID 使用 before/after.bid；位置加价使用 topOfSearchAdjustment/restOfSearchAdjustment/productPageAdjustment；预算使用 dailyBudget；启停使用 state；分组使用 group。若证据不足，返回 REQUEST_MORE_DATA 或空 recommendations。`
       },
       { role: "user", content: JSON.stringify(input) }
     ], true);
@@ -7910,7 +8051,7 @@ async function executeAdsAiBatchAnalysisRuns(runs) {
     const content = await callOpenAI([
       {
         role: "system",
-        content: `你是 Amazon Ads 每日批量关键词投放分析器。只能根据每个关键词各自的输入 JSON 和策略规则判断，不得在关键词之间混用数据。所有真实调整都必须人工确认。若某关键词的 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{"results":[{"keywordId":"输入中的 keywordId","analysisSummary":"string","signals":[{"code":"string","severity":"info|warning|critical","summary":"string","evidence":["输入字段路径"]}],"recommendations":[{"actionType":"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION","target":{},"before":{},"after":{},"reason":"string","risk":"string","evidence":["输入字段路径"],"confidence":0.0,"observeDays":3}]}]}\n每个输入关键词必须恰好返回一个同 keywordId 的结果。必须使用输入中真实存在的本地 ID。证据不足时返回 REQUEST_MORE_DATA 或空 recommendations。`
+        content: `你是 Amazon Ads 每日批量关键词投放分析器。只能根据每个关键词各自的输入 JSON 和策略规则判断，不得在关键词之间混用数据。真实调整是否自动执行由输入策略中的处理建议行动模式决定。若某关键词的 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{"results":[{"keywordId":"输入中的 keywordId","analysisSummary":"string","signals":[{"code":"string","severity":"info|warning|critical","summary":"string","evidence":["输入字段路径"]}],"recommendations":[{"actionType":"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION","target":{},"before":{},"after":{},"reason":"string","risk":"string","evidence":["输入字段路径"],"confidence":0.0,"observeDays":3}]}]}\n每个输入关键词必须恰好返回一个同 keywordId 的结果。必须使用输入中真实存在的本地 ID。证据不足时返回 REQUEST_MORE_DATA 或空 recommendations。`
       },
       { role: "user", content: JSON.stringify({ analyses: runs.map(run => run.input) }) }
     ], true);
@@ -8448,11 +8589,17 @@ async function createAdsKeywordDraft(body = {}, options = {}) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
+    const [sortRows] = await connection.query(`
+      SELECT COALESCE(MAX(sort_order), 0) + 10 next_sort_order
+      FROM ads_keywords
+      WHERE profile_id = ? AND parent_asin = ?
+    `, [String(profile.profileId), parentAsin]);
+    const sortOrder = Number(sortRows[0]?.next_sort_order || 10);
     const [keywordResult] = await connection.query(`
       INSERT INTO ads_keywords (
-        profile_id, parent_asin, keyword_text, normalized_keyword, creation_batch, active_scope_key, keyword_group, lifecycle_status
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `, [String(profile.profileId), parentAsin, keywordText, normalizedKeyword, creationBatch, activeScopeKey, group, lifecycleStatus]);
+        profile_id, parent_asin, keyword_text, normalized_keyword, creation_batch, active_scope_key, keyword_group, sort_order, lifecycle_status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [String(profile.profileId), parentAsin, keywordText, normalizedKeyword, creationBatch, activeScopeKey, group, sortOrder, lifecycleStatus]);
     const keywordId = keywordResult.insertId;
     for (const matchType of matches) {
       const unit = units[0];
@@ -9671,6 +9818,11 @@ async function handleApi(req, res, url) {
     return sendJson(res, await updateSystemSchedules(await parseBody(req)));
   }
 
+  const systemScheduleRunMatch = url.pathname.match(/^\/api\/system\/schedules\/([^/]+)\/run$/);
+  if (req.method === "POST" && systemScheduleRunMatch) {
+    return sendJson(res, await runSystemScheduleTaskNow(decodeURIComponent(systemScheduleRunMatch[1])));
+  }
+
   if (req.method === "GET" && url.pathname === "/api/sif-keywords/history") {
     return sendJson(res, await readSifKeywordHistory({
       asin: url.searchParams.get("asin") || "",
@@ -9701,6 +9853,10 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/sif-keywords/subscriptions") {
     return sendJson(res, await updateSifKeywordSubscription(await parseBody(req)));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/sif-keywords/reorder") {
+    return sendJson(res, await saveSifKeywordOrder(await parseBody(req)));
   }
 
   if (req.method === "GET" && url.pathname === "/api/gmail/auth-url") {
@@ -9783,6 +9939,12 @@ async function handleApi(req, res, url) {
     const body = await parseBody(req);
     await saveAdsParentAsinOrder(body.parentAsins);
     return sendJson(res, { products: await readAdsProductCatalog() });
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/ads/keywords/reorder") {
+    const body = await parseBody(req);
+    await saveAdsKeywordOrder(body.parentAsin, body.keywordIds);
+    return sendJson(res, { ok: true });
   }
 
   if (req.method === "GET" && url.pathname === "/api/ads/template") {

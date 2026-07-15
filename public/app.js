@@ -67,6 +67,7 @@ let adsHistoryState = {
 };
 let adsHistoryRequestSequence = 0;
 let draggedAdsParentAsin = "";
+let pointerRowDrag = null;
 let activeModule = "dashboard";
 let productsLoaded = false;
 let factoryLoaded = false;
@@ -75,6 +76,7 @@ let systemSchedulesLoaded = false;
 let systemSchedules = [];
 let sifWorkspaceData = { dates: [], keywords: [], asins: [] };
 let selectedSifAsin = "";
+let sifSearchSortDirection = "";
 let sifDetailState = { asin: "", keyword: "", startDate: "", endDate: "" };
 let sifDetailDatePickerOpen = false;
 let sifDetailDatePickerMonth = "";
@@ -777,9 +779,12 @@ function renderSystemSchedules() {
     <section class="system-schedule-card ${task.enabled ? "enabled" : ""}" data-system-schedule="${escapeHtml(task.key)}">
       <label class="system-schedule-switch"><input data-system-schedule-enabled type="checkbox" ${task.enabled ? "checked" : ""}><span></span></label>
       <div class="system-schedule-copy"><strong>${escapeHtml(task.label)}</strong><p>${escapeHtml(task.description)}</p><small class="${task.lastStatus === "FAILED" ? "failed" : ""}">${escapeHtml(systemScheduleStatus(task))}</small></div>
-      ${task.scheduleType === "DAILY"
-        ? `<label class="system-schedule-value">执行时间（北京时间）<input data-system-schedule-time type="time" value="${escapeHtml(task.timeBeijing || "09:00")}"></label>`
-        : `<label class="system-schedule-value">执行间隔（分钟）<input data-system-schedule-interval type="number" min="${Number(task.minIntervalMinutes || 1)}" step="1" value="${Number(task.intervalMinutes || 60)}"></label>`}
+      <div class="system-schedule-controls">
+        ${task.scheduleType === "DAILY"
+          ? `<label class="system-schedule-value">执行时间（北京时间）<input data-system-schedule-time type="time" value="${escapeHtml(task.timeBeijing || "09:00")}"></label>`
+          : `<label class="system-schedule-value">执行间隔（分钟）<input data-system-schedule-interval type="number" min="${Number(task.minIntervalMinutes || 1)}" step="1" value="${Number(task.intervalMinutes || 60)}"></label>`}
+        <button type="button" class="secondary-button system-schedule-run" data-system-schedule-run ${task.lastStatus === "RUNNING" ? "disabled" : ""}>立即执行</button>
+      </div>
     </section>`).join("");
 }
 
@@ -807,6 +812,20 @@ async function saveSystemSchedules(button) {
     renderSystemSchedules();
   } finally {
     setBusy(button, false, "保存定时计划");
+  }
+}
+
+async function runSystemScheduleNow(button) {
+  const card = button.closest("[data-system-schedule]");
+  const taskKey = card?.dataset.systemSchedule || "";
+  if (!taskKey) return;
+  setBusy(button, true, "执行中");
+  try {
+    const data = await api(`/api/system/schedules/${encodeURIComponent(taskKey)}/run`, { method: "POST", body: {} });
+    systemSchedules = data.tasks || [];
+    renderSystemSchedules();
+  } finally {
+    setBusy(button, false, "立即执行");
   }
 }
 
@@ -3636,6 +3655,40 @@ function moveAdsParentTab(targetParentAsin) {
   saveAdsProductOrder();
 }
 
+function adsKeywordIdsForParent(parentAsin) {
+  return adsWorkspace.keywords
+    .filter(keyword => keyword.parentAsin === parentAsin)
+    .map(keyword => keyword.id);
+}
+
+async function saveAdsKeywordOrder(parentAsin) {
+  try {
+    await api("/api/ads/keywords/reorder", {
+      method: "POST",
+      body: { parentAsin, keywordIds: adsKeywordIdsForParent(parentAsin) }
+    });
+  } catch (error) {
+    alert(error.message);
+    await loadAdsWorkspace().catch(() => {});
+  }
+}
+
+function moveAdsKeywordRow(targetKeywordId, sourceKeywordId) {
+  if (!sourceKeywordId || !targetKeywordId || sourceKeywordId === targetKeywordId) return;
+  const parentAsin = selectedAdsParentAsin;
+  const parentKeywords = adsWorkspace.keywords.filter(keyword => keyword.parentAsin === parentAsin);
+  const otherKeywords = adsWorkspace.keywords.filter(keyword => keyword.parentAsin !== parentAsin);
+  const fromIndex = parentKeywords.findIndex(keyword => keyword.id === sourceKeywordId);
+  const toIndex = parentKeywords.findIndex(keyword => keyword.id === targetKeywordId);
+  if (fromIndex < 0 || toIndex < 0) return;
+  const nextParentKeywords = [...parentKeywords];
+  const [moved] = nextParentKeywords.splice(fromIndex, 1);
+  nextParentKeywords.splice(toIndex, 0, moved);
+  adsWorkspace.keywords = [...otherKeywords, ...nextParentKeywords.map((keyword, index) => ({ ...keyword, sortOrder: (index + 1) * 10 }))];
+  renderAdsKeywordRows();
+  saveAdsKeywordOrder(parentAsin);
+}
+
 function filteredAdsKeywords() {
   const query = ($("#adsKeywordSearch")?.value || "").trim().toLowerCase();
   return adsWorkspace.keywords.filter(item => {
@@ -3708,7 +3761,7 @@ function renderAdsKeywordRows() {
       ? `<span class="ads-keyword-ai-summary"><b>建议行动：</b>${escapeHtml(aiSummaryText)}</span>`
       : "";
     return `<tr class="${keyword.id === selectedAdsKeywordId ? "selected" : ""}" data-ads-keyword-id="${keyword.id}">
-      <td><div class="ads-keyword-name"><strong>${escapeHtml(keyword.keyword)}</strong>${aiReminder}</div><span>${escapeHtml(keywordSubline)}</span>${aiSummary}</td>
+      <td><div class="ads-keyword-main"><button type="button" class="ads-keyword-drag" title="拖动调整关键词顺序" aria-label="拖动调整关键词顺序">⋮⋮</button><div><div class="ads-keyword-name"><strong>${escapeHtml(keyword.keyword)}</strong>${aiReminder}</div><span>${escapeHtml(keywordSubline)}</span>${aiSummary}</div></div></td>
       <td>${childAsins.length ? childAsins.map(asin => `<span class="ads-asin-chip">${escapeHtml(asin)}</span>`).join("") : "-"}</td>
       <td><span class="ads-group-badge ${keyword.group.toLowerCase()}">${adsGroupLabel(keyword.group)}</span></td>
       <td>${renderAdsMatchCell(keyword, "EXACT")}</td><td>${renderAdsMatchCell(keyword, "PHRASE")}</td><td>${renderAdsMatchCell(keyword, "BROAD")}</td>
@@ -3721,7 +3774,7 @@ function renderAdsKeywordRows() {
 
 function renderAdsAiPanel(keyword, currency) {
   return `<aside class="ads-ai-panel" id="adsAiPanel">
-    <div class="ads-ai-panel-head"><div><span class="ads-ai-kicker">AI 广告助手</span><strong>调整目标与建议</strong><p>分析近 30 天全部广告与排名指标；任何真实调整都需要你逐条确认。</p></div><span id="adsAiConnectionStatus" class="ads-ai-status">读取中</span></div>
+    <div class="ads-ai-panel-head"><div><span class="ads-ai-kicker">AI 广告助手</span><strong>调整目标与建议</strong><p>分析近 30 天全部广告与排名指标；建议按策略规则中的处理建议行动执行。</p></div><span id="adsAiConnectionStatus" class="ads-ai-status">读取中</span></div>
     <section class="ads-ai-section ads-ai-goal-section">
       <div class="ads-ai-section-title"><strong>调整目标</strong><span>手动输入</span></div>
       <textarea id="adsAiGoal" rows="3" placeholder="例如：7 天内冲到首页；或 ACOS 控制在 30% 以下"></textarea>
@@ -4142,14 +4195,13 @@ function renderAdsAiStrategyForm(strategy) {
       <label>最短观察期（天）<input data-ads-ai-limit="minObservationDays" type="number" min="1" max="30" value="${limits.minObservationDays}"></label>
       <label>最高竞价<input data-ads-ai-limit="maxBid" type="number" min="0.02" step="0.01" value="${limits.maxBid}"></label>
       <label>单次最多调价<input data-ads-ai-limit="maxBidChangeAmount" type="number" min="0.01" step="0.01" value="${limits.maxBidChangeAmount}"></label>
-      <label>单次调价比例<input data-ads-ai-limit="maxBidChangePercent" type="number" min="0.01" step="0.01" value="${limits.maxBidChangePercent}"></label>
+      <label>单次调价比例上限<input data-ads-ai-limit="maxBidChangePercent" type="number" min="0.01" step="0.01" value="${limits.maxBidChangePercent}"></label>
       <label>最高日预算<input data-ads-ai-limit="maxDailyBudget" type="number" min="1" step="1" value="${limits.maxDailyBudget}"></label>
-      <label>预算调整比例<input data-ads-ai-limit="maxDailyBudgetChangePercent" type="number" min="0.01" step="0.01" value="${limits.maxDailyBudgetChangePercent}"></label>
+      <label>预算调整比例上限<input data-ads-ai-limit="maxDailyBudgetChangePercent" type="number" min="0.01" step="0.01" value="${limits.maxDailyBudgetChangePercent}"></label>
       <label>最高位置加价 %<input data-ads-ai-limit="maxPlacementAdjustment" type="number" min="0" max="900" step="1" value="${limits.maxPlacementAdjustment}"></label>
       <label>库存安全线（天）<input data-ads-ai-limit="inventorySafetyDays" type="number" min="0" max="365" step="1" value="${limits.inventorySafetyDays}"></label>
-      <label class="ads-ai-required-confirmation"><input type="checkbox" checked disabled> 所有真实调整必须人工确认</label>
     </div></section>
-    <section class="ads-ai-strategy-section"><div><strong>每日批量分析</strong><span>统一按北京时间，用一次后台批量任务分析所有填写了调整目标的关键词。</span></div><div class="ads-ai-schedule-fields"><label class="ads-ai-schedule-enabled"><input id="adsAiDailyBatchEnabled" type="checkbox" ${schedule.dailyBatchEnabled ? "checked" : ""}> 每天自动分析</label><label>执行时间（北京时间）<input id="adsAiDailyBatchTime" type="time" value="${escapeHtml(schedule.dailyBatchTime)}"></label></div><div class="ads-ai-approval-setting"><strong>处理建议行动</strong><span>AI 只负责判断；服务端会按此模式决定是否调用 Amazon Ads 执行接口。</span><div class="ads-ai-approval-options"><label class="${schedule.approvalMode === "MANUAL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="MANUAL" ${schedule.approvalMode === "MANUAL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>请求批准</strong><small>所有行动都需用户批准</small></span></label><label class="${schedule.approvalMode === "RISK_ONLY" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="RISK_ONLY" ${schedule.approvalMode === "RISK_ONLY" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>替我审批</strong><small>仅竞价自动执行，风险操作请求批准</small></span></label><label class="${schedule.approvalMode === "AUTO_ALL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="AUTO_ALL" ${schedule.approvalMode === "AUTO_ALL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>完全批准</strong><small>自动执行所有通过安全边界的行动</small></span></label></div></div></section>
+    <section class="ads-ai-strategy-section"><div><strong>每日批量分析</strong><span>统一按北京时间，用一次后台批量任务分析所有填写了调整目标的关键词。</span></div><div class="ads-ai-schedule-fields"><label class="ads-ai-schedule-enabled"><input id="adsAiDailyBatchEnabled" type="checkbox" ${schedule.dailyBatchEnabled ? "checked" : ""}> 每天自动分析</label><label>执行时间（北京时间）<input id="adsAiDailyBatchTime" type="time" value="${escapeHtml(schedule.dailyBatchTime)}"></label></div><div class="ads-ai-approval-setting"><strong>处理建议行动</strong><span>AI 只负责判断；服务端会按此模式决定是否调用 Amazon Ads 执行接口。</span><div class="ads-ai-approval-options"><label class="${schedule.approvalMode === "MANUAL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="MANUAL" ${schedule.approvalMode === "MANUAL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>需要用户批准</strong><small>所有行动都需用户批准</small></span></label><label class="${schedule.approvalMode === "RISK_ONLY" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="RISK_ONLY" ${schedule.approvalMode === "RISK_ONLY" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>AI替用户审批</strong><small>仅竞价自动执行，风险操作请求批准</small></span></label><label class="${schedule.approvalMode === "AUTO_ALL" ? "selected" : ""}"><input type="radio" name="adsAiApprovalMode" value="AUTO_ALL" ${schedule.approvalMode === "AUTO_ALL" ? "checked" : ""}><span class="ads-ai-approval-label"><strong>自动批准执行</strong><small>自动执行所有通过安全边界的行动</small></span></label></div></div></section>
     ${groupSection("NORMAL")}${groupSection("PROMOTED")}${groupSection("STABLE")}
   </div>`;
   $("#adsAiStrategyVersion").textContent = "";
@@ -4259,7 +4311,7 @@ async function saveAdsAiStrategy(button) {
     };
     const data = await api("/api/ads/ai/strategy", { method: "PUT", body: { rules: { generalText: $("#adsAiGeneralRules")?.value || "", globalLimits, schedule, groups } } });
     if (adsAiState) adsAiState.strategy = data.strategy;
-    renderAdsAiStrategyForm(data.strategy);
+    $("#adsAiStrategyDialog")?.close();
     if (selectedAdsKeywordId) await loadAdsAiKeywordState(selectedAdsKeywordId);
   } finally {
     setBusy(button, false, "确认");
@@ -4771,6 +4823,10 @@ $("#systemScheduleList").addEventListener("change", event => {
   const card = event.target.closest("[data-system-schedule]");
   if (card && event.target.matches("[data-system-schedule-enabled]")) card.classList.toggle("enabled", event.target.checked);
 });
+$("#systemScheduleList").addEventListener("click", event => {
+  const runButton = event.target.closest("[data-system-schedule-run]");
+  if (runButton) runSystemScheduleNow(runButton).catch(error => alert(error.message));
+});
 $("#adsKeywordSearch").addEventListener("input", renderAdsKeywordRows);
 $("#adsKeywordForm").addEventListener("submit", saveAdsKeywordDraft);
 $("#adsProductTabs").addEventListener("click", event => {
@@ -4813,6 +4869,7 @@ document.querySelectorAll(".ads-group-filter").forEach(button => button.addEvent
   renderAdsWorkspace();
 }));
 $("#adsKeywordRows").addEventListener("click", event => {
+  if (event.target.closest(".ads-keyword-drag")) return;
   const row = event.target.closest("[data-ads-keyword-id]");
   if (!row) return;
   selectedAdsKeywordId = row.dataset.adsKeywordId;
@@ -4822,6 +4879,16 @@ $("#adsKeywordRows").addEventListener("click", event => {
     requestAnimationFrame(() => $("#adsAiPanel")?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
   }
 });
+$("#adsKeywordRows").addEventListener("pointerdown", event => startPointerRowDrag(event, {
+  rowSelector: "[data-ads-keyword-id]",
+  handleSelector: ".ads-keyword-drag",
+  idAttr: "adsKeywordId",
+  move: moveAdsKeywordRow,
+  labelSelector: ".ads-keyword-name strong"
+}));
+$("#adsKeywordRows").addEventListener("pointermove", updatePointerRowDrag);
+$("#adsKeywordRows").addEventListener("pointerup", finishPointerRowDrag);
+$("#adsKeywordRows").addEventListener("pointercancel", clearPointerRowDrag);
 $("#adsKeywordFormBody").addEventListener("change", event => {
   if (event.target.id === "adsFormParentAsin") {
     renderAdsKeywordForm(event.target.value);
@@ -5579,10 +5646,10 @@ function renderSifRankingTrend(keyword) {
     ], tooltips, "ranking-trend")}`;
 }
 
-function renderSifRankLine(rank, label) {
+function renderSifRankLine(rank, label, channel) {
   const value = rank && rank.rank !== null && rank.rank !== "" && Number.isFinite(Number(rank.rank)) ? Number(rank.rank) : null;
   const changeClass = rank?.changeType === "up" ? "improved" : rank?.changeType === "down" ? "declined" : "steady";
-  return `<div class="sif-rank-line ${changeClass}"><span>${label}</span><strong>${value ?? "—"}</strong><small>${escapeHtml(rank?.rankStr || "未上榜")}</small></div>`;
+  return `<div class="sif-rank-line sif-rank-${channel} ${changeClass}"><span>${label}</span><strong>${value ?? "—"}</strong><small>${escapeHtml(rank?.rankStr || "未上榜")}</small></div>`;
 }
 
 function renderSifFixedBid(bid) {
@@ -5597,21 +5664,123 @@ function renderSifFixedBid(bid) {
   return `<div class="sif-fixed-bid" title="${escapeHtml(title)}"><small class="sif-bid-category">类目：${escapeHtml(bid.categoryName || bid.categoryId || "未命名")}</small><span class="sif-bid-prices"><em>竞价：</em><b>精准 ${price(bid.exact?.median)}</b><b>词组 ${price(bid.phrase?.median)}</b><b>广泛 ${price(bid.broad?.median)}</b></span></div>`;
 }
 
+function sifSearchValue(keyword) {
+  const value = sifNumericValue(keyword?.estSearchesNum);
+  return value === null ? -1 : value;
+}
+
+function sifVisibleKeywords() {
+  const query = $("#sifKeywordSearch").value.trim().toLowerCase();
+  const keywords = (sifWorkspaceData.keywords || []).filter(item => `${item.keyword || ""} ${item.translateKeyword || ""}`.toLowerCase().includes(query));
+  if (!sifSearchSortDirection) return keywords;
+  return [...keywords].sort((a, b) => {
+    const av = sifSearchValue(a);
+    const bv = sifSearchValue(b);
+    if (av < 0 && bv < 0) return Number(a.sortOrder || 0) - Number(b.sortOrder || 0);
+    if (av < 0) return 1;
+    if (bv < 0) return -1;
+    return sifSearchSortDirection === "asc" ? av - bv : bv - av;
+  });
+}
+
+async function saveSifKeywordOrder() {
+  try {
+    await api("/api/sif-keywords/reorder", {
+      method: "POST",
+      body: { asin: selectedSifAsin, keywords: (sifWorkspaceData.keywords || []).map(item => item.keyword).filter(Boolean) }
+    });
+  } catch (error) {
+    alert(error.message);
+    await refreshSifWorkspace(selectedSifAsin).catch(() => {});
+  }
+}
+
+function moveSifKeywordRow(targetKeyword, sourceKeyword) {
+  if (!sourceKeyword || !targetKeyword || sourceKeyword === targetKeyword) return;
+  const visible = sifVisibleKeywords();
+  const fromIndex = visible.findIndex(item => item.keyword === sourceKeyword);
+  const toIndex = visible.findIndex(item => item.keyword === targetKeyword);
+  if (fromIndex < 0 || toIndex < 0) return;
+  const movedVisible = [...visible];
+  const [moved] = movedVisible.splice(fromIndex, 1);
+  movedVisible.splice(toIndex, 0, moved);
+  const movedSet = new Set(movedVisible.map(item => item.keyword));
+  const hidden = (sifWorkspaceData.keywords || []).filter(item => !movedSet.has(item.keyword));
+  sifWorkspaceData.keywords = [...movedVisible, ...hidden]
+    .map((item, index) => ({ ...item, sortOrder: (index + 1) * 10 }));
+  sifSearchSortDirection = "";
+  renderSifRankings();
+  saveSifKeywordOrder();
+}
+
+function clearPointerRowDrag() {
+  document.querySelectorAll("tr.dragging, tr.drag-over").forEach(node => node.classList.remove("dragging", "drag-over"));
+  pointerRowDrag?.ghost?.remove();
+  pointerRowDrag = null;
+}
+
+function startPointerRowDrag(event, { rowSelector, handleSelector, idAttr, move, labelSelector }) {
+  const handle = event.target.closest(handleSelector);
+  const row = event.target.closest(rowSelector);
+  if (!handle || !row) return;
+  event.preventDefault();
+  const label = row.querySelector(labelSelector)?.textContent?.trim() || "拖动排序";
+  const ghost = document.createElement("div");
+  ghost.className = "row-drag-ghost";
+  ghost.textContent = label;
+  document.body.append(ghost);
+  pointerRowDrag = {
+    rowSelector,
+    idAttr,
+    move,
+    sourceId: row.dataset[idAttr] || "",
+    pointerId: event.pointerId,
+    ghost
+  };
+  row.classList.add("dragging");
+  movePointerRowGhost(event);
+  handle.setPointerCapture?.(event.pointerId);
+}
+
+function movePointerRowGhost(event) {
+  if (!pointerRowDrag?.ghost) return;
+  pointerRowDrag.ghost.style.transform = `translate(${event.clientX + 14}px, ${event.clientY + 12}px)`;
+}
+
+function updatePointerRowDrag(event) {
+  if (!pointerRowDrag) return;
+  movePointerRowGhost(event);
+  const row = document.elementFromPoint(event.clientX, event.clientY)?.closest?.(pointerRowDrag.rowSelector);
+  document.querySelectorAll(`${pointerRowDrag.rowSelector}.drag-over`).forEach(node => node.classList.remove("drag-over"));
+  if (row && row.dataset[pointerRowDrag.idAttr] !== pointerRowDrag.sourceId) row.classList.add("drag-over");
+}
+
+function finishPointerRowDrag(event) {
+  if (!pointerRowDrag) return;
+  const row = document.elementFromPoint(event.clientX, event.clientY)?.closest?.(pointerRowDrag.rowSelector);
+  const targetId = row?.dataset?.[pointerRowDrag.idAttr] || "";
+  const move = pointerRowDrag.move;
+  const sourceId = pointerRowDrag.sourceId;
+  clearPointerRowDrag();
+  if (targetId && targetId !== sourceId) move(targetId, sourceId);
+}
+
 function renderSifRankings() {
   const dates = (sifWorkspaceData.dates || []).slice(0, 60);
   const query = $("#sifKeywordSearch").value.trim().toLowerCase();
-  const keywords = (sifWorkspaceData.keywords || []).filter(item => `${item.keyword || ""} ${item.translateKeyword || ""}`.toLowerCase().includes(query));
+  const keywords = sifVisibleKeywords();
   $("#sifKeywordSummary").textContent = `${keywords.length} 个关键词 · ${selectedSifAsin || "未选择 ASIN"}`;
   $("#sifUpdateRange").textContent = dates.length ? `已保存 ${dates.length} 个排名日期 · 最多显示近 60 天` : "暂无数据库排名";
-  $("#sifRankingHead").innerHTML = `<tr><th class="sif-index-col">#</th><th class="sif-keyword-col">关键词</th><th class="sif-search-trend-col">搜索量 / ABA 趋势</th><th class="sif-ranking-trend-col">排名趋势</th><th class="sif-latest-col"><button type="button" data-sif-scroll-latest title="回到最新日期">⇤<span>最新</span></button></th>${dates.map((date, index) => `<th class="sif-date-col ${index === 0 ? "latest" : ""}">${index === 0 ? "今天 · " : ""}${escapeHtml(date)}<small>美国时间</small></th>`).join("")}<th class="sif-action-col">操作</th></tr>`;
+  const searchSortMark = sifSearchSortDirection === "asc" ? "↑" : sifSearchSortDirection === "desc" ? "↓" : "";
+  $("#sifRankingHead").innerHTML = `<tr><th class="sif-index-col">#</th><th class="sif-keyword-col">关键词</th><th class="sif-search-trend-col"><button type="button" class="sif-sort-head" data-sif-sort-search title="按搜索量排序">搜索量 / ABA 趋势${searchSortMark ? `<span>${searchSortMark}</span>` : ""}</button></th><th class="sif-ranking-trend-col">排名趋势</th><th class="sif-latest-col"><button type="button" data-sif-scroll-latest title="回到最新日期">⇤<span>最新</span></button></th>${dates.map((date, index) => `<th class="sif-date-col ${index === 0 ? "latest" : ""}">${index === 0 ? "今天 · " : ""}${escapeHtml(date)}<small>美国时间</small></th>`).join("")}<th class="sif-action-col">操作</th></tr>`;
   $("#sifRankingRows").innerHTML = keywords.length ? keywords.map((keyword, index) => {
     const cells = dates.map(date => {
       const natural = sifRankForDate(keyword, date, "nf");
       const sponsored = sifRankForDate(keyword, date, "sp");
-      return `<td class="sif-rank-cell">${renderSifRankLine(natural, "自然")}${renderSifRankLine(sponsored, "SP")}</td>`;
+      return `<td class="sif-rank-cell">${renderSifRankLine(natural, "自然", "natural")}${renderSifRankLine(sponsored, "SP", "sponsored")}</td>`;
     }).join("");
-    return `<tr>
-      <td class="sif-index-col">${index + 1}</td>
+    return `<tr data-sif-row-keyword="${escapeHtml(keyword.keyword || "")}">
+      <td class="sif-index-col"><button type="button" class="sif-keyword-drag" title="拖动调整关键词顺序" aria-label="拖动调整关键词顺序">⋮⋮</button><span>${index + 1}</span></td>
       <td class="sif-keyword-cell"><button type="button" class="sif-keyword-open" data-sif-history-keyword="${escapeHtml(keyword.keyword || "")}"><strong>${escapeHtml(keyword.keyword || "-")}</strong><span>${escapeHtml(keyword.translateKeyword || "")}</span></button>${renderSifFixedBid(keyword.fixedBid)}</td>
       <td class="sif-trend-cell">${renderSifSearchTrend(keyword)}</td>
       <td class="sif-trend-cell">${renderSifRankingTrend(keyword)}</td>
@@ -5761,6 +5930,7 @@ async function saveSifCredentials() {
   try {
     const result = await api("/api/sif-keywords/credentials", { method: "POST", body: { curl } });
     selectedSifAsin = result.selectedAsin || "";
+    sifSearchSortDirection = "";
     sifWorkspaceData = result.data || { dates: [], keywords: [], asins: [] };
     $("#sifCurlInput").value = "";
     showSifWorkspace();
@@ -5775,6 +5945,7 @@ async function saveSifCredentials() {
 async function openSifAsin(asin) {
   const normalized = String(asin || "").trim().toUpperCase();
   if (!/^[A-Z0-9]{10}$/.test(normalized)) return;
+  if (normalized !== selectedSifAsin) sifSearchSortDirection = "";
   await refreshSifWorkspace(normalized);
 }
 
@@ -5797,6 +5968,11 @@ async function changeSifKeywordSubscription(keywords, type) {
 document.addEventListener("click", event => {
   const asinButton = event.target.closest("[data-sif-asin]");
   if (asinButton) openSifAsin(asinButton.dataset.sifAsin).catch(error => alert(error.message));
+  if (event.target.closest("[data-sif-sort-search]")) {
+    sifSearchSortDirection = sifSearchSortDirection === "desc" ? "asc" : "desc";
+    renderSifRankings();
+    return;
+  }
   const historyButton = event.target.closest("[data-sif-history-keyword]");
   if (historyButton) openSifKeywordHistory(historyButton.dataset.sifHistoryKeyword);
   if (event.target.closest("[data-sif-scroll-latest]")) {
@@ -5875,6 +6051,16 @@ document.addEventListener("click", event => {
   document.querySelectorAll("[data-ads-group-menu]").forEach(menu => { menu.hidden = true; });
   document.querySelectorAll("[data-ads-group-toggle]").forEach(toggle => toggle.setAttribute("aria-expanded", "false"));
 });
+$("#sifRankingRows").addEventListener("pointerdown", event => startPointerRowDrag(event, {
+  rowSelector: "[data-sif-row-keyword]",
+  handleSelector: ".sif-keyword-drag",
+  idAttr: "sifRowKeyword",
+  move: moveSifKeywordRow,
+  labelSelector: ".sif-keyword-open strong"
+}));
+$("#sifRankingRows").addEventListener("pointermove", updatePointerRowDrag);
+$("#sifRankingRows").addEventListener("pointerup", finishPointerRowDrag);
+$("#sifRankingRows").addEventListener("pointercancel", clearPointerRowDrag);
 $("#sifRefreshBtn").addEventListener("click", async () => {
   const button = $("#sifRefreshBtn");
   setBusy(button, true, "同步中");

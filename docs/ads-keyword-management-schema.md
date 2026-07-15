@@ -63,6 +63,10 @@ ads_keywords
 
 `ads_keywords.creation_batch` 在保存草稿时生成一次，采用 UTC 紧凑时间戳，例如 `20260713T093015123Z`。该值复制到 `ads_campaigns` 和 `ads_ad_units`，预览、确认、创建及失败续传全过程不重新生成。
 
+`ads_keywords.sort_order` 保存同一 Profile、同一父 ASIN 下的关键词手动排序；前端拖拽关键词行后更新该值，刷新后仍按用户调整后的顺序展示。
+
+`sif_keyword_monitors.sort_order` 保存同一国家、同一子 ASIN 下的关键词监控手动排序；首次同步按 SIF 返回顺序写入，前端拖拽关键词监控行后更新该值。
+
 `ads_sync_jobs.active_dedupe_key` 只在任务处于活动状态时有值，利用唯一索引阻止同一报表并发重复申请；任务结束后清空，允许以后重新覆盖同步同一日期范围。
 
 ## AI 分析与执行审计
