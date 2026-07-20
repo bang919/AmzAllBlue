@@ -607,7 +607,7 @@ function renderFbaPlanQuantityCell(product, type) {
   return `
     <div class="fba-plan-cell ${warning ? "has-warning" : ""}">
       <div class="fba-plan-formula">
-        <input class="fba-plan-mini-input ${warning ? "fba-plan-input-warning" : ""}" data-fba-plan-field="${boxesField}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="0.01" min="0" value="${escapeHtml(formatPlanInputValue(boxes, 2))}">
+        <input class="fba-plan-mini-input ${warning ? "fba-plan-input-warning" : ""}" data-fba-plan-field="${boxesField}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="1" min="0" value="${escapeHtml(formatPlanInputValue(boxes, 2))}">
         <span>箱 x ${formatNumber(plan.boxQuantity)} =</span>
         <input class="fba-plan-quantity-input" data-fba-plan-field="${quantityField}" data-fba-plan-key="${escapeHtml(getFbaReplenishmentKey(product))}" type="number" step="1" min="0" value="${escapeHtml(formatPlanInputValue(quantity, 0))}">
       </div>
@@ -767,7 +767,9 @@ function switchModule(module) {
 
 function systemScheduleStatus(task) {
   if (!task.lastStartedAt) return "尚未执行";
+  if (task.lastStatus === "RETRY_WAIT") return `执行失败，将于 ${formatDate(task.nextRetryAt)} 自动重试（第 ${Number(task.retryCount || 1)}/2 次）`;
   if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}`;
+  if (task.lastStatus === "SKIPPED") return `上次跳过：${task.lastError || "无需执行"}`;
   if (task.lastStatus === "RUNNING") return `正在执行 · ${formatDate(task.lastStartedAt)}`;
   return `上次触发：${formatDate(task.lastStartedAt)}`;
 }
@@ -778,7 +780,7 @@ function renderSystemSchedules() {
   list.innerHTML = systemSchedules.map(task => `
     <section class="system-schedule-card ${task.enabled ? "enabled" : ""}" data-system-schedule="${escapeHtml(task.key)}">
       <label class="system-schedule-switch"><input data-system-schedule-enabled type="checkbox" ${task.enabled ? "checked" : ""}><span></span></label>
-      <div class="system-schedule-copy"><strong>${escapeHtml(task.label)}</strong><p>${escapeHtml(task.description)}</p><small class="${task.lastStatus === "FAILED" ? "failed" : ""}">${escapeHtml(systemScheduleStatus(task))}</small></div>
+      <div class="system-schedule-copy"><strong>${escapeHtml(task.label)}</strong><p>${escapeHtml(task.description)}</p><small class="${["FAILED", "SKIPPED", "RETRY_WAIT"].includes(task.lastStatus) ? "failed" : ""}">${escapeHtml(systemScheduleStatus(task))}</small></div>
       <div class="system-schedule-controls">
         ${task.scheduleType === "DAILY"
           ? `<label class="system-schedule-value">执行时间（北京时间）<input data-system-schedule-time type="time" value="${escapeHtml(task.timeBeijing || "09:00")}"></label>`
@@ -4040,7 +4042,7 @@ function adsAiStatusLabel(status) {
 
 function adsAiRunStatusLabel(status) {
   return {
-    RUNNING: "分析中", COMPLETE: "分析完成", FAILED: "分析失败"
+    RUNNING: "分析中", COMPLETE: "分析完成", FAILED: "分析失败", COOLDOWN: "冷却中"
   }[status] || status;
 }
 
@@ -4087,13 +4089,20 @@ function renderAdsAiKeywordState(data) {
   const goal = $("#adsAiGoal");
   if (goal && document.activeElement !== goal) goal.value = data.goal?.text || "";
   const run = data.latestRun;
+  const guard = data.analysisGuard;
+  const guardBlocksAnalysis = ["RUNNING", "COOLDOWN"].includes(guard?.state);
+  const guardMessage = guard?.state === "RUNNING"
+    ? (String(guard.keywordId) === String(data.keyword?.id) ? "后台正在分析中。你可以切换到其他关键词，稍后回来查看结果。" : "同一 ASIN 的另一条关键词正在分析中，当前不会重复发送 AI 请求。")
+    : guard?.state === "COOLDOWN"
+      ? `同一 ASIN 刚完成分析，${guard.remainingMinutes || guard.cooldownMinutes || 1} 分钟内不会重复发送 AI 请求。`
+      : "";
   const output = run?.output;
   const analysisStatus = $("#adsAiAnalysisStatus");
   const analysisContent = $("#adsAiAnalysisContent");
-  if (analysisStatus) analysisStatus.textContent = run ? (run.status === "COMPLETE" ? `规则 v${run.strategyVersion}` : adsAiRunStatusLabel(run.status)) : "尚未分析";
+  if (analysisStatus) analysisStatus.textContent = guardBlocksAnalysis ? adsAiRunStatusLabel(guard.state) : (run ? (run.status === "COMPLETE" ? `规则 v${run.strategyVersion}` : adsAiRunStatusLabel(run.status)) : "尚未分析");
   if (analysisContent) {
-    if (run?.status === "RUNNING") {
-      analysisContent.innerHTML = `<i aria-hidden="true">⌁</i><p>后台正在分析中。你可以切换到其他关键词，稍后回来查看结果。</p>`;
+    if (guardBlocksAnalysis) {
+      analysisContent.innerHTML = `<i aria-hidden="true">⌁</i><p>${escapeHtml(guardMessage)}</p>`;
     } else if (run?.status === "FAILED") {
       analysisContent.innerHTML = `<i aria-hidden="true">!</i><p>${escapeHtml(run.error || "AI 分析失败")}</p>`;
     } else if (output?.analysisSummary) {
@@ -4119,16 +4128,21 @@ function renderAdsAiKeywordState(data) {
   const count = $("#adsAiRecommendationCount");
   if (count) count.textContent = pending.length ? `${pending.length} 条待处理` : "暂无待处理";
   const analyzeButton = $("[data-ads-ai-analyze]");
-  if (analyzeButton) analyzeButton.disabled = run?.status === "RUNNING";
+  if (analyzeButton) analyzeButton.disabled = guardBlocksAnalysis || run?.status === "RUNNING";
   const container = $("#adsAiRecommendations");
   if (container) container.innerHTML = visible.length
     ? visible.map(item => renderAdsAiRecommendation(item, adsWorkspace.profile?.currencyCode || "USD")).join("")
     : `<div class="ads-ai-action-empty"><strong>暂无 AI 建议</strong><p>只有通过 JSON 校验并符合安全边界的建议才会显示。</p></div>`;
-  if (run?.status === "RUNNING") {
+  if (guard?.state === "RUNNING" || run?.status === "RUNNING") {
     const watchedKeywordId = data.keyword.id;
     adsAiPollTimer = setTimeout(() => {
       if (currentAdsKeyword()?.id === watchedKeywordId) loadAdsAiKeywordState(watchedKeywordId);
     }, 5000);
+  } else if (guard?.state === "COOLDOWN") {
+    const watchedKeywordId = data.keyword.id;
+    adsAiPollTimer = setTimeout(() => {
+      if (currentAdsKeyword()?.id === watchedKeywordId) loadAdsAiKeywordState(watchedKeywordId);
+    }, 30_000);
   } else if (run?.status === "COMPLETE" && previousRunStatus === "RUNNING") {
     setTimeout(() => loadAdsWorkspace().catch(() => {}), 0);
   }
@@ -4172,7 +4186,7 @@ async function analyzeAdsKeyword(keywordId, button) {
     await loadAdsWorkspace();
   } finally {
     setBusy(button, false, "开始 AI 分析");
-    if (adsAiState?.latestRun?.status === "RUNNING") button.disabled = true;
+    if (["RUNNING", "COOLDOWN"].includes(adsAiState?.analysisGuard?.state) || adsAiState?.latestRun?.status === "RUNNING") button.disabled = true;
   }
 }
 
@@ -4216,7 +4230,7 @@ async function openAdsAiStrategyDialog() {
 }
 
 function adsAiHistoryRunStatus(status) {
-  return { RUNNING: "分析中", COMPLETE: "分析完成", FAILED: "分析失败" }[status] || status || "未知";
+  return { RUNNING: "分析中", COMPLETE: "分析完成", FAILED: "分析失败", COOLDOWN: "冷却中" }[status] || status || "未知";
 }
 
 function adsAiModelLabel(model) {

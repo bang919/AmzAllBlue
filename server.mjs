@@ -803,11 +803,15 @@ async function ensureAppMysqlSchema() {
       last_completed_at DATETIME NULL,
       last_status VARCHAR(16) NULL,
       last_error TEXT NULL,
+      retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0,
+      next_retry_at DATETIME NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
       PRIMARY KEY (task_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query("ALTER TABLE system_schedule_settings ADD COLUMN retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER last_error").catch(() => {});
+  await pool.query("ALTER TABLE system_schedule_settings ADD COLUMN next_retry_at DATETIME NULL AFTER retry_count").catch(() => {});
   await ensureAdsMysqlSchema(pool);
   appMysqlSchemaReady = true;
   return true;
@@ -917,8 +921,77 @@ function mapSystemSchedule(row) {
     lastStartedAt: row.last_started_at,
     lastCompletedAt: row.last_completed_at,
     lastStatus: row.last_status || "",
-    lastError: row.last_error || ""
+    lastError: row.last_error || "",
+    retryCount: Number(row.retry_count || 0),
+    nextRetryAt: row.next_retry_at || null
   };
+}
+
+function timeKeyInTimeZone(date, timeZone = SYSTEM_SCHEDULE_TIME_ZONE) {
+  const parts = getZonedParts(date, timeZone);
+  return `${String(parts.hour).padStart(2, "0")}:${String(parts.minute).padStart(2, "0")}`;
+}
+
+function shouldResetDailyRunKeyForNewTime(row, nextTime) {
+  if (!row?.last_started_at || row.last_run_key !== formatDateInTimeZone(new Date(), SYSTEM_SCHEDULE_TIME_ZONE)) return false;
+  const previousTime = row.time_beijing || "";
+  if (!previousTime || previousTime === nextTime) return false;
+  return timeKeyInTimeZone(new Date(row.last_started_at), SYSTEM_SCHEDULE_TIME_ZONE) < nextTime;
+}
+
+function systemScheduleOutcome(result) {
+  if (result?.skipped || result?.started === false) {
+    return {
+      status: "SKIPPED",
+      error: result.reason || result.message || "任务已跳过"
+    };
+  }
+  if (Array.isArray(result?.jobs) && result.jobs.length && result.jobs.every(job => ["FAILED", "CANCELLED"].includes(String(job.status || "").toUpperCase()))) {
+    return {
+      status: "FAILED",
+      error: result.jobs.map(job => job.error || job.status).filter(Boolean).join("; ") || "任务创建失败"
+    };
+  }
+  if (Array.isArray(result?.errors) && result.errors.length) {
+    return { status: "FAILED", error: result.errors.join("; ") };
+  }
+  if (["FAILED", "PARTIAL"].includes(String(result?.status || "").toUpperCase())) {
+    return { status: "FAILED", error: result.error || result.lastError || "任务执行失败" };
+  }
+  return { status: "COMPLETE", error: null };
+}
+
+const SYSTEM_SCHEDULE_RETRY_DELAY_MINUTES = 5;
+const SYSTEM_SCHEDULE_MAX_RETRIES = 2;
+
+async function finishSystemScheduleTask(pool, taskKey, result, options = {}) {
+  const outcome = systemScheduleOutcome(result);
+  if (outcome.status === "FAILED" && options.retry !== false) {
+    await scheduleSystemScheduleRetry(pool, taskKey, outcome.error);
+    return;
+  }
+  await pool.query(
+    "UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = ?, last_error = ?, retry_count = 0, next_retry_at = NULL WHERE task_key = ?",
+    [outcome.status, outcome.error, taskKey]
+  );
+}
+
+async function scheduleSystemScheduleRetry(pool, taskKey, error) {
+  const [rows] = await pool.query("SELECT retry_count FROM system_schedule_settings WHERE task_key = ?", [taskKey]);
+  const retryCount = Number(rows[0]?.retry_count || 0);
+  const nextRetryCount = retryCount + 1;
+  const nonRetryable = /未配置|尚未就绪|请先授权|不存在|不合法|校验|不是合法 JSON|缺少|无效|权限不足/i.test(String(error || ""));
+  if (!nonRetryable && nextRetryCount <= SYSTEM_SCHEDULE_MAX_RETRIES) {
+    await pool.query(
+      "UPDATE system_schedule_settings SET last_status = 'RETRY_WAIT', last_error = ?, retry_count = ?, next_retry_at = DATE_ADD(NOW(), INTERVAL ? MINUTE) WHERE task_key = ?",
+      [`${error}（将在 ${SYSTEM_SCHEDULE_RETRY_DELAY_MINUTES} 分钟后进行第 ${nextRetryCount} 次重试）`, nextRetryCount, SYSTEM_SCHEDULE_RETRY_DELAY_MINUTES, taskKey]
+    );
+    return;
+  }
+  await pool.query(
+    "UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ?, next_retry_at = NULL WHERE task_key = ?",
+    [nonRetryable ? error : `${error}（已完成 ${SYSTEM_SCHEDULE_MAX_RETRIES} 次自动重试）`, taskKey]
+  );
 }
 
 async function readSystemSchedules() {
@@ -938,7 +1011,14 @@ async function updateSystemSchedules(input = {}) {
     if (definition.type === "DAILY") {
       const time = String(item.timeBeijing || definition.time || "");
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) throw new Error(`${definition.label}的执行时间不合法`);
-      await pool.query("UPDATE system_schedule_settings SET enabled = ?, time_beijing = ?, schedule_type = 'DAILY' WHERE task_key = ?", [item.enabled ? 1 : 0, time, taskKey]);
+      const [currentRows] = await pool.query("SELECT time_beijing, last_run_key, last_started_at FROM system_schedule_settings WHERE task_key = ?", [taskKey]);
+      const resetRunKey = shouldResetDailyRunKeyForNewTime(currentRows[0], time);
+      await pool.query(
+        `UPDATE system_schedule_settings
+         SET enabled = ?, time_beijing = ?, schedule_type = 'DAILY', last_run_key = IF(?, NULL, last_run_key)
+         WHERE task_key = ?`,
+        [item.enabled ? 1 : 0, time, resetRunKey ? 1 : 0, taskKey]
+      );
     } else {
       const interval = Math.max(Number(definition.minInterval || 1), Math.round(Number(item.intervalMinutes || definition.intervalMinutes)));
       if (!Number.isFinite(interval)) throw new Error(`${definition.label}的执行间隔不合法`);
@@ -954,11 +1034,11 @@ async function runSystemScheduleTaskNow(taskKey) {
   if (!definition) throw new Error("未知定时任务");
   const pool = getMysqlPool();
   const runKey = `manual:${new Date().toISOString()}`;
-  await pool.query("UPDATE system_schedule_settings SET last_run_key = ?, last_started_at = NOW(), last_status = 'RUNNING', last_error = NULL WHERE task_key = ?", [runKey, taskKey]);
-  Promise.resolve(executeSystemScheduledTask(taskKey)).then(async () => {
-    await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'COMPLETE', last_error = NULL WHERE task_key = ?", [taskKey]);
+  await pool.query("UPDATE system_schedule_settings SET last_run_key = ?, last_started_at = NOW(), last_status = 'RUNNING', last_error = NULL, retry_count = 0, next_retry_at = NULL WHERE task_key = ?", [runKey, taskKey]);
+  Promise.resolve(executeSystemScheduledTask(taskKey)).then(async result => {
+    await finishSystemScheduleTask(pool, taskKey, result, { retry: false });
   }).catch(async error => {
-    await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ? WHERE task_key = ?", [error.message, taskKey]);
+    await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ?, next_retry_at = NULL WHERE task_key = ?", [error.message, taskKey]);
     console.error(`Manual system schedule ${taskKey} failed: ${error.message}`);
   });
   return readSystemSchedules();
@@ -4400,7 +4480,7 @@ async function runFbaSyncJob(job) {
 
 function scheduleFbaSyncJob(job) {
   const run = () => runFbaSyncJob(job);
-  fbaSyncQueueTail = fbaSyncQueueTail.then(run, run);
+  job.completion = fbaSyncQueueTail = fbaSyncQueueTail.then(run, run).then(() => job);
 }
 
 function enqueueFbaSyncJob(input = {}) {
@@ -7004,10 +7084,11 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
       WHERE keyword_id IN (?) AND profile_id = ?
     `, [keywordIds, String(profile.profileId)]);
     [aiRunRows] = await pool.query(`
-      SELECT keyword_id, status, output_payload
-      FROM ads_ai_analysis_runs
-      WHERE keyword_id IN (?) AND profile_id = ?
-      ORDER BY created_at DESC, id DESC
+      SELECT r.keyword_id, r.status, r.output_payload, r.completed_at, k.parent_asin
+      FROM ads_ai_analysis_runs r
+      JOIN ads_keywords k ON k.id = r.keyword_id
+      WHERE r.keyword_id IN (?) AND r.profile_id = ?
+      ORDER BY r.created_at DESC, r.id DESC
     `, [keywordIds, String(profile.profileId)]);
     [campaignRows] = await pool.query("SELECT * FROM ads_campaigns WHERE keyword_id IN (?) ORDER BY match_type", [keywordIds]);
     const campaignIds = campaignRows.map(row => row.id);
@@ -7050,6 +7131,15 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
   }
   for (const [key, status] of aiLatestStatusByKeyword) {
     if (status === "RUNNING") aiSummaryByKeyword.set(key, "AI 正在分析中…");
+  }
+  const aiAsinGuardByParent = new Map();
+  const cooldownMinutes = adsAiAsinCooldownMinutes();
+  const cooldownStart = Date.now() - cooldownMinutes * 60 * 1000;
+  for (const row of aiRunRows) {
+    const parentAsin = String(row.parent_asin || "");
+    if (!parentAsin || aiAsinGuardByParent.get(parentAsin) === "RUNNING") continue;
+    if (row.status === "RUNNING") aiAsinGuardByParent.set(parentAsin, "RUNNING");
+    else if (row.status === "COMPLETE" && new Date(row.completed_at).getTime() >= cooldownStart) aiAsinGuardByParent.set(parentAsin, "COOLDOWN");
   }
   const metricsByAdUnit = new Map(performanceRows.map(row => [String(row.ad_unit_id), {
     impressions: Number(row.impressions || 0), clicks: Number(row.clicks || 0), spend: Number(row.spend || 0),
@@ -7153,7 +7243,11 @@ async function readAdsWorkspace(startDate = "", endDate = "") {
       ? "ACTIVE" : monitoring.some(item => item.status === "ACTIVE") ? "PARTIAL" : "INACTIVE";
     const keywordKey = String(row.id);
     const latestRecommendation = aiLatestRecommendationByKeyword.get(keywordKey) || null;
-    return { id: keywordKey, parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, sortOrder: Number(row.sort_order || 0), lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(keywordKey) || 0, aiGoalSet: Boolean(aiGoalByKeyword.get(keywordKey)), aiAnalysisSummary: aiSummaryByKeyword.get(keywordKey) || "", aiSuggestionAction: latestRecommendation?.actionType || "", aiSuggestionReason: latestRecommendation?.reason || "" };
+    const asinGuard = aiAsinGuardByParent.get(String(row.parent_asin || ""));
+    const aiAnalysisSummary = asinGuard === "RUNNING" ? "AI 正在分析中…"
+      : asinGuard === "COOLDOWN" ? "AI 分析冷却中…"
+      : aiSummaryByKeyword.get(keywordKey) || "";
+    return { id: keywordKey, parentAsin: row.parent_asin, keyword: row.keyword_text, group: row.keyword_group, sortOrder: Number(row.sort_order || 0), lifecycleStatus: row.lifecycle_status, stoppedAt: row.stopped_at || (row.lifecycle_status === "STOPPED" ? row.updated_at : null), creationBatch: row.creation_batch || "", metrics, campaigns, monitoring, monitorStatus, aiSuggestionCount: aiSuggestionCountByKeyword.get(keywordKey) || 0, aiGoalSet: Boolean(aiGoalByKeyword.get(keywordKey)), aiAnalysisSummary, aiSuggestionAction: latestRecommendation?.actionType || "", aiSuggestionReason: latestRecommendation?.reason || "" };
   });
   return {
     profile,
@@ -8003,18 +8097,68 @@ async function createAdsAiAnalysisRunFromInput(input) {
   return { runId, input };
 }
 
+function adsAiAsinCooldownMinutes() {
+  return Math.round(adsAiNumber(process.env.ADS_AI_ASIN_COOLDOWN_MINUTES, 60, 5, 1440));
+}
+
+async function readAdsAiAsinAnalysisGuard(profileId, parentAsin) {
+  const cooldownMinutes = adsAiAsinCooldownMinutes();
+  const [rows] = await getMysqlPool().query(`
+    SELECT r.id, r.keyword_id, r.status, r.started_at, r.completed_at
+    FROM ads_ai_analysis_runs r
+    JOIN ads_keywords k ON k.id = r.keyword_id
+    WHERE r.profile_id = ? AND k.parent_asin = ?
+      AND (
+        r.status = 'RUNNING'
+        OR (r.status = 'COMPLETE' AND r.completed_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE))
+      )
+    ORDER BY (r.status = 'RUNNING') DESC, COALESCE(r.completed_at, r.started_at) DESC
+    LIMIT 1
+  `, [String(profileId), String(parentAsin), cooldownMinutes]);
+  const row = rows[0];
+  if (!row) return null;
+  if (row.status === 'RUNNING') {
+    return { state: 'RUNNING', runId: row.id, keywordId: String(row.keyword_id), cooldownMinutes };
+  }
+  const [remainingRows] = await getMysqlPool().query(`
+    SELECT GREATEST(1, CEIL(TIMESTAMPDIFF(SECOND, NOW(), DATE_ADD(?, INTERVAL ? MINUTE)) / 60)) remaining_minutes
+  `, [row.completed_at || row.started_at, cooldownMinutes]);
+  return {
+    state: 'COOLDOWN', runId: row.id, keywordId: String(row.keyword_id), cooldownMinutes,
+    remainingMinutes: Number(remainingRows[0]?.remaining_minutes || 1)
+  };
+}
+
+async function withAdsAiAsinLock(profileId, parentAsin, callback) {
+  const pool = getMysqlPool();
+  const connection = await pool.getConnection();
+  const lockKey = `ads_ai_asin_${createHash('sha256').update(`${profileId}|${parentAsin}`).digest('hex').slice(0, 40)}`;
+  let locked = false;
+  try {
+    const [rows] = await connection.query('SELECT GET_LOCK(?, 5) acquired', [lockKey]);
+    locked = Number(rows[0]?.acquired || 0) === 1;
+    if (!locked) throw new Error('该 ASIN 正在创建 AI 分析任务，请稍后重试');
+    return await callback();
+  } finally {
+    if (locked) await connection.query('SELECT RELEASE_LOCK(?)', [lockKey]).catch(() => {});
+    connection.release();
+  }
+}
+
+async function reserveAdsAiAnalysisRun(profile, keyword) {
+  return withAdsAiAsinLock(profile.profileId, keyword.parent_asin, async () => {
+    const guard = await readAdsAiAsinAnalysisGuard(profile.profileId, keyword.parent_asin);
+    if (guard) return { guard, run: null };
+    return { guard: null, run: await createAdsAiAnalysisRun(keyword.id) };
+  });
+}
+
 async function startAdsAiAnalysis(keywordId) {
   const { profile, keyword } = await requireAdsAiKeyword(keywordId);
-  const pool = getMysqlPool();
-  await expireStaleAdsAiAnalysisRuns(profile.profileId, keyword.id);
-  const [runningRows] = await pool.query(`
-    SELECT id FROM ads_ai_analysis_runs
-    WHERE keyword_id = ? AND profile_id = ? AND status = 'RUNNING'
-    ORDER BY started_at DESC LIMIT 1
-  `, [keyword.id, String(profile.profileId)]);
-  if (runningRows[0]) return readAdsAiKeywordState(keyword.id, runningRows[0].id);
-
-  const run = await createAdsAiAnalysisRun(keyword.id);
+  await expireStaleAdsAiAnalysisRuns(profile.profileId);
+  const reservation = await reserveAdsAiAnalysisRun(profile, keyword);
+  if (reservation.guard) return readAdsAiKeywordState(keyword.id);
+  const run = reservation.run;
   const precheck = buildAdsAiDeterministicPrecheck(run.input);
   const job = (precheck
     ? executeAdsAiDeterministicPrecheckRun(run.runId, run.input, precheck)
@@ -8174,14 +8318,14 @@ async function executeChunkedAdsAiBatchAnalysisRuns(runs) {
   };
 }
 
-async function startDailyAdsAiBatch(profile, scheduleDate) {
+async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
   const pool = getMysqlPool();
   const batchId = randomUUID();
   let runs = [];
   // 时区规则切换或部署重启时，避免 20 小时内重复产生一轮付费 DAILY 分析。
   const [recentBatchRows] = await pool.query(`
     SELECT id FROM ads_ai_batch_runs
-    WHERE profile_id = ? AND trigger_source = 'DAILY' AND started_at >= DATE_SUB(NOW(), INTERVAL 20 HOUR)
+    WHERE profile_id = ? AND trigger_source = 'DAILY' AND status NOT IN ('FAILED', 'PARTIAL') AND started_at >= DATE_SUB(NOW(), INTERVAL 20 HOUR)
     ORDER BY started_at DESC LIMIT 1
   `, [String(profile.profileId)]);
   if (recentBatchRows[0]) {
@@ -8200,44 +8344,51 @@ async function startDailyAdsAiBatch(profile, scheduleDate) {
   try {
     await expireStaleAdsAiAnalysisRuns(profile.profileId);
     const [goalRows] = await pool.query(`
-      SELECT g.keyword_id
+      SELECT g.keyword_id, k.parent_asin
       FROM ads_ai_keyword_goals g
       JOIN ads_keywords k ON k.id = g.keyword_id
       WHERE g.profile_id = ? AND k.lifecycle_status = 'ACTIVE' AND TRIM(g.goal_text) <> ''
       ORDER BY g.updated_at, g.keyword_id
     `, [String(profile.profileId)]);
+    const skipped = [];
     for (const goal of goalRows) {
       const keywordId = String(goal.keyword_id);
-      const [runningRows] = await pool.query(`
-        SELECT id FROM ads_ai_analysis_runs
-        WHERE keyword_id = ? AND profile_id = ? AND status = 'RUNNING'
-        ORDER BY started_at DESC LIMIT 1
-      `, [keywordId, String(profile.profileId)]);
-      if (runningRows[0]) continue;
-      const input = await buildAdsAiAnalysisInput(keywordId);
-      runs.push(await createAdsAiAnalysisRunFromInput(input));
+      const keyword = { id: keywordId, parent_asin: goal.parent_asin };
+      const reservation = await reserveAdsAiAnalysisRun(profile, keyword);
+      if (reservation.guard) {
+        skipped.push({ keywordId, parentAsin: goal.parent_asin, reason: reservation.guard.state, blockedByRunId: reservation.guard.runId });
+        continue;
+      }
+      runs.push(reservation.run);
     }
     await pool.query(`
       UPDATE ads_ai_batch_runs
       SET keyword_count = ?, input_payload = CAST(? AS JSON)
       WHERE id = ?
-    `, [runs.length, JSON.stringify(runs.map(run => ({ runId: run.runId, input: run.input }))), batchId]);
+    `, [runs.length, JSON.stringify({ runs: runs.map(run => ({ runId: run.runId, input: run.input })), skipped }), batchId]);
     if (!runs.length) {
-      await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify({ results: [] }), batchId]);
-      return { started: false, reason: "NO_ELIGIBLE_KEYWORDS" };
+      await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify({ results: [], skipped }), batchId]);
+      return { started: false, reason: "NO_ELIGIBLE_KEYWORDS", skippedCount: skipped.length };
     }
     const job = executeChunkedAdsAiBatchAnalysisRuns(runs)
       .then(async result => {
         const lastError = result.status === "COMPLETE" ? null : `${result.summary.failedCount} 个关键词分析失败`;
         await pool.query("UPDATE ads_ai_batch_runs SET status = ?, output_payload = CAST(? AS JSON), last_error = ?, completed_at = NOW() WHERE id = ?", [result.status, JSON.stringify(result), lastError, batchId]);
+        return result;
       })
       .catch(async error => {
         await pool.query("UPDATE ads_ai_batch_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, batchId]);
         console.error(`Daily AI batch ${batchId} failed: ${error.message}`);
+        return { status: "FAILED", error: error.message };
       })
       .finally(() => runs.forEach(run => adsAiAnalysisJobs.delete(run.input.context.keywordId)));
     runs.forEach(run => adsAiAnalysisJobs.set(run.input.context.keywordId, job));
-    return { started: true, batchId, keywordCount: runs.length };
+    if (options.waitForCompletion) {
+      const result = await job;
+      if (result.status !== "COMPLETE") throw new Error(result.error || `${result.summary?.failedCount || 0} 个关键词 AI 分析失败`);
+      return { started: true, batchId, keywordCount: runs.length, skippedCount: skipped.length, status: result.status };
+    }
+    return { started: true, batchId, keywordCount: runs.length, skippedCount: skipped.length };
   } catch (error) {
     await Promise.all(runs.map(run => failAdsAiAnalysisRun(run.runId, null, error).catch(() => {})));
     await pool.query("UPDATE ads_ai_batch_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, batchId]);
@@ -8303,8 +8454,12 @@ async function readAdsAiKeywordState(keywordId, preferredRunId = "") {
   `, [keyword.id, String(profile.profileId)]);
   return {
     configured: Boolean(process.env.OPENAI_API_KEY),
-    keyword: { id: String(keyword.id), text: keyword.keyword_text, group: keyword.keyword_group },
-    goal, strategy, latestRun, recommendations: recommendationRows.map(mapAdsAiRecommendation)
+    keyword: { id: String(keyword.id), text: keyword.keyword_text, group: keyword.keyword_group, parentAsin: keyword.parent_asin },
+    goal,
+    strategy,
+    latestRun,
+    recommendations: recommendationRows.map(mapAdsAiRecommendation),
+    analysisGuard: await readAdsAiAsinAnalysisGuard(profile.profileId, keyword.parent_asin)
   };
 }
 
@@ -9572,6 +9727,24 @@ async function enqueueAdsSync(startDate, endDate) {
   return { jobs, range: { startDate: safeStart, endDate: safeEnd } };
 }
 
+async function waitForAdsSyncJobs(jobs, timeoutMs = 35 * 60_000) {
+  const ids = jobs.map(job => String(job.id)).filter(Boolean);
+  if (!ids.length) return { jobs: [] };
+  const deadline = Date.now() + timeoutMs;
+  const pool = getMysqlPool();
+  while (Date.now() < deadline) {
+    const [rows] = await pool.query("SELECT id, status, last_error FROM ads_sync_jobs WHERE id IN (?)", [ids]);
+    const byId = new Map(rows.map(row => [String(row.id), row]));
+    if (ids.every(id => ["COMPLETE", "FAILED", "CANCELLED"].includes(String(byId.get(id)?.status || "").toUpperCase()))) {
+      const failed = ids.map(id => byId.get(id)).filter(row => !row || ["FAILED", "CANCELLED"].includes(String(row.status || "").toUpperCase()));
+      if (failed.length) throw new Error(failed.map(row => row?.last_error || "广告报表同步失败").join("; "));
+      return { jobs: ids.map(id => ({ id, status: byId.get(id).status })) };
+    }
+    await wait(3000);
+  }
+  throw new Error("等待广告报表同步完成超时");
+}
+
 async function adsSyncStatus() {
   const profile = await requireSelectedAdsProfile();
   const pool = getMysqlPool();
@@ -9616,36 +9789,45 @@ function startAdsPerformanceSchedule() {
 async function executeSystemScheduledTask(taskKey) {
   if (taskKey === "FBA_TODAY_SALES") {
     const today = formatDateInTimeZone();
-    return enqueueFbaSyncJob({ reason: "scheduled_today_sales", dates: [today], inventoryDates: [], forceNewReport: true, syncCurrentInventory: false, syncHistoricalInventory: false, syncSales: true, syncCatalog: false });
+    const job = enqueueFbaSyncJob({ reason: "scheduled_today_sales", dates: [today], inventoryDates: [], forceNewReport: true, syncCurrentInventory: false, syncHistoricalInventory: false, syncSales: true, syncCatalog: false });
+    const completed = await job.completion;
+    if (completed.status === "failed") throw new Error(completed.error || "FBA 当日销量同步失败");
+    return completed;
   }
   if (taskKey === "FBA_CURRENT_INVENTORY") {
     const today = formatDateInTimeZone();
-    return enqueueFbaSyncJob({ reason: "scheduled_current_inventory", dates: [today], inventoryDates: [today], syncCurrentInventory: true, syncHistoricalInventory: false, syncSales: false, syncCatalog: true });
+    const job = enqueueFbaSyncJob({ reason: "scheduled_current_inventory", dates: [today], inventoryDates: [today], syncCurrentInventory: true, syncHistoricalInventory: false, syncSales: false, syncCatalog: true });
+    const completed = await job.completion;
+    if (completed.status === "failed") throw new Error(completed.error || "FBA 当前库存同步失败");
+    return completed;
   }
   if (taskKey === "FBA_HISTORY_BACKFILL") {
     const endDate = addDays(formatDateInTimeZone(), -1);
     const dates = dateRangeInclusive(addDays(endDate, -29), endDate);
-    return enqueueFbaSyncJob({ reason: "scheduled_history_backfill", dates, inventoryDates: dates, forceNewReport: true, syncCurrentInventory: false, syncHistoricalInventory: true, syncSales: true, syncCatalog: false });
+    const job = enqueueFbaSyncJob({ reason: "scheduled_history_backfill", dates, inventoryDates: dates, forceNewReport: true, syncCurrentInventory: false, syncHistoricalInventory: true, syncSales: true, syncCatalog: false });
+    const completed = await job.completion;
+    if (completed.status === "failed") throw new Error(completed.error || "FBA 历史数据补齐失败");
+    return completed;
   }
   if (taskKey === "ADS_TODAY_PERFORMANCE") {
     const profile = await readAdsProfileSelection();
     if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
     const today = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
     await captureAdsSettingsDaily(profile, today);
-    return enqueueAdsSync(today, today);
+    return waitForAdsSyncJobs((await enqueueAdsSync(today, today)).jobs);
   }
   if (taskKey === "ADS_ROLLING_PERFORMANCE") {
     const profile = await readAdsProfileSelection();
     if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
     const endDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
     await captureAdsSettingsDaily(profile, endDate);
-    return enqueueAdsSync(addDays(endDate, -29), endDate);
+    return waitForAdsSyncJobs((await enqueueAdsSync(addDays(endDate, -29), endDate)).jobs);
   }
   if (taskKey === "SIF_KEYWORD_DATA") return syncAllSifKeywordRanks();
   if (taskKey === "ADS_AI_ANALYSIS") {
     const profile = await readAdsProfileSelection();
     if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
-    return startDailyAdsAiBatch(profile, formatDateInTimeZone(new Date(), SYSTEM_SCHEDULE_TIME_ZONE));
+    return startDailyAdsAiBatch(profile, formatDateInTimeZone(new Date(), SYSTEM_SCHEDULE_TIME_ZONE), { waitForCompletion: true });
   }
   return { skipped: true, reason: "UNKNOWN_TASK" };
 }
@@ -9654,22 +9836,26 @@ async function runSystemScheduleTick() {
   const pool = getMysqlPool();
   const settings = await readSystemSchedules();
   const now = new Date();
-  const beijing = getZonedParts(now, SYSTEM_SCHEDULE_TIME_ZONE);
   const dateKey = formatDateInTimeZone(now, SYSTEM_SCHEDULE_TIME_ZONE);
-  const timeKey = `${String(beijing.hour).padStart(2, "0")}:${String(beijing.minute).padStart(2, "0")}`;
+  const timeKey = timeKeyInTimeZone(now, SYSTEM_SCHEDULE_TIME_ZONE);
   for (const task of settings.tasks) {
     if (!task.enabled) continue;
+    if (task.lastStatus === "RUNNING") continue;
     const lastStartedMs = task.lastStartedAt ? new Date(task.lastStartedAt).getTime() : 0;
-    const due = task.scheduleType === "DAILY"
+    const retryDue = task.lastStatus === "RETRY_WAIT" && task.nextRetryAt && new Date(task.nextRetryAt).getTime() <= now.getTime();
+    const due = retryDue || (task.lastStatus !== "RETRY_WAIT" && (task.scheduleType === "DAILY"
       ? timeKey >= task.timeBeijing && task.lastRunKey !== dateKey
-      : !lastStartedMs || now.getTime() - lastStartedMs >= task.intervalMinutes * 60_000;
+      : !lastStartedMs || now.getTime() - lastStartedMs >= task.intervalMinutes * 60_000));
     if (!due) continue;
-    const runKey = task.scheduleType === "DAILY" ? dateKey : now.toISOString();
-    await pool.query("UPDATE system_schedule_settings SET last_run_key = ?, last_started_at = NOW(), last_status = 'RUNNING', last_error = NULL WHERE task_key = ?", [runKey, task.key]);
-    Promise.resolve(executeSystemScheduledTask(task.key)).then(async () => {
-      await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'COMPLETE', last_error = NULL WHERE task_key = ?", [task.key]);
+    const runKey = retryDue ? task.lastRunKey : task.scheduleType === "DAILY" ? dateKey : now.toISOString();
+    await pool.query(
+      "UPDATE system_schedule_settings SET last_run_key = ?, last_started_at = NOW(), last_status = 'RUNNING', last_error = NULL, next_retry_at = NULL WHERE task_key = ?",
+      [runKey, task.key]
+    );
+    Promise.resolve(executeSystemScheduledTask(task.key)).then(async result => {
+      await finishSystemScheduleTask(pool, task.key, result);
     }).catch(async error => {
-      await pool.query("UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ? WHERE task_key = ?", [error.message, task.key]);
+      await scheduleSystemScheduleRetry(pool, task.key, error.message);
       console.error(`System schedule ${task.key} failed: ${error.message}`);
     });
   }
