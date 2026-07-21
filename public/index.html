@@ -275,7 +275,6 @@
           <div class="page-head keyword-monitor-head">
             <div>
               <h1>关键词监控</h1>
-              <p>通过 SIF 跟踪子 ASIN 的自然排名、广告排名和搜索热度</p>
             </div>
             <div class="actions slim">
               <span id="sifAuthStatus" class="ads-auth-status">检查中</span>
@@ -307,10 +306,31 @@
 
           <div id="sifWorkspace" class="sif-workspace" hidden>
             <section class="panel sif-asins-panel">
-              <div class="sif-section-head">
-                <div><strong id="sifMonitorSummary">正在读取监控商品</strong><span>自动读取“广告管理”中已添加关键词的子 ASIN</span></div>
-              </div>
               <div id="sifAsinTabs" class="sif-asin-tabs"></div>
+            </section>
+
+            <section class="panel sif-traffic-audit-panel">
+              <div class="sif-traffic-audit-head">
+                <div><strong>流量词总体检</strong></div>
+                <span id="sifTrafficAuditStatus" class="ads-auth-status">等待配置</span>
+              </div>
+              <div class="sif-traffic-audit-config">
+                <label>对比 ASIN
+                  <div id="sifTrafficAuditAsinInputWrap" class="sif-traffic-audit-asin-input">
+                    <div id="sifTrafficAuditAsinChips" class="sif-traffic-audit-chips"></div>
+                    <input id="sifTrafficAuditAsinInput" placeholder="用逗号、中文逗号或空格分隔，例如 B0ABC12345，B0XYZ67890（最多 10 个）">
+                  </div>
+                </label>
+                <div class="sif-traffic-audit-controls">
+                  <button id="sifTrafficAuditStartBtn" class="primary" type="button" disabled>开始分析</button>
+                </div>
+              </div>
+              <div class="sif-traffic-audit-meta">
+                <a id="sifTrafficAuditSifLink" class="sif-traffic-audit-sif-link" target="_blank" rel="noopener noreferrer" hidden>在 SIF 查看对比流量词 ↗</a>
+                <p id="sifTrafficAuditHint" class="hint">至少添加 1 个有效的对比 ASIN。</p>
+                <button id="sifTrafficAuditHistoryBtn" class="secondary-button" type="button">查看分析历史</button>
+              </div>
+              <div id="sifTrafficAuditReport" class="sif-traffic-audit-report"><div class="ads-ai-action-empty"><strong>尚未进行总体检</strong><p>分析会综合 SIF 多 ASIN 流量词对比与本地近 7 天投放表现。</p></div></div>
             </section>
 
             <section class="panel sif-ranking-panel">
@@ -357,6 +377,16 @@
             </div>
             <div id="sifHistoryChart" class="sif-history-chart"><div class="ads-history-loading">正在读取排名历史…</div></div>
             <div id="sifDetailDatePicker" class="date-picker-popover" hidden></div>
+          </dialog>
+          <dialog id="sifTrafficAuditHistoryDialog" class="ads-dialog ads-ai-history-dialog sif-traffic-audit-history-dialog">
+            <div class="ads-dialog-head">
+              <div><strong>流量词总体检历史</strong><span id="sifTrafficAuditHistorySubtitle">查看每次总体检的对比 ASIN、诊断与建议</span></div>
+              <button type="button" data-close-sif-traffic-audit-history aria-label="关闭">×</button>
+            </div>
+            <div id="sifTrafficAuditHistoryBody" class="ads-dialog-body"><div class="ads-history-loading">正在读取分析历史…</div></div>
+            <div class="ads-dialog-actions">
+              <button type="button" class="secondary-button" data-close-sif-traffic-audit-history>关闭</button>
+            </div>
           </dialog>
           <div id="sifChartTooltip" class="sif-chart-tooltip" hidden></div>
         </section>

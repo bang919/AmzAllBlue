@@ -65,6 +65,7 @@ let sifDailySyncTimer = null;
 let adsAiDailyScheduleTimer = null;
 let systemScheduleTimer = null;
 const adsAiAnalysisJobs = new Map();
+const sifTrafficAuditJobs = new Map();
 
 function loadEnvFile() {
   if (!existsSync(ENV_PATH)) return;
@@ -663,6 +664,27 @@ async function ensureAdsMysqlSchema(pool) {
       PRIMARY KEY (id),
       UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date),
       KEY idx_ads_ai_batch_profile_status (profile_id, status, created_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sif_traffic_audit_runs (
+      id VARCHAR(64) NOT NULL,
+      profile_id VARCHAR(64) NOT NULL,
+      country_code VARCHAR(8) NOT NULL DEFAULT 'US',
+      parent_asin VARCHAR(32) NOT NULL DEFAULT '',
+      target_asin VARCHAR(32) NOT NULL,
+      competitor_asins JSON NOT NULL,
+      status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
+      model_name VARCHAR(128) NOT NULL DEFAULT '',
+      input_payload JSON NULL,
+      output_payload JSON NULL,
+      last_error TEXT NULL,
+      started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME NULL,
+      created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (id),
+      KEY idx_sif_traffic_audit_target (profile_id, target_asin, created_at),
+      KEY idx_sif_traffic_audit_status (profile_id, status, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
   await pool.query("ALTER TABLE ads_campaigns ADD COLUMN amazon_campaign_name VARCHAR(255) NULL AFTER campaign_name").catch(() => {});
@@ -6025,6 +6047,233 @@ async function importMessagePayloads(messages) {
   return imported;
 }
 
+function sifTrafficAuditAsin(value) {
+  const asin = String(value || "").trim().toUpperCase();
+  return /^B[A-Z0-9]{9}$/.test(asin) ? asin : "";
+}
+
+function sifTrafficAuditNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function sifTrafficAuditAsinMetrics(item = {}) {
+  return {
+    asin: sifTrafficAuditAsin(item.asin),
+    naturalRank: sifTrafficAuditNumber(item.lastRank),
+    sponsoredRank: sifTrafficAuditNumber(item.adLastRank),
+    totalShare: sifTrafficAuditNumber(item.totalScoreRatio),
+    naturalShare: sifTrafficAuditNumber(item.nfScoreRatio),
+    adShare: sifTrafficAuditNumber(item.adScoreRatio),
+    totalShareChange: sifTrafficAuditNumber(item.totalScoreDifferRatio),
+    naturalShareChange: sifTrafficAuditNumber(item.nfScoreDifferRatio),
+    adShareChange: sifTrafficAuditNumber(item.adScoreDifferRatio),
+    keywordTags: Array.isArray(item.kwCharacters) ? item.kwCharacters.slice(0, 8) : []
+  };
+}
+
+function sifTrafficAuditCpc(cpc = {}) {
+  const output = {};
+  for (const [key, entries] of Object.entries(cpc && typeof cpc === "object" ? cpc : {})) {
+    const first = Array.isArray(entries) ? entries[0] : null;
+    if (!first) continue;
+    output[key] = { start: sifTrafficAuditNumber(first.start), median: sifTrafficAuditNumber(first.median), end: sifTrafficAuditNumber(first.end) };
+  }
+  return output;
+}
+
+async function listSifTrafficAuditKeywords(credentials, asins) {
+  const collected = [];
+  const pageSize = 50;
+  let pageNum = 1;
+  let total = null;
+  do {
+    const payload = await sifRequest("/api/compare/multiAsinKeywords", {
+      vipModule: false, asins, searchKeyword: "", condition: "", effectCondition: "",
+      compareField: "shareScore", sortBy: null, desc: true, granularity: "week",
+      pageNum, pageSize, timePieceType: "latelyDay", timePieceValue: "7", indicatorType: "2"
+    }, credentials);
+    const data = payload?.data || {};
+    const items = Array.isArray(data.keywords) ? data.keywords : [];
+    collected.push(...items);
+    total = Number.isFinite(Number(data.total)) ? Number(data.total) : collected.length;
+    if (!items.length) break;
+    pageNum += 1;
+  } while (collected.length < total && pageNum <= 100);
+  return { total: total ?? collected.length, keywords: collected };
+}
+
+async function readSifTrafficAuditLocalKeywords(profile, targetAsin, startDate, endDate) {
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT k.id, k.keyword_text, k.normalized_keyword, k.keyword_group,
+      MAX(CASE WHEN c.lifecycle_status = 'ACTIVE' AND u.lifecycle_status = 'ACTIVE' AND c.desired_state = 'ENABLED' AND u.desired_state = 'ENABLED' THEN 1 ELSE 0 END) active,
+      GROUP_CONCAT(DISTINCT c.match_type ORDER BY c.match_type SEPARATOR ',') match_types,
+      AVG(CASE WHEN c.lifecycle_status = 'ACTIVE' AND u.lifecycle_status = 'ACTIVE' THEN u.bid END) current_bid,
+      AVG(CASE WHEN c.lifecycle_status = 'ACTIVE' THEN c.daily_budget END) daily_budget,
+      COALESCE(SUM(p.impressions), 0) impressions, COALESCE(SUM(p.clicks), 0) clicks,
+      COALESCE(SUM(p.spend), 0) spend, COALESCE(SUM(p.orders_count), 0) orders_count, COALESCE(SUM(p.sales), 0) sales
+    FROM ads_keywords k
+    JOIN ads_campaigns c ON c.keyword_id = k.id AND c.profile_id = k.profile_id
+    JOIN ads_ad_units u ON u.campaign_id = c.id AND u.child_asin = ?
+    LEFT JOIN ads_performance_daily p ON p.ad_unit_id = u.id AND p.date BETWEEN ? AND ?
+    WHERE k.profile_id = ? AND k.lifecycle_status = 'ACTIVE'
+    GROUP BY k.id, k.keyword_text, k.normalized_keyword, k.keyword_group
+  `, [targetAsin, startDate, endDate, String(profile.profileId)]);
+  const output = new Map();
+  for (const row of rows) {
+    const impressions = Number(row.impressions || 0);
+    const clicks = Number(row.clicks || 0);
+    const spend = Number(row.spend || 0);
+    const sales = Number(row.sales || 0);
+    output.set(String(row.normalized_keyword || ""), {
+      keywordId: String(row.id), active: Boolean(row.active), group: row.keyword_group || "",
+      matchTypes: String(row.match_types || "").split(",").filter(Boolean), bid: sifTrafficAuditNumber(row.current_bid), dailyBudget: sifTrafficAuditNumber(row.daily_budget),
+      last7Days: { impressions, clicks, spend, orders: Number(row.orders_count || 0), sales,
+        ctr: impressions ? clicks / impressions : null, cpc: clicks ? spend / clicks : null,
+        conversionRate: clicks ? Number(row.orders_count || 0) / clicks : null, acos: sales ? spend / sales : null }
+    });
+  }
+  return output;
+}
+
+async function readSifTrafficAuditProductContext(targetAsin) {
+  const catalog = await readAdsProductCatalog().catch(() => []);
+  for (const parent of catalog) {
+    const child = (parent.children || []).find(item => String(item.asin || "").toUpperCase() === targetAsin);
+    if (child) return { parentAsin: parent.parentAsin || "", asin: targetAsin, internalName: child.internalName || "", title: child.title || "", category: "" };
+  }
+  return { parentAsin: "", asin: targetAsin, internalName: "", title: "", category: "" };
+}
+
+async function buildSifTrafficAuditInput(targetAsin, competitorAsins) {
+  const profile = await requireSelectedAdsProfile();
+  const credentials = await readAppSecret(SECRET_KEYS.sifCredentials);
+  if (!credentials?.authorization) throw new Error("请先在关键词监控中授权 SIF 账户");
+  const asins = [targetAsin, ...competitorAsins];
+  const endDate = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
+  const startDate = addDays(endDate, -6);
+  const [sifResult, asinSummary, localKeywords, product] = await Promise.all([
+    listSifTrafficAuditKeywords(credentials, asins),
+    sifRequest("/api/search/compare/asinSummary", { searchValue: asins.join(","), sortBy: "", desc: true, showType: 1 }, credentials).catch(() => null),
+    readSifTrafficAuditLocalKeywords(profile, targetAsin, startDate, endDate),
+    readSifTrafficAuditProductContext(targetAsin)
+  ]);
+  const keywordUniverse = sifResult.keywords.map(item => {
+    const keyword = String(item.keyword || "").trim();
+    const normalizedKeyword = normalizeSifKeyword(keyword);
+    const metricsByAsin = new Map((item.asins || []).map(value => [sifTrafficAuditAsin(value.asin), sifTrafficAuditAsinMetrics(value)]));
+    const target = metricsByAsin.get(targetAsin) || { asin: targetAsin };
+    return {
+      keyword, normalizedKeyword, translation: String(item.translateKeyword || "").trim(),
+      market: { searches: sifTrafficAuditNumber(item.estSearchesNum), abaRank: sifTrafficAuditNumber(item.searchesRank), estimatedSales: sifTrafficAuditNumber(item.saleNum), clickShare: sifTrafficAuditNumber(item.clickShared), conversionShare: sifTrafficAuditNumber(item.conversionShared), cpc: sifTrafficAuditCpc(item.cpc), competition: item.competition || null },
+      target, competitors: competitorAsins.map(asin => metricsByAsin.get(asin) || { asin }),
+      localAdvertising: localKeywords.get(normalizedKeyword) || { active: false },
+      sourceTags: Array.isArray(target.keywordTags) ? target.keywordTags : []
+    };
+  }).filter(item => item.keyword);
+  const recentStart = addDays(endDate, -6);
+  const [recentRows] = await getMysqlPool().query(`
+    SELECT id, output_payload, created_at FROM sif_traffic_audit_runs
+    WHERE profile_id = ? AND target_asin = ? AND status = 'COMPLETE' AND created_at >= ?
+    ORDER BY created_at DESC LIMIT 10
+  `, [String(profile.profileId), targetAsin, `${recentStart} 00:00:00`]);
+  const recentHistory = recentRows.map(row => {
+    const output = parseMysqlJson(row.output_payload) || {};
+    return {
+      id: row.id,
+      createdAt: row.created_at,
+      summary: String(output.summary || "").trim().slice(0, 1200),
+      recommendations: Array.isArray(output.recommendations) ? output.recommendations.map(item => ({
+        keyword: String(item.keyword || "").trim(), action: String(item.action || "").trim(), strength: String(item.strength || "").trim(),
+        conclusion: String(item.conclusion || "").trim().slice(0, 500), evidence: Array.isArray(item.evidence) ? item.evidence.map(value => String(value || "").trim()).filter(Boolean).slice(0, 4) : [],
+        dataSnapshot: item.dataSnapshot && typeof item.dataSnapshot === "object" ? item.dataSnapshot : {}, risk: String(item.risk || "").trim().slice(0, 240),
+        nextStep: String(item.nextStep || "").trim().slice(0, 240), confidence: sifTrafficAuditNumber(item.confidence), reviewDays: sifTrafficAuditNumber(item.reviewDays), status: "PENDING"
+      })).slice(0, 10) : []
+    };
+  });
+  return {
+    context: { targetAsin, parentAsin: product.parentAsin, competitorAsins, countryCode: profile.countryCode || "US", currency: profile.currencyCode || "USD", generatedAt: new Date().toISOString(), localPerformanceRange: { startDate, endDate } },
+    targetProduct: product,
+    asinSummary: (asinSummary?.data?.asins || []).map(item => ({ asin: sifTrafficAuditAsin(item.asin), title: String(item.title || "").trim(), price: sifTrafficAuditNumber(item.price), rating: sifTrafficAuditNumber(item.star), ratingCount: sifTrafficAuditNumber(item.ratingNum), currentMonthBought: sifTrafficAuditNumber(item.boughtInCurrentMonth), flowRatios: { total: sifTrafficAuditNumber(item.nfScoreRatio), natural: sifTrafficAuditNumber(item.naturalRatio), ad: sifTrafficAuditNumber(item.adRatio) } })),
+    keywordUniverse,
+    recentAuditHistory: recentHistory,
+    metadata: { totalSifKeywords: sifResult.total, localKeywordCount: localKeywords.size }
+  };
+}
+
+function normalizeSifTrafficAuditOutput(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const allowedActions = new Set(["ADD", "DROP", "SCALE"]);
+  const allowedStrengths = new Set(["STRONG", "NORMAL"]);
+  const recommendations = (Array.isArray(source.recommendations) ? source.recommendations : []).slice(0, 10).map(item => ({
+    keyword: String(item?.keyword || "").trim().slice(0, 255), action: String(item?.action || "").toUpperCase(), strength: String(item?.strength || "").toUpperCase(),
+    conclusion: String(item?.conclusion || "").trim().slice(0, 800), evidence: Array.isArray(item?.evidence) ? item.evidence.map(value => String(value || "").trim()).filter(Boolean).slice(0, 6) : [],
+    dataSnapshot: item?.dataSnapshot && typeof item.dataSnapshot === "object" ? item.dataSnapshot : {}, risk: String(item?.risk || "").trim().slice(0, 500), nextStep: String(item?.nextStep || "").trim().slice(0, 500), confidence: Math.max(0, Math.min(1, Number(item?.confidence || 0))), reviewDays: Math.max(1, Math.min(30, Math.round(Number(item?.reviewDays || 7))))
+  })).filter(item => item.keyword && allowedActions.has(item.action) && allowedStrengths.has(item.strength) && item.conclusion && item.evidence.length >= 2);
+  if (!recommendations.length) throw new Error("AI 未返回有效的流量词总体检建议");
+  return { summary: String(source.summary || "").trim().slice(0, 1600), recommendations };
+}
+
+async function runSifTrafficAudit(runId, input) {
+  const pool = getMysqlPool();
+  try {
+    const auditPrompt = `你是 Amazon 流量词总体检分析器。只根据输入 JSON 判断，不得虚构数据。目标是从完整词池中每次选出 3 至 10 个下一阶段最值得处理的关键词，不能为了凑数输出建议。只允许动作 ADD（建议新增投放，必须当前未有效投放）、DROP（建议停止投放，必须当前有效投放）或 SCALE（建议扩大投放，必须当前有效投放）。每条建议标记 STRONG 或 NORMAL。判断必须综合产品匹配度、我方与竞品自然/SP 流量、搜索需求、竞争难度、以及本地近 7 天表现。recentAuditHistory 是过去 7 天的完整压缩诊断记录；必须比较当前数据和历史证据，说明建议为何延续、升级、降级或不再重复，避免机械重复同一建议。不要自动修改广告。
+
+面向运营人员，用自然、通俗的中文写 summary、conclusion、evidence、risk 和 nextStep。任何可见句子都必须是“数据 + 中文含义/判断”，不能只罗列数据。
+
+严禁在可见文本中输出 JSON 字段名、内部标签、数据路径或英文技术键名，例如 isAccurateTailKw、target/source/localAdvertising、market.searches、estimatedSales、clickShare、conversionShare、naturalRank、sponsoredRank、adShare、totalShare。也不要写“当前未有效投放，符合 ADD 条件”这种规则判断；应直接说“我们还没有实际投放这个词，因此可以先用小预算测试”。
+
+所有数字必须翻译成运营表达并附带含义：575 搜索量写成“近期开约 575 次搜索，需求不高但仍有一定基础”；预估销量 1,403 写成“该词带动的市场销量约 1,403，具备转化机会”；点击份额 42.98%、转化份额 28.57% 写成“该词的点击和成交需求较集中”；自然/SP 排名写成“我们自然第 65 位、广告未上榜”；竞品写成“竞品 B0CGLRJFMW 自然和广告都在第 1 位，说明它已占据主要曝光”。份额、点击率、转化率最多保留一位百分比；CPC 写成“约 $0.46”；搜索量和销量用千位分隔。
+
+每条 conclusion 用 1–2 句说清“为什么现在做”；每条 evidence 用 2–4 条完整、易懂的中文事实，并且每一条事实都要说明对该建议的意义。不要仅复述数据，必须解释数据意味着什么。
+
+只返回 JSON：{"summary":"string","recommendations":[{"keyword":"string","action":"ADD|DROP|SCALE","strength":"STRONG|NORMAL","conclusion":"string","evidence":["至少两条、通俗中文且含具体数据事实"],"dataSnapshot":{},"risk":"string","nextStep":"string","confidence":0.0,"reviewDays":7}]}。`;
+    const content = await callOpenAI([{ role: "system", content: auditPrompt }, { role: "user", content: JSON.stringify(input) }], true);
+    if (!content) throw new Error("未配置 OPENAI_API_KEY，无法调用 AI 分析");
+    const output = normalizeSifTrafficAuditOutput(JSON.parse(content));
+    await pool.query("UPDATE sif_traffic_audit_runs SET status = 'COMPLETE', model_name = ?, output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [process.env.OPENAI_MODEL || "gpt-5.4", JSON.stringify(output), runId]);
+  } catch (error) {
+    await pool.query("UPDATE sif_traffic_audit_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ?", [error.message, runId]);
+  } finally {
+    sifTrafficAuditJobs.delete(runId);
+  }
+}
+
+async function startSifTrafficAudit(body = {}) {
+  const profile = await requireSelectedAdsProfile();
+  const targetAsin = sifTrafficAuditAsin(body.asin);
+  const competitorAsins = [...new Set((Array.isArray(body.competitorAsins) ? body.competitorAsins : []).map(sifTrafficAuditAsin).filter(Boolean))];
+  if (!targetAsin) throw new Error("请选择要总体检的子 ASIN");
+  if (!competitorAsins.length) throw new Error("至少添加 1 个对比 ASIN");
+  if (competitorAsins.length > 10) throw new Error("最多添加 10 个对比 ASIN");
+  if (competitorAsins.includes(targetAsin)) throw new Error("对比 ASIN 不能与当前子 ASIN 相同");
+  const pool = getMysqlPool();
+  const [runningRows] = await pool.query("SELECT id FROM sif_traffic_audit_runs WHERE profile_id = ? AND target_asin = ? AND status = 'RUNNING' ORDER BY created_at DESC LIMIT 1", [String(profile.profileId), targetAsin]);
+  if (runningRows[0]) return { id: runningRows[0].id, status: "RUNNING", reused: true };
+  const input = await buildSifTrafficAuditInput(targetAsin, competitorAsins);
+  const runId = randomUUID();
+  await pool.query(`
+    INSERT INTO sif_traffic_audit_runs (id, profile_id, country_code, parent_asin, target_asin, competitor_asins, status, input_payload)
+    VALUES (?, ?, ?, ?, ?, CAST(? AS JSON), 'RUNNING', CAST(? AS JSON))
+  `, [runId, String(profile.profileId), input.context.countryCode, input.context.parentAsin || "", targetAsin, JSON.stringify(competitorAsins), JSON.stringify(input)]);
+  const job = runSifTrafficAudit(runId, input);
+  sifTrafficAuditJobs.set(runId, job);
+  return { id: runId, status: "RUNNING" };
+}
+
+async function readSifTrafficAuditState(asin) {
+  const profile = await requireSelectedAdsProfile();
+  const targetAsin = sifTrafficAuditAsin(asin);
+  if (!targetAsin) return { targetAsin: "", latestRun: null, history: [] };
+  const [rows] = await getMysqlPool().query(`
+    SELECT * FROM sif_traffic_audit_runs WHERE profile_id = ? AND target_asin = ? ORDER BY created_at DESC LIMIT 20
+  `, [String(profile.profileId), targetAsin]);
+  const normalize = row => ({ id: row.id, status: row.status, targetAsin: row.target_asin, competitorAsins: parseMysqlJson(row.competitor_asins) || [], output: parseMysqlJson(row.output_payload), error: row.last_error || "", createdAt: row.created_at, completedAt: row.completed_at });
+  const runs = rows.map(normalize);
+  return { targetAsin, latestRun: runs[0] || null, history: runs.slice(1) };
+}
+
 async function callOpenAI(messages, jsonMode = false) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
@@ -10043,6 +10292,14 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/sif-keywords/reorder") {
     return sendJson(res, await saveSifKeywordOrder(await parseBody(req)));
+  }
+
+  if (req.method === "GET" && url.pathname === "/api/sif-traffic-audit") {
+    return sendJson(res, await readSifTrafficAuditState(url.searchParams.get("asin") || ""));
+  }
+
+  if (req.method === "POST" && url.pathname === "/api/sif-traffic-audit") {
+    return sendJson(res, await startSifTrafficAudit(await parseBody(req)), 202);
   }
 
   if (req.method === "GET" && url.pathname === "/api/gmail/auth-url") {
