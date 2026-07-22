@@ -4736,9 +4736,9 @@ function amazonFetchTimeoutMs() {
   return Math.max(3000, Number(process.env.AMZ_SP_API_TIMEOUT_MS || 20000));
 }
 
-async function fetchAmazonWithTimeout(resource, init = {}) {
+async function fetchAmazonWithTimeout(resource, init = {}, requestedTimeoutMs = amazonFetchTimeoutMs()) {
   const controller = new AbortController();
-  const timeoutMs = amazonFetchTimeoutMs();
+  const timeoutMs = Math.max(3000, Number(requestedTimeoutMs || amazonFetchTimeoutMs()));
   let timeoutId;
   const timeout = new Promise((_, reject) => {
     timeoutId = setTimeout(() => {
@@ -6833,6 +6833,22 @@ function adsConfig() {
   };
 }
 
+function adsApiTimeoutMs() {
+  return Math.max(10_000, Number(process.env.AMZ_ADS_API_TIMEOUT_MS || 60_000));
+}
+
+function adsReportDownloadTimeoutMs() {
+  return Math.max(20_000, Number(process.env.AMZ_ADS_REPORT_DOWNLOAD_TIMEOUT_MS || 120_000));
+}
+
+function adsReportWaitTimeoutMs() {
+  return Math.max(10 * 60_000, Number(process.env.AMZ_ADS_REPORT_WAIT_MS || 45 * 60_000));
+}
+
+function adsReportPollMs() {
+  return Math.max(3000, Number(process.env.AMZ_ADS_REPORT_POLL_MS || 15_000));
+}
+
 function adsPublicConfig() {
   const config = adsConfig();
   const missing = [];
@@ -6954,11 +6970,27 @@ async function adsFetch(pathname, params = {}, options = {}) {
     headers["amazon-advertising-api-scope"] = String(selected.profileId);
   }
 
-  const response = await fetch(url, {
-    method: options.method || "GET",
-    headers,
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
+  let response;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      response = await fetchAmazonWithTimeout(url, {
+        method: options.method || "GET",
+        headers,
+        body: options.body ? JSON.stringify(options.body) : undefined
+      }, adsApiTimeoutMs());
+      if (response.ok || ![429, 500, 502, 503, 504].includes(response.status)) break;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 3) await wait(700 * attempt);
+  }
+  if (!response) {
+    const cause = lastError?.cause || {};
+    const detail = [cause.code, cause.message || lastError?.message].filter(Boolean).join(" ");
+    throw new Error(`Amazon Ads API 请求失败：${detail || "fetch failed"}`);
+  }
   const text = await response.text();
   let data = {};
   try {
@@ -7664,10 +7696,11 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
   const performanceByDate = new Map(performanceRows.map(row => [adsDateValue(row.date), row]));
   const rankByDate = new Map(rankRows.map(row => [adsDateValue(row.date), row]));
   const placementKey = value => {
-    const placement = String(value || "").toUpperCase();
-    if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP"].includes(placement)) return "top";
-    if (["PLACEMENT_REST_OF_SEARCH", "REST_OF_SEARCH", "OTHER"].includes(placement)) return "rest";
-    if (["PLACEMENT_PRODUCT_PAGE", "PRODUCT_PAGE", "DETAIL_PAGE"].includes(placement)) return "product";
+    const placement = normalizeAdsPlacement(value);
+    if (placement === "PLACEMENT_TOP") return "top";
+    if (placement === "PLACEMENT_REST_OF_SEARCH") return "rest";
+    if (placement === "PLACEMENT_PRODUCT_PAGE") return "product";
+    if (placement === "PLACEMENT_OFF_AMAZON") return "offAmazon";
     return null;
   };
   const placementByDate = new Map();
@@ -7721,6 +7754,7 @@ async function readAdsKeywordHistory(keywordId, filters = {}) {
       ...placementMetrics("top"),
       ...placementMetrics("rest"),
       ...placementMetrics("product"),
+      ...placementMetrics("offAmazon"),
       naturalRank: rank?.natural_rank === null || rank?.natural_rank === undefined ? null : Number(rank.natural_rank),
       adRank: rank?.sp_rank === null || rank?.sp_rank === undefined ? null : Number(rank.sp_rank)
     };
@@ -9850,12 +9884,22 @@ function adsReportMetric(row, keys) {
   return 0;
 }
 
+function normalizeAdsPlacement(value) {
+  const raw = String(value || "").trim();
+  const key = raw.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP", "TOP_OF_SEARCH_ON_AMAZON"].includes(key)) return "PLACEMENT_TOP";
+  if (["PLACEMENT_REST_OF_SEARCH", "REST_OF_SEARCH", "OTHER", "OTHER_ON_AMAZON"].includes(key)) return "PLACEMENT_REST_OF_SEARCH";
+  if (["PLACEMENT_PRODUCT_PAGE", "PRODUCT_PAGE", "DETAIL_PAGE", "DETAIL_PAGE_ON_AMAZON"].includes(key)) return "PLACEMENT_PRODUCT_PAGE";
+  if (["PLACEMENT_OFF_AMAZON", "OFF_AMAZON"].includes(key)) return "PLACEMENT_OFF_AMAZON";
+  return raw || "OTHER";
+}
+
 function adsReportConfiguration(kind) {
   if (kind === "PLACEMENT") {
     return {
       adProduct: "SPONSORED_PRODUCTS",
-      groupBy: ["campaignPlacement"],
-      columns: ["date", "campaignId", "impressions", "clicks", "cost", "purchases7d", "unitsSoldClicks7d", "sales7d"],
+      groupBy: ["campaign", "campaignPlacement"],
+      columns: ["date", "campaignId", "placementClassification", "impressions", "clicks", "cost", "purchases7d", "unitsSoldClicks7d", "sales7d"],
       reportTypeId: "spCampaigns",
       timeUnit: "DAILY",
       format: "GZIP_JSON"
@@ -9872,8 +9916,28 @@ function adsReportConfiguration(kind) {
 }
 
 async function downloadAdsReportRows(url) {
-  const response = await fetch(url);
-  if (!response.ok) throw new Error(`广告报表下载失败 ${response.status}`);
+  let response;
+  let lastError;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      response = await fetchAmazonWithTimeout(
+        url,
+        { headers: { "user-agent": "AmzAllBlue/0.1" } },
+        adsReportDownloadTimeoutMs()
+      );
+      if (response.ok || ![429, 500, 502, 503, 504].includes(response.status)) break;
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    if (attempt < 3) await wait(700 * attempt);
+  }
+  if (!response) {
+    const cause = lastError?.cause || {};
+    const detail = [cause.code, cause.message || lastError?.message].filter(Boolean).join(" ");
+    throw new Error(`广告报表下载失败：${detail || "fetch failed"}`);
+  }
+  if (!response.ok) throw new Error(`广告报表下载失败：${response.status}`);
   let buffer = Buffer.from(await response.arrayBuffer());
   if (buffer[0] === 0x1f && buffer[1] === 0x8b) buffer = gunzipSync(buffer);
   const parsed = JSON.parse(buffer.toString("utf8") || "[]");
@@ -9885,18 +9949,56 @@ async function saveAdsReportRows(profileId, kind, rows) {
   if (kind === "PLACEMENT") {
     const [campaignRows] = await pool.query("SELECT id, amazon_campaign_id FROM ads_campaigns WHERE profile_id = ? AND amazon_campaign_id IS NOT NULL", [String(profileId)]);
     const campaignByAmazonId = new Map(campaignRows.map(row => [String(row.amazon_campaign_id), row.id]));
+    const normalizedRows = [];
     for (const row of rows) {
       const campaignId = campaignByAmazonId.get(String(row.campaignId || ""));
       const date = String(row.date || "").slice(0, 10);
-      const placement = String(row.placementClassification || row.placement || "OTHER");
+      // Reporting API v3 只有在 groupBy 同时包含 campaign 和 campaignPlacement，
+      // 且 columns 包含 placementClassification 时，才会返回可识别的位置分类。
+      const placement = normalizeAdsPlacement(row.placementClassification || row.campaignPlacement || row.placement);
       if (!campaignId || !date) continue;
-      await pool.query(`
-        INSERT INTO ads_placement_performance_daily (
-          date, campaign_id, placement, impressions, clicks, spend, orders_count, units_sold, sales, synced_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
-        ON DUPLICATE KEY UPDATE impressions = VALUES(impressions), clicks = VALUES(clicks), spend = VALUES(spend),
-          orders_count = VALUES(orders_count), units_sold = VALUES(units_sold), sales = VALUES(sales), synced_at = VALUES(synced_at)
-      `, [date, campaignId, placement, adsReportMetric(row, ["impressions"]), adsReportMetric(row, ["clicks"]), adsReportMetric(row, ["cost", "spend"]), adsReportMetric(row, ["purchases7d", "orders7d"]), adsReportMetric(row, ["unitsSoldClicks7d", "unitsSold7d"]), adsReportMetric(row, ["sales7d", "sales"])]);
+      normalizedRows.push([
+        date,
+        campaignId,
+        placement,
+        adsReportMetric(row, ["impressions"]),
+        adsReportMetric(row, ["clicks"]),
+        adsReportMetric(row, ["cost", "spend"]),
+        adsReportMetric(row, ["purchases7d", "orders7d"]),
+        adsReportMetric(row, ["unitsSoldClicks7d", "unitsSold7d"]),
+        adsReportMetric(row, ["sales7d", "sales"])
+      ]);
+    }
+    if (!normalizedRows.length) return;
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const reportKeys = [...new Map(normalizedRows.map(row => [`${row[1]}|${row[0]}`, [row[1], row[0]]])).values()];
+      for (let index = 0; index < reportKeys.length; index += 500) {
+        const chunk = reportKeys.slice(index, index + 500);
+        const placeholders = chunk.map(() => "(?, ?)").join(", ");
+        await connection.query(
+          `DELETE FROM ads_placement_performance_daily WHERE (campaign_id, date) IN (${placeholders})`,
+          chunk.flat()
+        );
+      }
+      for (let index = 0; index < normalizedRows.length; index += 500) {
+        const chunk = normalizedRows.slice(index, index + 500);
+        const placeholders = chunk.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())").join(", ");
+        await connection.query(`
+          INSERT INTO ads_placement_performance_daily (
+            date, campaign_id, placement, impressions, clicks, spend, orders_count, units_sold, sales, synced_at
+          ) VALUES ${placeholders}
+          ON DUPLICATE KEY UPDATE impressions = VALUES(impressions), clicks = VALUES(clicks), spend = VALUES(spend),
+            orders_count = VALUES(orders_count), units_sold = VALUES(units_sold), sales = VALUES(sales), synced_at = VALUES(synced_at)
+        `, chunk.flat());
+      }
+      await connection.commit();
+    } catch (error) {
+      await connection.rollback().catch(() => {});
+      throw error;
+    } finally {
+      connection.release();
     }
     return;
   }
@@ -9916,6 +10018,11 @@ async function saveAdsReportRows(profileId, kind, rows) {
   }
 }
 
+function duplicateAdsReportId(error) {
+  const match = String(error?.message || error || "").match(/duplicate\s+of\s*:\s*([a-f0-9-]{16,})/i);
+  return match?.[1] || "";
+}
+
 async function runAdsSyncJob(jobId) {
   const pool = getMysqlPool();
   const [rows] = await pool.query("SELECT * FROM ads_sync_jobs WHERE id = ?", [jobId]);
@@ -9924,29 +10031,37 @@ async function runAdsSyncJob(jobId) {
   await pool.query("UPDATE ads_sync_jobs SET status = 'RUNNING', started_at = NOW(), attempts = attempts + 1 WHERE id = ?", [jobId]);
   try {
     const configuration = adsReportConfiguration(job.report_type);
-    const created = await adsFetch("/reporting/reports", {}, {
-      requireProfile: true,
-      profileId: job.profile_id,
-      method: "POST",
-      headers: {
-        accept: "application/vnd.createasyncreportrequest.v3+json",
-        "content-type": "application/vnd.createasyncreportrequest.v3+json"
-      },
-      body: {
-        name: `AmzAllBlue ERP ${job.report_type} ${adsDateValue(job.start_date)} ${adsDateValue(job.end_date)}`,
-        startDate: adsDateValue(job.start_date), endDate: adsDateValue(job.end_date), configuration
-      }
-    });
+    let created;
+    try {
+      created = await adsFetch("/reporting/reports", {}, {
+        requireProfile: true,
+        profileId: job.profile_id,
+        method: "POST",
+        headers: {
+          accept: "application/vnd.createasyncreportrequest.v3+json",
+          "content-type": "application/vnd.createasyncreportrequest.v3+json"
+        },
+        body: {
+          name: `AmzAllBlue ERP ${job.report_type} ${adsDateValue(job.start_date)} ${adsDateValue(job.end_date)}`,
+          startDate: adsDateValue(job.start_date), endDate: adsDateValue(job.end_date), configuration
+        }
+      });
+    } catch (error) {
+      const duplicateReportId = duplicateAdsReportId(error);
+      if (!duplicateReportId) throw error;
+      created = { reportId: duplicateReportId };
+    }
     const reportId = String(created.reportId || created.report?.reportId || "");
     if (!reportId) throw new Error("Amazon Ads 未返回 reportId");
     await pool.query("UPDATE ads_sync_jobs SET amazon_report_id = ? WHERE id = ?", [reportId, jobId]);
     let report = null;
-    for (let attempt = 0; attempt < 60; attempt += 1) {
+    const reportDeadline = Date.now() + adsReportWaitTimeoutMs();
+    while (Date.now() < reportDeadline) {
       report = await adsFetch(`/reporting/reports/${encodeURIComponent(reportId)}`, {}, { requireProfile: true, profileId: job.profile_id });
       const status = String(report.status || "").toUpperCase();
       if (["COMPLETED", "SUCCESS"].includes(status) && report.url) break;
       if (["FAILURE", "FAILED", "CANCELLED"].includes(status)) throw new Error(report.failureReason || `广告报表状态 ${status}`);
-      await wait(Math.min(30_000, 3000 + attempt * 1000));
+      await wait(Math.min(adsReportPollMs(), Math.max(0, reportDeadline - Date.now())));
     }
     if (!report?.url) throw new Error("等待广告报表完成超时");
     const reportRows = await downloadAdsReportRows(report.url);
@@ -10026,6 +10141,21 @@ async function adsSyncStatus() {
     jobs: jobs.map(row => ({ id: row.id, kind: row.report_type, startDate: adsDateValue(row.start_date), endDate: adsDateValue(row.end_date), status: row.status, attempts: Number(row.attempts || 0), error: row.last_error || "", createdAt: row.created_at, completedAt: row.completed_at })),
     dates: dates.map(row => ({ date: adsDateValue(row.date), kind: row.report_type, status: row.status, syncedAt: row.synced_at }))
   };
+}
+
+async function recoverInterruptedAdsSyncJobs() {
+  const pool = getMysqlPool();
+  const interruptionMessage = "服务重启，广告报表任务已中断，请重新执行";
+  await pool.query(`
+    UPDATE ads_sync_jobs
+    SET status = 'FAILED', active_dedupe_key = NULL, completed_at = NOW(), last_error = ?
+    WHERE status IN ('QUEUED', 'RUNNING')
+  `, [interruptionMessage]);
+  await pool.query(`
+    UPDATE system_schedule_settings
+    SET last_completed_at = NOW(), last_status = 'FAILED', last_error = ?, next_retry_at = NULL
+    WHERE task_key IN ('ADS_TODAY_PERFORMANCE', 'ADS_ROLLING_PERFORMANCE') AND last_status = 'RUNNING'
+  `, [interruptionMessage]);
 }
 
 function startAdsPerformanceSchedule() {
@@ -11251,8 +11381,13 @@ const server = createServer(async (req, res) => {
 
 await ensureDataDir();
 await ensureAppMysqlSchema();
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
+  try {
+    await recoverInterruptedAdsSyncJobs();
+  } catch (error) {
+    console.error(`Amazon Ads interrupted job recovery failed: ${error.message}`);
+  }
   if (process.env.AMZ_FBA_SYNC_ON_START !== "0" && process.env.AMZ_FBA_SYNC_ON_START !== "false") {
     setTimeout(async () => {
       try {

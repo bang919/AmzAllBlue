@@ -774,7 +774,7 @@ function systemScheduleStatus(task) {
   if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}`;
   if (task.lastStatus === "SKIPPED") return `上次跳过：${task.lastError || "无需执行"}`;
   if (task.lastStatus === "RUNNING") return `正在执行 · ${formatDate(task.lastStartedAt)}`;
-  return `上次触发：${formatDate(task.lastStartedAt)}`;
+  return `上次完成：${formatDate(task.lastCompletedAt || task.lastStartedAt)}`;
 }
 
 function renderSystemSchedules() {
@@ -3820,17 +3820,18 @@ function renderAdsHistoryPanel(keyword) {
 }
 
 function adsPlacementLabel(value) {
-  const placement = String(value || "").toUpperCase();
-  if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP"].includes(placement)) return "顶部搜索";
-  if (["PLACEMENT_REST_OF_SEARCH", "REST_OF_SEARCH", "OTHER"].includes(placement)) return "其余搜索";
-  if (["PLACEMENT_PRODUCT_PAGE", "PRODUCT_PAGE", "DETAIL_PAGE"].includes(placement)) return "商品页面";
+  const placement = String(value || "").toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  if (["PLACEMENT_TOP", "TOP_OF_SEARCH", "TOP", "TOP_OF_SEARCH_ON_AMAZON"].includes(placement)) return "顶部搜索";
+  if (["PLACEMENT_REST_OF_SEARCH", "REST_OF_SEARCH", "OTHER", "OTHER_ON_AMAZON"].includes(placement)) return "其余搜索";
+  if (["PLACEMENT_PRODUCT_PAGE", "PRODUCT_PAGE", "DETAIL_PAGE", "DETAIL_PAGE_ON_AMAZON"].includes(placement)) return "商品页面";
+  if (["PLACEMENT_OFF_AMAZON", "OFF_AMAZON"].includes(placement)) return "亚马逊站外";
   return value || "未知位置";
 }
 
 function adsCampaignPerformanceTable(campaign, currency) {
   const rows = [
     { label: "综合", metrics: campaign.metrics, complete: true },
-    ...["顶部搜索", "其余搜索", "商品页面"].map(label => ({
+    ...["顶部搜索", "其余搜索", "商品页面", "亚马逊站外"].map(label => ({
       label,
       metrics: campaign.placements.find(item => adsPlacementLabel(item.placement) === label) || null,
       complete: false
