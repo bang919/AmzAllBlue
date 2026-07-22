@@ -6846,7 +6846,8 @@ function adsReportWaitTimeoutMs() {
 }
 
 function adsReportPollMs() {
-  return Math.max(3000, Number(process.env.AMZ_ADS_REPORT_POLL_MS || 15_000));
+  // 广告回补报告通常需要异步生成；每分钟查询一次即可，避免无意义地频繁轮询 Amazon。
+  return Math.max(3000, Number(process.env.AMZ_ADS_REPORT_POLL_MS || 60_000));
 }
 
 function adsPublicConfig() {
