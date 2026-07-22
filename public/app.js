@@ -91,7 +91,7 @@ const FBA_COLUMN_WIDTHS_KEY = "amazonAggregator.fbaColumnWidths.v1";
 const FBA_REPLENISHMENT_OVERRIDES_KEY = "amazonAggregator.fbaReplenishment.overrides.v1";
 const FBA_REPLENISHMENT_MULTIPLIER_KEY = "amazonAggregator.fbaReplenishment.multiplier.v1";
 const FACTORY_COLUMN_WIDTH_KEY = "amazonAggregator.factoryColumnWidth.v1";
-const ADS_HISTORY_PREFERENCES_KEY = "amazonAggregator.adsHistoryPreferences.v1";
+const ADS_HISTORY_PREFERENCES_KEY = "amazonAggregator.adsHistoryPreferences.v2";
 const fbaDateStatus = new Map();
 let dateRangePickerOpen = false;
 let datePickerMonth = "";
@@ -3561,13 +3561,8 @@ function isAdsKeywordComplete(keyword) {
 }
 
 function saveAdsHistoryPreferences() {
-  const keywordId = String(adsHistoryState.keywordId || "");
-  if (!keywordId) return;
-  adsHistoryPreferences[keywordId] = {
-    childAsin: adsHistoryState.childAsin,
+  adsHistoryPreferences = {
     matchType: adsHistoryState.matchType,
-    startDate: adsHistoryState.startDate,
-    endDate: adsHistoryState.endDate,
     metricA: adsHistoryState.metricA,
     metricB: adsHistoryState.metricB
   };
@@ -3580,19 +3575,17 @@ function saveAdsHistoryPreferences() {
 
 function resetAdsHistoryState(keyword) {
   if (adsHistoryState.keywordId === keyword.id) return;
-  const saved = adsHistoryPreferences[String(keyword.id)] || {};
-  const childAsins = new Set(keyword.campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)));
+  const saved = adsHistoryPreferences;
   const matchTypes = new Set(keyword.campaigns.map(campaign => campaign.matchType));
   const validMetric = key => Boolean(ADS_HISTORY_METRICS[key]) && !ADS_HISTORY_METRICS[key].unavailable;
   const metricA = validMetric(saved.metricA) ? saved.metricA : "impressions";
   const metricB = validMetric(saved.metricB) && saved.metricB !== metricA ? saved.metricB : "clicks";
-  const hasSavedRange = isValidDateValue(saved.startDate) && isValidDateValue(saved.endDate) && saved.startDate <= saved.endDate;
   adsHistoryState = {
     keywordId: keyword.id,
-    childAsin: childAsins.has(saved.childAsin) ? saved.childAsin : "ALL",
+    childAsin: "ALL",
     matchType: matchTypes.has(saved.matchType) ? saved.matchType : "ALL",
-    startDate: hasSavedRange ? saved.startDate : (adsWorkspace.range?.startDate || ""),
-    endDate: hasSavedRange ? saved.endDate : (adsWorkspace.range?.endDate || ""),
+    startDate: adsWorkspace.range?.startDate || "",
+    endDate: adsWorkspace.range?.endDate || "",
     metricA,
     metricB
   };
@@ -5542,7 +5535,6 @@ $("#adsHistoryDatePicker").addEventListener("click", event => {
     adsHistoryState.startDate = range.startDate;
     adsHistoryState.endDate = range.endDate;
     adsHistoryDatePickerMonth = range.endDate.slice(0, 7);
-    saveAdsHistoryPreferences();
     updateAdsHistoryDateRangeInput();
     closeAdsHistoryDatePicker();
     return;
@@ -5554,13 +5546,11 @@ $("#adsHistoryDatePicker").addEventListener("click", event => {
     adsHistoryState.startDate = date;
     adsHistoryState.endDate = "";
     adsHistoryDatePickerMonth = date.slice(0, 7);
-    saveAdsHistoryPreferences();
     updateAdsHistoryDateRangeInput();
     renderAdsHistoryDatePicker();
     return;
   }
   adsHistoryState.endDate = date;
-  saveAdsHistoryPreferences();
   updateAdsHistoryDateRangeInput();
   closeAdsHistoryDatePicker();
 });
