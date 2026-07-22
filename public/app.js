@@ -3978,6 +3978,13 @@ function renderAdsHistoryChart(data) {
       ${pathB ? `<polyline points="${pathB}" class="ads-chart-line secondary"></polyline>` : ""}
       ${points.map((point, index) => {
         const x = bounds.left + (index / Math.max(1, points.length - 1)) * bounds.width;
+        const tooltip = encodeURIComponent(JSON.stringify({
+          title: `${point.date || "未知日期"}（美国时间）`,
+          rows: [
+            { label: configA.label, value: formatAdsHistoryValue(point[metricA], metricA, currency), color: "#2563eb" },
+            { label: configB.label, value: formatAdsHistoryValue(point[metricB], metricB, currency), color: "#f97316" }
+          ]
+        }));
         const circles = [];
         for (const [key, value, max, className] of [[metricA, point[metricA], maxA || 1, "primary"], [metricB, point[metricB], maxB || 1, "secondary"]]) {
           if (value === null || value === undefined || !Number.isFinite(Number(value))) continue;
@@ -3985,7 +3992,9 @@ function renderAdsHistoryChart(data) {
           const y = ADS_HISTORY_METRICS[key]?.unit === "rank" ? bounds.top + ratio * bounds.height : bounds.top + bounds.height - ratio * bounds.height;
           circles.push(`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6" class="ads-chart-point ${className}"><title>${escapeHtml(point.date)} · ${escapeHtml(ADS_HISTORY_METRICS[key].label)} ${escapeHtml(formatAdsHistoryValue(value, key, currency))}</title></circle>`);
         }
-        return circles.join("");
+        // 使用覆盖整条日期竖线的感应区，不要求用户精准停在 2.6px 的数据点上。
+        const hitWidth = bounds.width / Math.max(1, points.length - 1);
+        return `${circles.join("")}<rect class="ads-chart-hit" x="${Math.max(bounds.left, x - hitWidth / 2).toFixed(1)}" y="${bounds.top}" width="${Math.min(hitWidth, bounds.left + bounds.width - Math.max(bounds.left, x - hitWidth / 2)).toFixed(1)}" height="${bounds.height}" data-sif-chart-tooltip="${tooltip}"></rect>`;
       }).join("")}
     </svg>
     ${!numericA.length && !numericB.length ? `<div class="ads-history-empty">所选时间范围还没有数据，请先同步广告表现。</div>` : ""}`;

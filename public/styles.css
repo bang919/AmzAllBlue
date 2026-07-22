@@ -3181,6 +3181,7 @@ td.sif-index-col > span {
 .ads-history-legend i.primary { background: #2563eb; }
 .ads-history-legend i.secondary { background: #f97316; }
 .ads-history-svg { display: block; width: 100%; min-width: 560px; height: 280px; overflow: visible; }
+.ads-chart-hit { fill: transparent; pointer-events: all; cursor: crosshair; }
 .ads-chart-grid { stroke: #e5e7eb; stroke-width: 1; }
 .ads-chart-axis,
 .ads-chart-date { fill: #64748b; font-size: 9px; }
