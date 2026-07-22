@@ -9977,9 +9977,10 @@ async function enqueueAdsSync(startDate, endDate) {
   const profileToday = formatDateInTimeZone(new Date(), profile.timezone || US_MARKETPLACE_TIME_ZONE);
   if (profileToday >= safeStart && profileToday <= safeEnd) await captureAdsSettingsDaily(profile, profileToday);
   const jobs = [];
-  // 关键词历史图只依赖 Ad Group 的每日表现；一个报表覆盖当前 Profile 内所有受管 Ad Group，
-  // 再由本地 ID 映射汇总到子 ASIN 和关键词。展示位置数据改为后续单独同步，避免每次同步多等一份报表。
-  for (const kind of ["AD_GROUP"]) {
+  // 关键词历史图由 Ad Group 的每日表现提供；展示位置则是 Campaign 级补充报表。
+  // 两份报表都覆盖当前 Profile 内所有受管广告，随后按本地 Campaign / Ad Group 映射汇总。
+  // 位置报表必须与核心表现一起入队，否则 AI 无法判断顶部搜索、其余搜索和商品页的差异。
+  for (const kind of ["AD_GROUP", "PLACEMENT"]) {
     const id = randomUUID();
     const dedupeKey = `${profile.profileId}|${kind}|${safeStart}|${safeEnd}`;
     try {
