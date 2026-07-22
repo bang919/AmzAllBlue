@@ -2786,11 +2786,17 @@ td.sif-index-col > span {
   resize: vertical;
 }
 
-.sif-traffic-audit-panel { display: grid; gap: 9px; padding: 16px 20px; }
-.sif-traffic-audit-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
-.sif-traffic-audit-head > div { display: grid; gap: 4px; }
-.sif-traffic-audit-head strong { color: #0f172a; font-size: 15px; }
+.sif-keyword-monitor-panel { padding: 0; overflow: hidden; }
+.sif-traffic-audit-panel { padding: 0 20px; }
+.sif-traffic-audit-details { display: grid; }
+.sif-traffic-audit-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 0; cursor: pointer; list-style: none; }
+.sif-traffic-audit-head::-webkit-details-marker { display: none; }
+.sif-traffic-audit-head::before { content: "▸"; margin-right: 9px; color: #475569; font-size: 17px; font-weight: 800; line-height: 1; transition: transform .16s ease; }
+.sif-traffic-audit-details[open] .sif-traffic-audit-head::before { transform: rotate(90deg); }
+.sif-traffic-audit-head strong { margin-right: auto; color: #0f172a; font-size: 15px; }
+.sif-traffic-audit-content { display: grid; gap: 9px; }
 .sif-traffic-audit-head span:not(.ads-auth-status) { color: #64748b; font-size: 12px; }
+.sif-keyword-monitor-divider { height: 1px; margin: 0 20px; background: var(--line); }
 .sif-traffic-audit-config { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 12px; }
 .sif-traffic-audit-config label { display: grid; flex: 1; gap: 6px; color: #475569; font-size: 12px; font-weight: 700; }
 .sif-traffic-audit-asin-input { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 40px; padding: 5px 8px; border: 1px solid #cbd5e1; border-radius: 8px; background: #fff; }
@@ -2818,14 +2824,6 @@ td.sif-index-col > span {
 .sif-traffic-audit-card ul { display: grid; gap: 4px; margin: 0; padding-left: 16px; color: #64748b; font-size: 11px; line-height: 1.45; }
 .sif-traffic-audit-card footer { color: #64748b; font-size: 10px; }
 .sif-traffic-audit-time { color: #94a3b8; font-size: 11px; }
-.sif-traffic-audit-history { border-top: 1px solid #e2e8f0; padding-top: 10px; }
-.sif-traffic-audit-history summary { cursor: pointer; color: #475569; font-size: 12px; font-weight: 800; }
-.sif-traffic-audit-history > div { display: grid; gap: 8px; margin-top: 10px; }
-.sif-traffic-audit-history article { padding: 9px 10px; border-radius: 7px; background: #f8fafc; }
-.sif-traffic-audit-history article header { display: flex; justify-content: space-between; gap: 12px; color: #334155; font-size: 11px; }
-.sif-traffic-audit-history article header span { color: #64748b; }
-.sif-traffic-audit-history article p { margin: 6px 0; color: #475569; font-size: 11px; line-height: 1.45; }
-.sif-traffic-audit-history article ul { display: grid; gap: 3px; margin: 0; padding-left: 16px; color: #64748b; font-size: 10px; }
 .sif-traffic-audit-history-dialog { width: min(1120px, calc(100vw - 32px)); }
 .sif-traffic-audit-history-competitors { color: #64748b; font-size: 10px; }
 
