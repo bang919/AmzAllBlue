@@ -91,6 +91,7 @@ const FBA_COLUMN_WIDTHS_KEY = "amazonAggregator.fbaColumnWidths.v1";
 const FBA_REPLENISHMENT_OVERRIDES_KEY = "amazonAggregator.fbaReplenishment.overrides.v1";
 const FBA_REPLENISHMENT_MULTIPLIER_KEY = "amazonAggregator.fbaReplenishment.multiplier.v1";
 const FACTORY_COLUMN_WIDTH_KEY = "amazonAggregator.factoryColumnWidth.v1";
+const ADS_HISTORY_PREFERENCES_KEY = "amazonAggregator.adsHistoryPreferences.v1";
 const fbaDateStatus = new Map();
 let dateRangePickerOpen = false;
 let datePickerMonth = "";
@@ -115,6 +116,12 @@ try {
   fbaReplenishmentOverrides = JSON.parse(localStorage.getItem(FBA_REPLENISHMENT_OVERRIDES_KEY) || "{}") || {};
 } catch {
   fbaReplenishmentOverrides = {};
+}
+let adsHistoryPreferences = {};
+try {
+  adsHistoryPreferences = JSON.parse(localStorage.getItem(ADS_HISTORY_PREFERENCES_KEY) || "{}") || {};
+} catch {
+  adsHistoryPreferences = {};
 }
 
 const fbaReplenishmentTargets = {
@@ -3553,16 +3560,41 @@ function isAdsKeywordComplete(keyword) {
   );
 }
 
+function saveAdsHistoryPreferences() {
+  const keywordId = String(adsHistoryState.keywordId || "");
+  if (!keywordId) return;
+  adsHistoryPreferences[keywordId] = {
+    childAsin: adsHistoryState.childAsin,
+    matchType: adsHistoryState.matchType,
+    startDate: adsHistoryState.startDate,
+    endDate: adsHistoryState.endDate,
+    metricA: adsHistoryState.metricA,
+    metricB: adsHistoryState.metricB
+  };
+  try {
+    localStorage.setItem(ADS_HISTORY_PREFERENCES_KEY, JSON.stringify(adsHistoryPreferences));
+  } catch {
+    // 本地存储不可用时不影响历史图表本身。
+  }
+}
+
 function resetAdsHistoryState(keyword) {
   if (adsHistoryState.keywordId === keyword.id) return;
+  const saved = adsHistoryPreferences[String(keyword.id)] || {};
+  const childAsins = new Set(keyword.campaigns.flatMap(campaign => campaign.units.map(unit => unit.childAsin)));
+  const matchTypes = new Set(keyword.campaigns.map(campaign => campaign.matchType));
+  const validMetric = key => Boolean(ADS_HISTORY_METRICS[key]) && !ADS_HISTORY_METRICS[key].unavailable;
+  const metricA = validMetric(saved.metricA) ? saved.metricA : "impressions";
+  const metricB = validMetric(saved.metricB) && saved.metricB !== metricA ? saved.metricB : "clicks";
+  const hasSavedRange = isValidDateValue(saved.startDate) && isValidDateValue(saved.endDate) && saved.startDate <= saved.endDate;
   adsHistoryState = {
     keywordId: keyword.id,
-    childAsin: "ALL",
-    matchType: "ALL",
-    startDate: adsWorkspace.range?.startDate || "",
-    endDate: adsWorkspace.range?.endDate || "",
-    metricA: "impressions",
-    metricB: "clicks"
+    childAsin: childAsins.has(saved.childAsin) ? saved.childAsin : "ALL",
+    matchType: matchTypes.has(saved.matchType) ? saved.matchType : "ALL",
+    startDate: hasSavedRange ? saved.startDate : (adsWorkspace.range?.startDate || ""),
+    endDate: hasSavedRange ? saved.endDate : (adsWorkspace.range?.endDate || ""),
+    metricA,
+    metricB
   };
 }
 
@@ -4017,6 +4049,7 @@ async function loadAdsKeywordHistory(keywordId) {
     metricA: $("#adsHistoryMetricA")?.value || adsHistoryState.metricA,
     metricB: $("#adsHistoryMetricB")?.value || adsHistoryState.metricB
   };
+  saveAdsHistoryPreferences();
   chart.innerHTML = `<div class="ads-history-loading">正在读取历史数据…</div>`;
   const query = new URLSearchParams({
     startDate: adsHistoryState.startDate,
@@ -5509,6 +5542,7 @@ $("#adsHistoryDatePicker").addEventListener("click", event => {
     adsHistoryState.startDate = range.startDate;
     adsHistoryState.endDate = range.endDate;
     adsHistoryDatePickerMonth = range.endDate.slice(0, 7);
+    saveAdsHistoryPreferences();
     updateAdsHistoryDateRangeInput();
     closeAdsHistoryDatePicker();
     return;
@@ -5520,11 +5554,13 @@ $("#adsHistoryDatePicker").addEventListener("click", event => {
     adsHistoryState.startDate = date;
     adsHistoryState.endDate = "";
     adsHistoryDatePickerMonth = date.slice(0, 7);
+    saveAdsHistoryPreferences();
     updateAdsHistoryDateRangeInput();
     renderAdsHistoryDatePicker();
     return;
   }
   adsHistoryState.endDate = date;
+  saveAdsHistoryPreferences();
   updateAdsHistoryDateRangeInput();
   closeAdsHistoryDatePicker();
 });
