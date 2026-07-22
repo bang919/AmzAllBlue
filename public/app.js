@@ -5584,6 +5584,30 @@ function sifTrafficAuditActionLabel(action) {
   return ({ ADD: "建议新增投放", DROP: "建议停止投放", SCALE: "建议扩大投放" })[String(action || "").toUpperCase()] || "AI关键词体检建议";
 }
 
+function sifTrafficAuditParentAsin(run = {}) {
+  if (run.parentAsin) return String(run.parentAsin);
+  const targetAsin = String(run.targetAsin || selectedSifAsin).toUpperCase();
+  return adsWorkspace.products.find(product => product.children?.some(child => String(child.asin).toUpperCase() === targetAsin))?.parentAsin || "";
+}
+
+function sifTrafficAuditKeywordIsPlaced(keyword, parentAsin) {
+  const normalizedKeyword = String(keyword || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
+  const checkedByAudit = Array.isArray(sifTrafficAuditState?.placedKeywords) && sifTrafficAuditState.placedKeywords.some(item =>
+    item.parentAsin === parentAsin && item.normalizedKeyword === normalizedKeyword
+  );
+  return Boolean(normalizedKeyword && parentAsin && (checkedByAudit || adsWorkspace.keywords.some(item =>
+    item.parentAsin === parentAsin
+    && item.lifecycleStatus !== "STOPPED"
+    && String(item.keyword || "").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US") === normalizedKeyword
+  )));
+}
+
+function sifTrafficAuditPlacementButton(item, run) {
+  const parentAsin = sifTrafficAuditParentAsin(run);
+  if (String(item?.action || "").toUpperCase() !== "ADD" || !parentAsin || sifTrafficAuditKeywordIsPlaced(item?.keyword, parentAsin)) return "";
+  return `<button type="button" class="sif-traffic-audit-place-button" data-sif-traffic-audit-place="${escapeHtml(item.keyword || "")}" data-sif-traffic-audit-parent="${escapeHtml(parentAsin)}">投放</button>`;
+}
+
 function renderSifTrafficAudit() {
   const status = $("#sifTrafficAuditStatus");
   const chips = $("#sifTrafficAuditAsinChips");
@@ -5637,7 +5661,7 @@ function renderSifTrafficAudit() {
   }
   const output = run.output || {};
   const recommendations = Array.isArray(output.recommendations) ? output.recommendations : [];
-  report.innerHTML = `<small class="sif-traffic-audit-time">本次 AI关键词体检：${escapeHtml(formatDate(run.completedAt || run.createdAt || ""))}</small>${output.summary ? `<p class="sif-traffic-audit-summary">${escapeHtml(output.summary)}</p>` : ""}<div class="sif-traffic-audit-recommendations">${recommendations.map(item => `<article class="sif-traffic-audit-card"><header><strong>${escapeHtml(item.keyword || "-")}</strong><span class="${String(item.strength || "").toLowerCase()}">${escapeHtml(sifTrafficAuditActionLabel(item.action))} · ${item.strength === "STRONG" ? "强烈" : "普通"}</span></header><p>${escapeHtml(item.conclusion || "")}</p>${Array.isArray(item.evidence) && item.evidence.length ? `<ul>${item.evidence.map(value => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : ""}<footer>${item.nextStep ? `下一步：${escapeHtml(item.nextStep)}` : ""}${item.reviewDays ? ` · ${Number(item.reviewDays)} 天后复盘` : ""}</footer></article>`).join("")}</div>`;
+  report.innerHTML = `<small class="sif-traffic-audit-time">本次 AI关键词体检：${escapeHtml(formatDate(run.completedAt || run.createdAt || ""))}</small>${output.summary ? `<p class="sif-traffic-audit-summary">${escapeHtml(output.summary)}</p>` : ""}<div class="sif-traffic-audit-recommendations">${recommendations.map(item => `<article class="sif-traffic-audit-card"><header><strong>${escapeHtml(item.keyword || "-")}</strong><div class="sif-traffic-audit-card-actions"><span class="${String(item.strength || "").toLowerCase()}">${escapeHtml(sifTrafficAuditActionLabel(item.action))} · ${item.strength === "STRONG" ? "强烈" : "普通"}</span>${sifTrafficAuditPlacementButton(item, run)}</div></header><p>${escapeHtml(item.conclusion || "")}</p>${Array.isArray(item.evidence) && item.evidence.length ? `<ul>${item.evidence.map(value => `<li>${escapeHtml(value)}</li>`).join("")}</ul>` : ""}<footer>${item.nextStep ? `下一步：${escapeHtml(item.nextStep)}` : ""}${item.reviewDays ? ` · ${Number(item.reviewDays)} 天后复盘` : ""}</footer></article>`).join("")}</div>`;
 }
 
 async function loadSifTrafficAudit(asin = selectedSifAsin, { keepCompetitors = false } = {}) {
@@ -5684,8 +5708,8 @@ function renderSifTrafficAuditHistoryDialog() {
     const recommendations = Array.isArray(output.recommendations) ? output.recommendations : [];
     const statusText = run.status === "COMPLETE" ? "分析完成" : run.status === "FAILED" ? "分析失败" : "分析中";
     const analysis = output.summary ? `<p>${escapeHtml(output.summary)}</p>` : `<p class="ads-ai-history-muted">${escapeHtml(run.error || (run.status === "RUNNING" ? "分析仍在进行中" : "本次没有可展示的总结"))}</p>`;
-    const suggestionHtml = recommendations.length ? recommendations.map(item => `<div class="ads-ai-history-recommendation"><strong>${escapeHtml(item.keyword || "-")} · ${escapeHtml(sifTrafficAuditActionLabel(item.action))}</strong><span class="ads-ai-history-action-status">${item.strength === "STRONG" ? "强烈" : "普通"}</span><p>${escapeHtml(item.conclusion || "")}</p></div>`).join("") : '<p class="ads-ai-history-muted">本次没有建议</p>';
-    return `<tbody class="ads-ai-history-run"><tr><td rowspan="2" class="ads-ai-history-time"><strong>${escapeHtml(formatDate(run.createdAt || run.completedAt || ""))}</strong><span class="sif-traffic-audit-history-competitors">对比：${escapeHtml((run.competitorAsins || []).join("、") || "-")}</span></td><td><div class="ads-ai-history-cell"><strong>总体诊断</strong>${analysis}</div></td><td rowspan="2" class="ads-ai-history-status"><span class="${String(run.status || "").toLowerCase()}">${escapeHtml(statusText)}</span>${run.completedAt ? `<small>${escapeHtml(formatDate(run.completedAt))}</small>` : ""}</td></tr><tr><td><div class="ads-ai-history-cell"><strong>建议（${recommendations.length}）</strong>${suggestionHtml}</div></td></tr></tbody>`;
+    const suggestionHtml = recommendations.length ? recommendations.map(item => `<div class="ads-ai-history-recommendation"><div class="sif-traffic-audit-history-recommendation-head"><strong>${escapeHtml(item.keyword || "-")} · ${escapeHtml(sifTrafficAuditActionLabel(item.action))}</strong><span class="ads-ai-history-action-status ${String(item.strength || "").toLowerCase()}">${item.strength === "STRONG" ? "强烈" : "普通"}</span>${sifTrafficAuditPlacementButton(item, run)}</div><p>${escapeHtml(item.conclusion || "")}</p></div>`).join("") : '<p class="ads-ai-history-muted">本次没有建议</p>';
+    return `<tbody class="ads-ai-history-run"><tr><td rowspan="2" class="ads-ai-history-time"><strong>${escapeHtml(formatDate(run.createdAt || run.completedAt || ""))}</strong><span class="sif-traffic-audit-history-competitors">对比：${escapeHtml((run.competitorAsins || []).join("、") || "-")}</span></td><td><div class="ads-ai-history-cell"><strong>总体诊断</strong>${analysis}</div></td><td rowspan="2" class="ads-ai-history-status"><button type="button" class="sif-traffic-audit-delete-button" data-sif-traffic-audit-delete="${escapeHtml(run.id || "")}" aria-label="删除本次体检历史" title="删除本次体检历史">×</button><span class="${String(run.status || "").toLowerCase()}">${escapeHtml(statusText)}</span>${run.completedAt ? `<small>${escapeHtml(formatDate(run.completedAt))}</small>` : ""}</td></tr><tr><td><div class="ads-ai-history-cell"><strong>建议（${recommendations.length}）</strong>${suggestionHtml}</div></td></tr></tbody>`;
   }).join("");
   body.innerHTML = `<div class="ads-ai-history-table-wrap"><table class="ads-ai-history-table"><thead><tr><th>分析时间与对比 ASIN</th><th>分析内容</th><th>状态</th></tr></thead>${rows}</table></div>`;
 }
@@ -5716,6 +5740,43 @@ async function startSifTrafficAudit() {
     alert(error.message);
     renderSifTrafficAudit();
   }
+}
+
+async function openSifTrafficAuditPlacement(keyword, parentAsin) {
+  if (!keyword || !parentAsin) return;
+  if (sifTrafficAuditKeywordIsPlaced(keyword, parentAsin)) {
+    alert(`关键词“${keyword}”已在该父 ASIN 下投放，无需重复添加。`);
+    renderSifTrafficAudit();
+    renderSifTrafficAuditHistoryDialog();
+    return;
+  }
+  const historyDialog = $("#sifTrafficAuditHistoryDialog");
+  if (historyDialog?.open) historyDialog.close();
+  switchModule("ads");
+  if (!adsLoaded || !adsWorkspace.products.length) await refreshAds();
+  else await loadAdsWorkspace();
+  selectedAdsParentAsin = parentAsin;
+  if (sifTrafficAuditKeywordIsPlaced(keyword, parentAsin)) {
+    alert(`关键词“${keyword}”已在该父 ASIN 下投放，无需重复添加。`);
+    return;
+  }
+  if (!adsWorkspace.products.some(product => product.parentAsin === parentAsin)) {
+    alert("未找到该父 ASIN 的广告商品，无法创建投放。");
+    return;
+  }
+  renderAdsWorkspace();
+  renderAdsKeywordForm(parentAsin);
+  const input = $("#adsKeywordInputRows .ads-form-keyword");
+  if (input) input.value = keyword;
+  $("#adsKeywordDialog").showModal();
+  input?.focus();
+}
+
+async function deleteSifTrafficAuditHistory(runId) {
+  if (!runId || !confirm("确定删除这条 AI关键词体检历史吗？此操作无法恢复。")) return;
+  await api(`/api/sif-traffic-audit/${encodeURIComponent(runId)}`, { method: "DELETE" });
+  await loadSifTrafficAudit(selectedSifAsin, { keepCompetitors: true });
+  renderSifTrafficAuditHistoryDialog();
 }
 
 function sifNumericValue(value) {
@@ -6150,6 +6211,12 @@ document.addEventListener("click", event => {
     sifTrafficAuditCompetitorAsins = sifTrafficAuditCompetitorAsins.filter(asin => asin !== removeTrafficAuditAsin.dataset.sifTrafficAuditRemove);
     renderSifTrafficAudit();
   }
+  const placeTrafficAuditKeyword = event.target.closest("[data-sif-traffic-audit-place]");
+  if (placeTrafficAuditKeyword) {
+    openSifTrafficAuditPlacement(placeTrafficAuditKeyword.dataset.sifTrafficAuditPlace, placeTrafficAuditKeyword.dataset.sifTrafficAuditParent).catch(error => alert(error.message));
+  }
+  const deleteTrafficAuditHistory = event.target.closest("[data-sif-traffic-audit-delete]");
+  if (deleteTrafficAuditHistory) deleteSifTrafficAuditHistory(deleteTrafficAuditHistory.dataset.sifTrafficAuditDelete).catch(error => alert(error.message));
   if (event.target.closest("[data-close-sif-dialog]")) $("#sifKeywordDialog").close();
   if (event.target.closest("[data-close-sif-history]")) {
     closeSifDetailDatePicker();

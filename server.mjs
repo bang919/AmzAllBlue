@@ -6265,13 +6265,35 @@ async function startSifTrafficAudit(body = {}) {
 async function readSifTrafficAuditState(asin) {
   const profile = await requireSelectedAdsProfile();
   const targetAsin = sifTrafficAuditAsin(asin);
-  if (!targetAsin) return { targetAsin: "", latestRun: null, history: [] };
+  if (!targetAsin) return { targetAsin: "", latestRun: null, history: [], placedKeywords: [] };
   const [rows] = await getMysqlPool().query(`
     SELECT * FROM sif_traffic_audit_runs WHERE profile_id = ? AND target_asin = ? ORDER BY created_at DESC LIMIT 20
   `, [String(profile.profileId), targetAsin]);
-  const normalize = row => ({ id: row.id, status: row.status, targetAsin: row.target_asin, competitorAsins: parseMysqlJson(row.competitor_asins) || [], output: parseMysqlJson(row.output_payload), error: row.last_error || "", createdAt: row.created_at, completedAt: row.completed_at });
+  const parentAsins = [...new Set(rows.map(row => String(row.parent_asin || "").trim()).filter(Boolean))];
+  let placedKeywords = [];
+  if (parentAsins.length) {
+    const [keywordRows] = await getMysqlPool().query(`
+      SELECT parent_asin, normalized_keyword
+      FROM ads_keywords
+      WHERE profile_id = ? AND parent_asin IN (?) AND lifecycle_status IN ('ACTIVE', 'CREATING', 'STOPPING')
+    `, [String(profile.profileId), parentAsins]);
+    placedKeywords = keywordRows.map(row => ({ parentAsin: row.parent_asin, normalizedKeyword: row.normalized_keyword }));
+  }
+  const normalize = row => ({ id: row.id, status: row.status, parentAsin: row.parent_asin || "", targetAsin: row.target_asin, competitorAsins: parseMysqlJson(row.competitor_asins) || [], output: parseMysqlJson(row.output_payload), error: row.last_error || "", createdAt: row.created_at, completedAt: row.completed_at });
   const runs = rows.map(normalize);
-  return { targetAsin, latestRun: runs[0] || null, history: runs.slice(1) };
+  return { targetAsin, latestRun: runs[0] || null, history: runs.slice(1), placedKeywords };
+}
+
+async function deleteSifTrafficAuditRun(runId) {
+  const profile = await requireSelectedAdsProfile();
+  const id = String(runId || "").trim();
+  if (!id) throw new Error("缺少体检历史记录");
+  const [result] = await getMysqlPool().query(
+    "DELETE FROM sif_traffic_audit_runs WHERE id = ? AND profile_id = ?",
+    [id, String(profile.profileId)]
+  );
+  if (!Number(result.affectedRows || 0)) throw new Error("体检历史不存在或无权删除");
+  return { deleted: true };
 }
 
 async function callOpenAI(messages, jsonMode = false) {
@@ -10300,6 +10322,11 @@ async function handleApi(req, res, url) {
 
   if (req.method === "POST" && url.pathname === "/api/sif-traffic-audit") {
     return sendJson(res, await startSifTrafficAudit(await parseBody(req)), 202);
+  }
+
+  const sifTrafficAuditRunMatch = url.pathname.match(/^\/api\/sif-traffic-audit\/([^/]+)$/);
+  if (req.method === "DELETE" && sifTrafficAuditRunMatch) {
+    return sendJson(res, await deleteSifTrafficAuditRun(decodeURIComponent(sifTrafficAuditRunMatch[1])));
   }
 
   if (req.method === "GET" && url.pathname === "/api/gmail/auth-url") {

@@ -2820,6 +2820,15 @@ td.sif-index-col > span {
 .sif-traffic-audit-card header strong { color: #0f172a; font-size: 13px; }
 .sif-traffic-audit-card header span { padding: 3px 6px; border-radius: 4px; background: #eff6ff; color: #1d4ed8; font-size: 10px; font-weight: 800; }
 .sif-traffic-audit-card header span.strong { background: #fee2e2; color: #b91c1c; }
+.sif-traffic-audit-card-actions { display: inline-flex; align-items: center; justify-content: end; gap: 6px; }
+.sif-traffic-audit-place-button { min-height: 25px; padding: 2px 8px; border: 1px solid #2563eb; border-radius: 5px; background: #2563eb; color: #fff; box-shadow: none; font-size: 11px; font-weight: 800; }
+.sif-traffic-audit-place-button:hover { border-color: #1d4ed8; background: #1d4ed8; }
+.ads-ai-history-action-status.normal { background: #dbeafe; color: #1d4ed8; }
+.ads-ai-history-action-status.strong { background: #fee2e2; color: #b91c1c; }
+.sif-traffic-audit-history-recommendation-head { grid-column: 1 / -1; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.ads-ai-history-status { position: relative; }
+.sif-traffic-audit-delete-button { position: absolute; top: 4px; right: 5px; min-height: 24px; padding: 0 5px; border: 0; background: transparent; color: #ef4444; box-shadow: none; font-size: 24px; font-weight: 800; line-height: 1; }
+.sif-traffic-audit-delete-button:hover { color: #dc2626; background: #fef2f2; }
 .sif-traffic-audit-card p { margin: 0; color: #334155; font-size: 12px; line-height: 1.5; }
 .sif-traffic-audit-card ul { display: grid; gap: 4px; margin: 0; padding-left: 16px; color: #64748b; font-size: 11px; line-height: 1.45; }
 .sif-traffic-audit-card footer { color: #64748b; font-size: 10px; }
