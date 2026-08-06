@@ -589,6 +589,7 @@ async function ensureAdsMysqlSchema(pool) {
       id VARCHAR(64) NOT NULL,
       profile_id VARCHAR(64) NOT NULL,
       keyword_id BIGINT UNSIGNED NOT NULL,
+      batch_id VARCHAR(64) NULL,
       status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
       model_name VARCHAR(128) NOT NULL DEFAULT '',
       prompt_version VARCHAR(64) NOT NULL,
@@ -602,6 +603,7 @@ async function ensureAdsMysqlSchema(pool) {
       PRIMARY KEY (id),
       KEY idx_ads_ai_runs_keyword (keyword_id, created_at),
       KEY idx_ads_ai_runs_profile_status (profile_id, status, created_at),
+      KEY idx_ads_ai_runs_batch_status (batch_id, status, created_at),
       CONSTRAINT fk_ads_ai_run_keyword FOREIGN KEY (keyword_id) REFERENCES ads_keywords (id) ON UPDATE RESTRICT ON DELETE CASCADE
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
@@ -655,6 +657,7 @@ async function ensureAdsMysqlSchema(pool) {
       trigger_source VARCHAR(32) NOT NULL,
       schedule_date DATE NOT NULL,
       run_key VARCHAR(64) NOT NULL DEFAULT '',
+      system_run_token CHAR(36) NULL,
       status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
       keyword_count INT UNSIGNED NOT NULL DEFAULT 0,
       input_payload JSON NULL,
@@ -665,10 +668,15 @@ async function ensureAdsMysqlSchema(pool) {
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
       UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date, run_key),
-      KEY idx_ads_ai_batch_profile_status (profile_id, status, created_at)
+      KEY idx_ads_ai_batch_profile_status (profile_id, status, created_at),
+      KEY idx_ads_ai_batch_system_run (system_run_token, status)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query("ALTER TABLE ads_ai_analysis_runs ADD COLUMN batch_id VARCHAR(64) NULL AFTER keyword_id").catch(() => {});
+  await pool.query("ALTER TABLE ads_ai_analysis_runs ADD KEY idx_ads_ai_runs_batch_status (batch_id, status, created_at)").catch(() => {});
   await pool.query("ALTER TABLE ads_ai_batch_runs ADD COLUMN run_key VARCHAR(64) NOT NULL DEFAULT '' AFTER schedule_date").catch(() => {});
+  await pool.query("ALTER TABLE ads_ai_batch_runs ADD COLUMN system_run_token CHAR(36) NULL AFTER run_key").catch(() => {});
+  await pool.query("ALTER TABLE ads_ai_batch_runs ADD KEY idx_ads_ai_batch_system_run (system_run_token, status)").catch(() => {});
   await pool.query("ALTER TABLE ads_ai_batch_runs DROP INDEX uq_ads_ai_batch_daily").catch(() => {});
   await pool.query("ALTER TABLE ads_ai_batch_runs ADD UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date, run_key)").catch(() => {});
   await pool.query(`
@@ -1029,11 +1037,17 @@ async function stopSystemScheduleTask(taskKey) {
   await ensureSystemScheduleDefaults();
   if (!SYSTEM_SCHEDULE_TASKS[taskKey]) throw new Error("未知定时任务");
   const pool = getMysqlPool();
+  const [currentRows] = await pool.query("SELECT run_token FROM system_schedule_settings WHERE task_key = ?", [taskKey]);
   const [result] = await pool.query(
     "UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = 'CANCELLED', last_error = '用户已停止任务', retry_count = 0, next_retry_at = NULL WHERE task_key = ? AND last_status = 'RUNNING'",
     [taskKey]
   );
-  if (result.affectedRows) systemScheduleExecutions.get(taskKey)?.controller.abort();
+  if (result.affectedRows) {
+    systemScheduleExecutions.get(taskKey)?.controller.abort();
+    if (taskKey === "ADS_AI_ANALYSIS") {
+      await cancelAdsAiBatchRuns({ systemRunToken: currentRows[0]?.run_token || "", reason: "用户已停止系统计划" });
+    }
+  }
   return readSystemSchedules();
 }
 
@@ -8573,7 +8587,63 @@ async function expireStaleAdsAiAnalysisRuns(profileId, keywordId = null) {
   `, params);
 }
 
-async function executeAdsAiBatchAnalysisRuns(runs) {
+function adsAiBatchTimeoutMinutes() {
+  return Math.round(adsAiNumber(process.env.ADS_AI_BATCH_TIMEOUT_MINUTES, 10, 1, 60));
+}
+
+function adsAiBatchTimeoutError() {
+  return new Error(`广告 AI 批量分析超过 ${adsAiBatchTimeoutMinutes()} 分钟仍未完成，已停止并释放任务锁`);
+}
+
+async function cancelAdsAiBatchRuns({ batchIds = [], systemRunToken = "", reason }) {
+  const pool = getMysqlPool();
+  const ids = batchIds.map(String).filter(Boolean);
+  let rows = [];
+  if (ids.length) {
+    [rows] = await pool.query("SELECT id FROM ads_ai_batch_runs WHERE id IN (?) AND status = 'RUNNING'", [ids]);
+  } else if (systemRunToken) {
+    [rows] = await pool.query("SELECT id FROM ads_ai_batch_runs WHERE system_run_token = ? AND status = 'RUNNING'", [systemRunToken]);
+  } else {
+    [rows] = await pool.query("SELECT id FROM ads_ai_batch_runs WHERE status = 'RUNNING'");
+  }
+  const runningIds = rows.map(row => String(row.id));
+  if (!runningIds.length) return [];
+  await pool.query(
+    "UPDATE ads_ai_batch_runs SET status = 'CANCELLED', last_error = ?, completed_at = NOW() WHERE id IN (?) AND status = 'RUNNING'",
+    [reason, runningIds]
+  );
+  await pool.query(
+    "UPDATE ads_ai_analysis_runs SET status = 'CANCELLED', validation_error = ?, completed_at = NOW() WHERE batch_id IN (?) AND status = 'RUNNING'",
+    [reason, runningIds]
+  );
+  return runningIds;
+}
+
+async function recoverInterruptedAdsAiBatchRuns(reason = "服务重启，广告 AI 批量分析已中断，请重新执行") {
+  return cancelAdsAiBatchRuns({ reason });
+}
+
+async function assertAdsAiBatchActive(batchId, runs = [], execution = null) {
+  if (execution) await assertSystemScheduleExecutionActive(execution);
+  const timeoutMinutes = adsAiBatchTimeoutMinutes();
+  const [rows] = await getMysqlPool().query(`
+    SELECT status, started_at < DATE_SUB(NOW(), INTERVAL ? MINUTE) AS expired
+    FROM ads_ai_batch_runs WHERE id = ?
+  `, [timeoutMinutes, batchId]);
+  const row = rows[0];
+  if (!row || row.status === "CANCELLED") throw systemScheduleCancelledError();
+  if (row.status !== "RUNNING") throw new Error("广告 AI 批量分析已结束");
+  if (!Number(row.expired || 0)) return;
+  const error = adsAiBatchTimeoutError();
+  await getMysqlPool().query(
+    "UPDATE ads_ai_batch_runs SET status = 'FAILED', last_error = ?, completed_at = NOW() WHERE id = ? AND status = 'RUNNING'",
+    [error.message, batchId]
+  );
+  await Promise.all(runs.map(run => failAdsAiAnalysisRun(run.runId, null, error).catch(() => {})));
+  throw error;
+}
+
+async function executeAdsAiBatchAnalysisRuns(runs, assertActive = null) {
   let outputForAudit = null;
   try {
     const content = await callOpenAI([
@@ -8603,6 +8673,7 @@ async function executeAdsAiBatchAnalysisRuns(runs) {
     for (const run of runs) {
       const result = resultsByKeywordId.get(run.input.context.keywordId);
       try {
+        if (assertActive) await assertActive();
         if (!result) throw new Error("AI 批量结果缺少该关键词");
         const { keywordId, ...rawKeywordOutput } = result;
         const output = validateAdsAiOutput(rawKeywordOutput, run.input);
@@ -8610,12 +8681,14 @@ async function executeAdsAiBatchAnalysisRuns(runs) {
         await autoExecuteAdsAiRecommendations(run.runId, run.input);
         completed.push({ keywordId, runId: run.runId, status: "COMPLETE" });
       } catch (error) {
+        if (isSystemScheduleCancelledError(error)) throw error;
         await failAdsAiAnalysisRun(run.runId, result || outputForAudit, error);
         completed.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "FAILED", error: error.message });
       }
     }
     return { results: completed, rawOutput: outputForAudit };
   } catch (error) {
+    if (isSystemScheduleCancelledError(error)) throw error;
     await Promise.all(runs.map(run => failAdsAiAnalysisRun(run.runId, outputForAudit, error).catch(() => {})));
     throw error;
   }
@@ -8641,7 +8714,8 @@ function splitAdsAiBatchRuns(runs) {
   return { chunks, limits: { maxKeywords, maxInputChars } };
 }
 
-async function executeChunkedAdsAiBatchAnalysisRuns(runs, execution = null) {
+async function executeChunkedAdsAiBatchAnalysisRuns(runs, execution = null, batchId = "") {
+  const assertActive = () => assertAdsAiBatchActive(batchId, runs, execution);
   const precheckedRuns = [];
   const modelRuns = [];
   for (const run of runs) {
@@ -8653,10 +8727,11 @@ async function executeChunkedAdsAiBatchAnalysisRuns(runs, execution = null) {
   const chunkResults = [];
   for (const run of precheckedRuns) {
     try {
-      if (execution) await assertSystemScheduleExecutionActive(execution);
+      await assertActive();
       await executeAdsAiDeterministicPrecheckRun(run.runId, run.input, run.precheck);
       results.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "COMPLETE", source: "RULE_ENGINE" });
     } catch (error) {
+      if (isSystemScheduleCancelledError(error)) throw error;
       await failAdsAiAnalysisRun(run.runId, run.precheck, error).catch(() => {});
       results.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "FAILED", source: "RULE_ENGINE", error: error.message });
     }
@@ -8666,8 +8741,9 @@ async function executeChunkedAdsAiBatchAnalysisRuns(runs, execution = null) {
     const chunk = plan.chunks[index];
     const keywordIds = chunk.runs.map(run => run.input.context.keywordId);
     try {
-      if (execution) await assertSystemScheduleExecutionActive(execution);
-      const result = await executeAdsAiBatchAnalysisRuns(chunk.runs);
+      await assertActive();
+      const result = await executeAdsAiBatchAnalysisRuns(chunk.runs, assertActive);
+      await assertActive();
       results.push(...result.results.map(item => ({ ...item, source: "CCAI", chunk: index + 1 })));
       const chunkFailedCount = result.results.filter(item => item.status === "FAILED").length;
       chunkResults.push({
@@ -8679,6 +8755,7 @@ async function executeChunkedAdsAiBatchAnalysisRuns(runs, execution = null) {
         output: result.rawOutput
       });
     } catch (error) {
+      if (isSystemScheduleCancelledError(error)) throw error;
       const failed = chunk.runs.map(run => ({
         keywordId: run.input.context.keywordId, runId: run.runId, status: "FAILED", source: "CCAI", chunk: index + 1, error: error.message
       }));
@@ -8734,10 +8811,11 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
     if (runningManualRows[0]) throw new Error("已有手动广告 AI 批量分析正在执行，请等待完成或先停止");
   }
   const [batchInsert] = await pool.query(`
-    INSERT IGNORE INTO ads_ai_batch_runs (id, profile_id, trigger_source, schedule_date, run_key, status)
-    VALUES (?, ?, ?, ?, ?, 'RUNNING')
-  `, [batchId, String(profile.profileId), triggerSource, scheduleDate, runKey]);
+    INSERT IGNORE INTO ads_ai_batch_runs (id, profile_id, trigger_source, schedule_date, run_key, system_run_token, status)
+    VALUES (?, ?, ?, ?, ?, ?, 'RUNNING')
+  `, [batchId, String(profile.profileId), triggerSource, scheduleDate, runKey, options.execution?.runToken || null]);
   if (!Number(batchInsert.affectedRows || 0)) return { started: false, reason: "ALREADY_RUN" };
+  if (options.execution) options.execution.batchId = batchId;
   try {
     if (options.execution) await assertSystemScheduleExecutionActive(options.execution);
     await expireStaleAdsAiAnalysisRuns(profile.profileId);
@@ -8750,7 +8828,7 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
     `, [String(profile.profileId)]);
     const skipped = [];
     for (const goal of goalRows) {
-      if (options.execution) await assertSystemScheduleExecutionActive(options.execution);
+      await assertAdsAiBatchActive(batchId, runs, options.execution);
       const keywordId = String(goal.keyword_id);
       const keyword = { id: keywordId, parent_asin: goal.parent_asin };
       const reservation = await reserveAdsAiAnalysisRun(profile, keyword);
@@ -8760,6 +8838,7 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
       }
       runs.push(reservation.run);
     }
+    if (runs.length) await pool.query("UPDATE ads_ai_analysis_runs SET batch_id = ? WHERE id IN (?)", [batchId, runs.map(run => run.runId)]);
     await pool.query(`
       UPDATE ads_ai_batch_runs
       SET keyword_count = ?, input_payload = CAST(? AS JSON)
@@ -8769,9 +8848,9 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
       await pool.query("UPDATE ads_ai_batch_runs SET status = 'COMPLETE', output_payload = CAST(? AS JSON), completed_at = NOW() WHERE id = ?", [JSON.stringify({ results: [], skipped }), batchId]);
       return { started: false, reason: "NO_ELIGIBLE_KEYWORDS", skippedCount: skipped.length };
     }
-    const job = executeChunkedAdsAiBatchAnalysisRuns(runs, options.execution)
+    const job = executeChunkedAdsAiBatchAnalysisRuns(runs, options.execution, batchId)
       .then(async result => {
-        if (options.execution) await assertSystemScheduleExecutionActive(options.execution);
+        await assertAdsAiBatchActive(batchId, runs, options.execution);
         const lastError = result.status === "COMPLETE" ? null : `${result.summary.failedCount} 个关键词分析失败`;
         await pool.query("UPDATE ads_ai_batch_runs SET status = ?, output_payload = CAST(? AS JSON), last_error = ?, completed_at = NOW() WHERE id = ?", [result.status, JSON.stringify(result), lastError, batchId]);
         return result;
@@ -8792,7 +8871,8 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
     return { started: true, batchId, keywordCount: runs.length, skippedCount: skipped.length };
   } catch (error) {
     if (isSystemScheduleCancelledError(error)) {
-      await pool.query("UPDATE ads_ai_batch_runs SET status = 'CANCELLED', last_error = '用户已停止系统计划', completed_at = NOW() WHERE id = ?", [batchId]);
+      if (runs.length) await pool.query("UPDATE ads_ai_analysis_runs SET status = 'CANCELLED', validation_error = '用户已停止系统计划', completed_at = NOW() WHERE id IN (?) AND status = 'RUNNING'", [runs.map(run => run.runId)]);
+      await pool.query("UPDATE ads_ai_batch_runs SET status = 'CANCELLED', last_error = '用户已停止系统计划', completed_at = NOW() WHERE id = ? AND status = 'RUNNING'", [batchId]);
       throw error;
     }
     await Promise.all(runs.map(run => failAdsAiAnalysisRun(run.runId, null, error).catch(() => {})));
@@ -11511,6 +11591,7 @@ async function shutdownServer(signal) {
   systemScheduleTimer = null;
   for (const execution of systemScheduleExecutions.values()) execution.controller.abort();
   try {
+    await recoverInterruptedAdsAiBatchRuns("服务关闭，广告 AI 批量分析已中断，请重新执行");
     await recoverInterruptedAdsSyncJobs("服务关闭，任务已中断，请重新执行");
   } catch (error) {
     console.error(`Interrupted task shutdown recovery failed: ${error.message}`);
@@ -11528,6 +11609,7 @@ await ensureAppMysqlSchema();
 server.listen(PORT, async () => {
   console.log(`Amazon Aggregator running at http://localhost:${PORT}`);
   try {
+    await recoverInterruptedAdsAiBatchRuns();
     await recoverInterruptedAdsSyncJobs();
   } catch (error) {
     console.error(`Amazon Ads interrupted job recovery failed: ${error.message}`);
