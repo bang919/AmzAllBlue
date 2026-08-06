@@ -654,6 +654,7 @@ async function ensureAdsMysqlSchema(pool) {
       profile_id VARCHAR(64) NOT NULL,
       trigger_source VARCHAR(32) NOT NULL,
       schedule_date DATE NOT NULL,
+      run_key VARCHAR(64) NOT NULL DEFAULT '',
       status VARCHAR(32) NOT NULL DEFAULT 'RUNNING',
       keyword_count INT UNSIGNED NOT NULL DEFAULT 0,
       input_payload JSON NULL,
@@ -663,10 +664,13 @@ async function ensureAdsMysqlSchema(pool) {
       completed_at DATETIME NULL,
       created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
       PRIMARY KEY (id),
-      UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date),
+      UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date, run_key),
       KEY idx_ads_ai_batch_profile_status (profile_id, status, created_at)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query("ALTER TABLE ads_ai_batch_runs ADD COLUMN run_key VARCHAR(64) NOT NULL DEFAULT '' AFTER schedule_date").catch(() => {});
+  await pool.query("ALTER TABLE ads_ai_batch_runs DROP INDEX uq_ads_ai_batch_daily").catch(() => {});
+  await pool.query("ALTER TABLE ads_ai_batch_runs ADD UNIQUE KEY uq_ads_ai_batch_daily (profile_id, trigger_source, schedule_date, run_key)").catch(() => {});
   await pool.query(`
     CREATE TABLE IF NOT EXISTS sif_traffic_audit_runs (
       id VARCHAR(64) NOT NULL,
@@ -1109,7 +1113,7 @@ async function runSystemScheduleTaskNow(taskKey) {
   if (currentRows[0]?.last_status === "RUNNING") throw new Error("该任务正在执行，请先停止或等待完成");
   const runKey = `manual:${new Date().toISOString()}`;
   const execution = await startSystemScheduleExecution(pool, taskKey, runKey);
-  Promise.resolve(executeSystemScheduledTask(taskKey, execution)).then(async result => {
+  Promise.resolve(executeSystemScheduledTask(taskKey, execution, "MANUAL")).then(async result => {
     await finishSystemScheduleTask(pool, taskKey, result, { retry: false, execution });
   }).catch(async error => {
     if (isSystemScheduleCancelledError(error)) return;
@@ -8704,25 +8708,35 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
   const pool = getMysqlPool();
   if (options.execution) await assertSystemScheduleExecutionActive(options.execution);
   const batchId = randomUUID();
+  const triggerSource = options.triggerSource === "MANUAL" ? "MANUAL" : "DAILY";
+  const runKey = triggerSource === "MANUAL" ? batchId : "";
   let runs = [];
-  // 时区规则切换或部署重启时，避免 20 小时内重复产生一轮付费 DAILY 分析。
-  const [recentBatchRows] = await pool.query(`
-    SELECT id FROM ads_ai_batch_runs
-    WHERE profile_id = ? AND trigger_source = 'DAILY' AND status NOT IN ('FAILED', 'PARTIAL') AND started_at >= DATE_SUB(NOW(), INTERVAL 20 HOUR)
-    ORDER BY started_at DESC LIMIT 1
-  `, [String(profile.profileId)]);
-  if (recentBatchRows[0]) {
-    await pool.query(`
-      INSERT IGNORE INTO ads_ai_batch_runs (
-        id, profile_id, trigger_source, schedule_date, status, output_payload, last_error, completed_at
-      ) VALUES (?, ?, 'DAILY', ?, 'SKIPPED', CAST(? AS JSON), ?, NOW())
-    `, [batchId, String(profile.profileId), scheduleDate, JSON.stringify({ reason: "RECENTLY_RUN", previousBatchId: recentBatchRows[0].id }), "20 小时内已有每日分析，已避免时区切换造成重复扣费"]);
-    return { started: false, reason: "RECENTLY_RUN" };
+  if (triggerSource === "DAILY") {
+    // 时区规则切换或部署重启时，避免 20 小时内重复产生一轮付费 DAILY 分析。
+    const [recentBatchRows] = await pool.query(`
+      SELECT id FROM ads_ai_batch_runs
+      WHERE profile_id = ? AND trigger_source = 'DAILY' AND status NOT IN ('FAILED', 'PARTIAL', 'CANCELLED') AND started_at >= DATE_SUB(NOW(), INTERVAL 20 HOUR)
+      ORDER BY started_at DESC LIMIT 1
+    `, [String(profile.profileId)]);
+    if (recentBatchRows[0]) {
+      await pool.query(`
+        INSERT IGNORE INTO ads_ai_batch_runs (
+          id, profile_id, trigger_source, schedule_date, run_key, status, output_payload, last_error, completed_at
+        ) VALUES (?, ?, 'DAILY', ?, ?, 'SKIPPED', CAST(? AS JSON), ?, NOW())
+      `, [batchId, String(profile.profileId), scheduleDate, `skip:${batchId}`, JSON.stringify({ reason: "RECENTLY_RUN", previousBatchId: recentBatchRows[0].id }), "20 小时内已有每日分析，已避免时区切换造成重复扣费"]);
+      return { started: false, reason: "RECENTLY_RUN" };
+    }
+  } else {
+    const [runningManualRows] = await pool.query(
+      "SELECT id FROM ads_ai_batch_runs WHERE profile_id = ? AND trigger_source = 'MANUAL' AND status = 'RUNNING' ORDER BY started_at DESC LIMIT 1",
+      [String(profile.profileId)]
+    );
+    if (runningManualRows[0]) throw new Error("已有手动广告 AI 批量分析正在执行，请等待完成或先停止");
   }
   const [batchInsert] = await pool.query(`
-    INSERT IGNORE INTO ads_ai_batch_runs (id, profile_id, trigger_source, schedule_date, status)
-    VALUES (?, ?, 'DAILY', ?, 'RUNNING')
-  `, [batchId, String(profile.profileId), scheduleDate]);
+    INSERT IGNORE INTO ads_ai_batch_runs (id, profile_id, trigger_source, schedule_date, run_key, status)
+    VALUES (?, ?, ?, ?, ?, 'RUNNING')
+  `, [batchId, String(profile.profileId), triggerSource, scheduleDate, runKey]);
   if (!Number(batchInsert.affectedRows || 0)) return { started: false, reason: "ALREADY_RUN" };
   try {
     if (options.execution) await assertSystemScheduleExecutionActive(options.execution);
@@ -10282,7 +10296,7 @@ function startAdsPerformanceSchedule() {
   setTimeout(runRolling, Number(process.env.AMZ_ADS_STARTUP_ROLLING_DELAY_MS || 180_000));
 }
 
-async function executeSystemScheduledTask(taskKey, execution = null) {
+async function executeSystemScheduledTask(taskKey, execution = null, triggerSource = "DAILY") {
   if (execution) await assertSystemScheduleExecutionActive(execution);
   if (taskKey === "FBA_TODAY_SALES") {
     const today = formatDateInTimeZone();
@@ -10334,7 +10348,7 @@ async function executeSystemScheduledTask(taskKey, execution = null) {
   if (taskKey === "ADS_AI_ANALYSIS") {
     const profile = await readAdsProfileSelection();
     if (!profile?.profileId) return { skipped: true, reason: "NO_ADS_PROFILE" };
-    return startDailyAdsAiBatch(profile, formatDateInTimeZone(new Date(), SYSTEM_SCHEDULE_TIME_ZONE), { waitForCompletion: true, execution });
+    return startDailyAdsAiBatch(profile, formatDateInTimeZone(new Date(), SYSTEM_SCHEDULE_TIME_ZONE), { waitForCompletion: true, execution, triggerSource });
   }
   return { skipped: true, reason: "UNKNOWN_TASK" };
 }
