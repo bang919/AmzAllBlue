@@ -8562,6 +8562,18 @@ async function readAdsAiAsinAnalysisGuard(profileId, parentAsin) {
   };
 }
 
+async function readAdsAiKeywordRunningGuard(profileId, keywordId) {
+  const [rows] = await getMysqlPool().query(`
+    SELECT id, keyword_id
+    FROM ads_ai_analysis_runs
+    WHERE profile_id = ? AND keyword_id = ? AND status = 'RUNNING'
+    ORDER BY started_at DESC
+    LIMIT 1
+  `, [String(profileId), keywordId]);
+  const row = rows[0];
+  return row ? { state: 'RUNNING', runId: row.id, keywordId: String(row.keyword_id) } : null;
+}
+
 async function withAdsAiAsinLock(profileId, parentAsin, callback) {
   const pool = getMysqlPool();
   const connection = await pool.getConnection();
@@ -8578,9 +8590,11 @@ async function withAdsAiAsinLock(profileId, parentAsin, callback) {
   }
 }
 
-async function reserveAdsAiAnalysisRun(profile, keyword) {
+async function reserveAdsAiAnalysisRun(profile, keyword, { batch = false } = {}) {
   return withAdsAiAsinLock(profile.profileId, keyword.parent_asin, async () => {
-    const guard = await readAdsAiAsinAnalysisGuard(profile.profileId, keyword.parent_asin);
+    const guard = batch
+      ? await readAdsAiKeywordRunningGuard(profile.profileId, keyword.id)
+      : await readAdsAiAsinAnalysisGuard(profile.profileId, keyword.parent_asin);
     if (guard) return { guard, run: null };
     return { guard: null, run: await createAdsAiAnalysisRun(keyword.id) };
   });
@@ -8933,7 +8947,7 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
       await assertAdsAiBatchActive(batchId, runs, options.execution);
       const keywordId = String(goal.keyword_id);
       const keyword = { id: keywordId, parent_asin: goal.parent_asin };
-      const reservation = await reserveAdsAiAnalysisRun(profile, keyword);
+      const reservation = await reserveAdsAiAnalysisRun(profile, keyword, { batch: true });
       if (reservation.guard) {
         skipped.push({ keywordId, parentAsin: goal.parent_asin, reason: reservation.guard.state, blockedByRunId: reservation.guard.runId });
         continue;
