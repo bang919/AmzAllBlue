@@ -8537,7 +8537,9 @@ async function readAdsAiAsinAnalysisGuard(profileId, parentAsin) {
     SELECT r.id, r.keyword_id, r.status, r.started_at, r.completed_at
     FROM ads_ai_analysis_runs r
     JOIN ads_keywords k ON k.id = r.keyword_id
+    LEFT JOIN ads_ai_batch_runs b ON b.id = r.batch_id
     WHERE r.profile_id = ? AND k.parent_asin = ?
+      AND (r.batch_id IS NULL OR b.status IN ('RUNNING', 'COMPLETE'))
       AND (
         r.status = 'RUNNING'
         OR (r.status = 'COMPLETE' AND r.completed_at >= DATE_SUB(NOW(), INTERVAL ? MINUTE))
@@ -8631,6 +8633,57 @@ function adsAiBatchTimeoutError() {
   return new Error(`广告 AI 批量分析超过 ${adsAiBatchTimeoutMinutes()} 分钟仍未完成，已停止并释放任务锁`);
 }
 
+async function reconcileCompletedAdsAiBatchRuns(batchIds) {
+  const ids = batchIds.map(String).filter(Boolean);
+  if (!ids.length) return [];
+  const pool = getMysqlPool();
+  const [rows] = await pool.query(`
+    SELECT b.id, b.keyword_count, b.system_run_token,
+      COUNT(r.id) AS child_count,
+      SUM(CASE WHEN r.status = 'COMPLETE' THEN 1 ELSE 0 END) AS complete_count
+    FROM ads_ai_batch_runs b
+    LEFT JOIN ads_ai_analysis_runs r ON r.batch_id = b.id
+    WHERE b.id IN (?) AND b.status = 'RUNNING'
+    GROUP BY b.id, b.keyword_count, b.system_run_token
+  `, [ids]);
+  const completed = [];
+  for (const row of rows) {
+    const keywordCount = Number(row.keyword_count || 0);
+    const childCount = Number(row.child_count || 0);
+    const completeCount = Number(row.complete_count || 0);
+    if (!keywordCount || childCount !== keywordCount || completeCount !== keywordCount) continue;
+    const [runRows] = await pool.query(`
+      SELECT id, keyword_id, completed_at
+      FROM ads_ai_analysis_runs
+      WHERE batch_id = ? AND status = 'COMPLETE'
+      ORDER BY completed_at, id
+    `, [row.id]);
+    const output = {
+      status: 'COMPLETE',
+      recoveredAfterInterruption: true,
+      summary: { keywordCount, completeCount, failedCount: 0 },
+      results: runRows.map(run => ({ keywordId: String(run.keyword_id), runId: run.id, status: 'COMPLETE' }))
+    };
+    const [result] = await pool.query(`
+      UPDATE ads_ai_batch_runs
+      SET status = 'COMPLETE', output_payload = CAST(? AS JSON), last_error = NULL, completed_at = NOW()
+      WHERE id = ? AND status = 'RUNNING'
+    `, [JSON.stringify(output), row.id]);
+    if (!result.affectedRows) continue;
+    completed.push(String(row.id));
+    if (row.system_run_token) {
+      await pool.query(`
+        UPDATE system_schedule_settings
+        SET last_completed_at = NOW(), last_success_at = NOW(), last_status = 'COMPLETE',
+          last_error = NULL, retry_count = 0, next_retry_at = NULL
+        WHERE task_key = 'ADS_AI_ANALYSIS' AND run_token = ? AND last_status = 'RUNNING'
+      `, [row.system_run_token]);
+    }
+    console.log(`Recovered completed Ads AI batch ${row.id} after interruption.`);
+  }
+  return completed;
+}
+
 async function cancelAdsAiBatchRuns({ batchIds = [], systemRunToken = "", reason }) {
   const pool = getMysqlPool();
   const ids = batchIds.map(String).filter(Boolean);
@@ -8644,13 +8697,17 @@ async function cancelAdsAiBatchRuns({ batchIds = [], systemRunToken = "", reason
   }
   const runningIds = rows.map(row => String(row.id));
   if (!runningIds.length) return [];
+  await reconcileCompletedAdsAiBatchRuns(runningIds);
+  const [remainingRows] = await pool.query("SELECT id FROM ads_ai_batch_runs WHERE id IN (?) AND status = 'RUNNING'", [runningIds]);
+  const remainingIds = remainingRows.map(row => String(row.id));
+  if (!remainingIds.length) return runningIds;
   await pool.query(
     "UPDATE ads_ai_batch_runs SET status = 'CANCELLED', last_error = ?, completed_at = NOW() WHERE id IN (?) AND status = 'RUNNING'",
-    [reason, runningIds]
+    [reason, remainingIds]
   );
   await pool.query(
     "UPDATE ads_ai_analysis_runs SET status = 'CANCELLED', validation_error = ?, completed_at = NOW() WHERE batch_id IN (?) AND status = 'RUNNING'",
-    [reason, runningIds]
+    [reason, remainingIds]
   );
   return runningIds;
 }
