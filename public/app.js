@@ -781,7 +781,10 @@ function systemScheduleStatus(task) {
   if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}`;
   if (task.lastStatus === "CANCELLED") return `已停止：${task.lastError || "用户已停止任务"}`;
   if (task.lastStatus === "SKIPPED") return `上次跳过：${task.lastError || "无需执行"}`;
-  if (task.lastStatus === "RUNNING") return `正在执行 · ${formatDate(task.lastStartedAt)}`;
+  if (task.lastStatus === "RUNNING") {
+    const previous = task.lastCompletedAt ? ` · 上次完成：${formatDate(task.lastCompletedAt)}` : "";
+    return `正在执行 · 本次开始：${formatDate(task.lastStartedAt)}${previous}`;
+  }
   return `上次完成：${formatDate(task.lastCompletedAt || task.lastStartedAt)}`;
 }
 

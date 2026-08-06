@@ -6388,7 +6388,7 @@ async function deleteSifTrafficAuditRun(runId) {
   return { deleted: true };
 }
 
-async function callOpenAI(messages, jsonMode = false) {
+async function callOpenAI(messages, jsonMode = false, options = {}) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) return null;
   const baseUrl = (process.env.OPENAI_BASE_URL || "https://cc-ai.xyz").replace(/\/+$/, "").replace(/\/v1$/i, "");
@@ -6396,7 +6396,7 @@ async function callOpenAI(messages, jsonMode = false) {
   const wireApi = (process.env.OPENAI_WIRE_API || "responses").toLowerCase();
   const reasoningEffort = process.env.OPENAI_REASONING_EFFORT || "xhigh";
   const storeResponses = process.env.OPENAI_STORE_RESPONSES === "true";
-  const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
+  const timeoutMs = Number(options.timeoutMs || process.env.OPENAI_TIMEOUT_MS || 120000);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -6934,7 +6934,7 @@ function adsReportDownloadTimeoutMs() {
 }
 
 function adsReportWaitTimeoutMs() {
-  return Math.max(10 * 60_000, Number(process.env.AMZ_ADS_REPORT_WAIT_MS || 45 * 60_000));
+  return Math.max(10 * 60_000, Number(process.env.AMZ_ADS_REPORT_WAIT_MS || 50 * 60_000));
 }
 
 function adsReportPollMs() {
@@ -8445,7 +8445,7 @@ async function failAdsAiAnalysisRun(runId, outputForAudit, error) {
   await getMysqlPool().query(`
     UPDATE ads_ai_analysis_runs
     SET status = 'FAILED', output_payload = CAST(? AS JSON), validation_error = ?, completed_at = NOW()
-    WHERE id = ?
+    WHERE id = ? AND status = 'RUNNING'
   `, [JSON.stringify(outputForAudit), error.message, runId]);
 }
 
@@ -8588,7 +8588,11 @@ async function expireStaleAdsAiAnalysisRuns(profileId, keywordId = null) {
 }
 
 function adsAiBatchTimeoutMinutes() {
-  return Math.round(adsAiNumber(process.env.ADS_AI_BATCH_TIMEOUT_MINUTES, 10, 1, 60));
+  return Math.round(adsAiNumber(process.env.ADS_AI_BATCH_TIMEOUT_MINUTES, 40, 1, 120));
+}
+
+function adsAiBatchRequestTimeoutMs() {
+  return Math.max(120_000, Number(process.env.ADS_AI_BATCH_REQUEST_TIMEOUT_MS || 5 * 60_000));
 }
 
 function adsAiBatchTimeoutError() {
@@ -8652,7 +8656,7 @@ async function executeAdsAiBatchAnalysisRuns(runs, assertActive = null) {
         content: `你是 Amazon Ads 每日批量关键词投放分析器。只能根据每个关键词各自的输入 JSON 和策略规则判断，不得在关键词之间混用数据。真实调整是否自动执行由输入策略中的处理建议行动模式决定。若某关键词的 recentAiHistory.entries 非空，必须结合其中近期分析结论与建议状态，避免重复已执行、已确认、已拒绝或已被取代的行动。只返回一个 JSON 对象，不要 Markdown。\n输出格式必须严格为：\n{"results":[{"keywordId":"输入中的 keywordId","analysisSummary":"string","signals":[{"code":"string","severity":"info|warning|critical","summary":"string","evidence":["输入字段路径"]}],"recommendations":[{"actionType":"CHANGE_BID|CHANGE_PLACEMENT_ADJUSTMENT|CHANGE_DAILY_BUDGET|PAUSE_CAMPAIGN|RESUME_CAMPAIGN|MOVE_GROUP|REQUEST_MORE_DATA|NO_ACTION","target":{},"before":{},"after":{},"reason":"string","risk":"string","evidence":["输入字段路径"],"confidence":0.0,"observeDays":3}]}]}\n每个输入关键词必须恰好返回一个同 keywordId 的结果。必须使用输入中真实存在的本地 ID。证据不足时返回 REQUEST_MORE_DATA 或空 recommendations。`
       },
       { role: "user", content: JSON.stringify({ analyses: runs.map(run => run.input) }) }
-    ], true);
+    ], true, { timeoutMs: adsAiBatchRequestTimeoutMs() });
     if (!content) throw new Error("未配置 OPENAI_API_KEY，无法调用 CCAI 分析");
     outputForAudit = { rawText: String(content).slice(0, 500000) };
     let rawOutput;
@@ -8781,12 +8785,20 @@ async function executeChunkedAdsAiBatchAnalysisRuns(runs, execution = null, batc
   };
 }
 
+function adsAiBatchResultError(result) {
+  const errors = [...new Set([
+    ...(Array.isArray(result?.chunks) ? result.chunks.map(chunk => chunk?.error) : []),
+    ...(Array.isArray(result?.results) ? result.results.map(item => item?.error) : [])
+  ].map(value => String(value || "").trim()).filter(Boolean))];
+  return errors.join("; ") || `${Number(result?.summary?.failedCount || 0)} 个关键词 AI 分析失败`;
+}
+
 async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
   const pool = getMysqlPool();
   if (options.execution) await assertSystemScheduleExecutionActive(options.execution);
   const batchId = randomUUID();
   const triggerSource = options.triggerSource === "MANUAL" ? "MANUAL" : "DAILY";
-  const runKey = triggerSource === "MANUAL" ? batchId : "";
+  const runKey = batchId;
   let runs = [];
   if (triggerSource === "DAILY") {
     // 时区规则切换或部署重启时，避免 20 小时内重复产生一轮付费 DAILY 分析。
@@ -8851,9 +8863,9 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
     const job = executeChunkedAdsAiBatchAnalysisRuns(runs, options.execution, batchId)
       .then(async result => {
         await assertAdsAiBatchActive(batchId, runs, options.execution);
-        const lastError = result.status === "COMPLETE" ? null : `${result.summary.failedCount} 个关键词分析失败`;
+        const lastError = result.status === "COMPLETE" ? null : adsAiBatchResultError(result);
         await pool.query("UPDATE ads_ai_batch_runs SET status = ?, output_payload = CAST(? AS JSON), last_error = ?, completed_at = NOW() WHERE id = ?", [result.status, JSON.stringify(result), lastError, batchId]);
-        return result;
+        return lastError ? { ...result, error: lastError } : result;
       })
       .catch(async error => {
         if (isSystemScheduleCancelledError(error)) throw error;
@@ -8865,7 +8877,7 @@ async function startDailyAdsAiBatch(profile, scheduleDate, options = {}) {
     runs.forEach(run => adsAiAnalysisJobs.set(run.input.context.keywordId, job));
     if (options.waitForCompletion) {
       const result = await job;
-      if (result.status !== "COMPLETE") throw new Error(result.error || `${result.summary?.failedCount || 0} 个关键词 AI 分析失败`);
+      if (result.status !== "COMPLETE") throw new Error(result.error || adsAiBatchResultError(result));
       return { started: true, batchId, keywordCount: runs.length, skippedCount: skipped.length, status: result.status };
     }
     return { started: true, batchId, keywordCount: runs.length, skippedCount: skipped.length };
@@ -10302,7 +10314,7 @@ async function enqueueAdsSync(startDate, endDate, options = {}) {
   return { jobs, range: { startDate: safeStart, endDate: safeEnd } };
 }
 
-async function waitForAdsSyncJobs(jobs, timeoutMs = 35 * 60_000, execution = null) {
+async function waitForAdsSyncJobs(jobs, timeoutMs = 50 * 60_000, execution = null) {
   const ids = jobs.map(job => String(job.id)).filter(Boolean);
   if (!ids.length) return { jobs: [] };
   const deadline = Date.now() + timeoutMs;
