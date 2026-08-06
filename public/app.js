@@ -777,15 +777,15 @@ function switchModule(module) {
 
 function systemScheduleStatus(task) {
   if (!task.lastStartedAt) return "尚未执行";
-  if (task.lastStatus === "RETRY_WAIT") return `执行失败，将于 ${formatDate(task.nextRetryAt)} 自动重试（第 ${Number(task.retryCount || 1)}/2 次）`;
-  if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}`;
-  if (task.lastStatus === "CANCELLED") return `已停止：${task.lastError || "用户已停止任务"}`;
-  if (task.lastStatus === "SKIPPED") return `上次跳过：${task.lastError || "无需执行"}`;
+  const lastSuccess = ` · 上次成功：${task.lastSuccessAt ? formatDate(task.lastSuccessAt) : "尚无记录"}`;
+  if (task.lastStatus === "RETRY_WAIT") return `执行失败，将于 ${formatDate(task.nextRetryAt)} 自动重试（第 ${Number(task.retryCount || 1)}/2 次）${lastSuccess}`;
+  if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}${lastSuccess}`;
+  if (task.lastStatus === "CANCELLED") return `已停止：${task.lastError || "用户已停止任务"}${lastSuccess}`;
+  if (task.lastStatus === "SKIPPED") return `上次跳过：${task.lastError || "无需执行"}${lastSuccess}`;
   if (task.lastStatus === "RUNNING") {
-    const previous = task.lastCompletedAt ? ` · 上次完成：${formatDate(task.lastCompletedAt)}` : "";
-    return `正在执行 · 本次开始：${formatDate(task.lastStartedAt)}${previous}`;
+    return `正在执行 · 本次开始：${formatDate(task.lastStartedAt)}${lastSuccess}`;
   }
-  return `上次完成：${formatDate(task.lastCompletedAt || task.lastStartedAt)}`;
+  return `上次成功：${formatDate(task.lastSuccessAt || task.lastCompletedAt || task.lastStartedAt)}`;
 }
 
 function renderSystemSchedules() {

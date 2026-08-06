@@ -836,6 +836,7 @@ async function ensureAppMysqlSchema() {
       last_run_key VARCHAR(32) NULL,
       last_started_at DATETIME NULL,
       last_completed_at DATETIME NULL,
+      last_success_at DATETIME NULL,
       last_status VARCHAR(16) NULL,
       last_error TEXT NULL,
       retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0,
@@ -846,10 +847,40 @@ async function ensureAppMysqlSchema() {
       PRIMARY KEY (task_key)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `);
+  await pool.query("ALTER TABLE system_schedule_settings ADD COLUMN last_success_at DATETIME NULL AFTER last_completed_at").catch(() => {});
   await pool.query("ALTER TABLE system_schedule_settings ADD COLUMN retry_count TINYINT UNSIGNED NOT NULL DEFAULT 0 AFTER last_error").catch(() => {});
   await pool.query("ALTER TABLE system_schedule_settings ADD COLUMN next_retry_at DATETIME NULL AFTER retry_count").catch(() => {});
   await pool.query("ALTER TABLE system_schedule_settings ADD COLUMN run_token CHAR(36) NULL AFTER next_retry_at").catch(() => {});
   await ensureAdsMysqlSchema(pool);
+  await pool.query(`
+    UPDATE system_schedule_settings
+    SET last_success_at = COALESCE(last_success_at, last_completed_at, last_started_at)
+    WHERE last_status = 'COMPLETE' AND last_success_at IS NULL
+  `);
+  await pool.query(`
+    UPDATE system_schedule_settings s
+    JOIN (
+      SELECT MAX(completed_at) last_success_at
+      FROM ads_ai_batch_runs WHERE status = 'COMPLETE'
+    ) history ON history.last_success_at IS NOT NULL
+    SET s.last_success_at = IF(s.last_success_at IS NULL OR s.last_success_at < history.last_success_at, history.last_success_at, s.last_success_at)
+    WHERE s.task_key = 'ADS_AI_ANALYSIS'
+  `);
+  await pool.query(`
+    UPDATE system_schedule_settings s
+    JOIN (
+      SELECT MAX(pair_completed_at) last_success_at
+      FROM (
+        SELECT MAX(completed_at) pair_completed_at
+        FROM ads_sync_jobs
+        WHERE report_type IN ('AD_GROUP', 'PLACEMENT') AND start_date = end_date
+        GROUP BY profile_id, start_date, end_date, created_at
+        HAVING COUNT(DISTINCT CASE WHEN status = 'COMPLETE' THEN report_type END) = 2
+      ) completed_pairs
+    ) history ON history.last_success_at IS NOT NULL
+    SET s.last_success_at = IF(s.last_success_at IS NULL OR s.last_success_at < history.last_success_at, history.last_success_at, s.last_success_at)
+    WHERE s.task_key = 'ADS_TODAY_PERFORMANCE'
+  `);
   appMysqlSchemaReady = true;
   return true;
 }
@@ -957,6 +988,7 @@ function mapSystemSchedule(row) {
     lastRunKey: row.last_run_key || "",
     lastStartedAt: row.last_started_at,
     lastCompletedAt: row.last_completed_at,
+    lastSuccessAt: row.last_success_at,
     lastStatus: row.last_status || "",
     lastError: row.last_error || "",
     retryCount: Number(row.retry_count || 0),
@@ -1059,8 +1091,8 @@ async function finishSystemScheduleTask(pool, taskKey, result, options = {}) {
     return;
   }
   await pool.query(
-    "UPDATE system_schedule_settings SET last_completed_at = NOW(), last_status = ?, last_error = ?, retry_count = 0, next_retry_at = NULL WHERE task_key = ? AND last_status = 'RUNNING' AND run_token = ?",
-    [outcome.status, outcome.error, taskKey, options.execution?.runToken || null]
+    "UPDATE system_schedule_settings SET last_completed_at = NOW(), last_success_at = IF(? = 'COMPLETE', NOW(), last_success_at), last_status = ?, last_error = ?, retry_count = 0, next_retry_at = NULL WHERE task_key = ? AND last_status = 'RUNNING' AND run_token = ?",
+    [outcome.status, outcome.status, outcome.error, taskKey, options.execution?.runToken || null]
   );
 }
 
@@ -11631,7 +11663,7 @@ server.listen(PORT, async () => {
       try {
         await enqueueStartupFbaSyncJobs();
         await ensureSystemScheduleDefaults();
-        await getMysqlPool().query("UPDATE system_schedule_settings SET last_started_at = NOW(), last_status = 'COMPLETE' WHERE task_key IN ('FBA_TODAY_SALES','FBA_CURRENT_INVENTORY')");
+        await getMysqlPool().query("UPDATE system_schedule_settings SET last_started_at = NOW(), last_completed_at = NOW(), last_success_at = NOW(), last_status = 'COMPLETE' WHERE task_key IN ('FBA_TODAY_SALES','FBA_CURRENT_INVENTORY')");
       } catch (error) {
         console.error(`FBA startup sync failed: ${error.message}`);
       } finally {
