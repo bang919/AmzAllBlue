@@ -6502,6 +6502,7 @@ async function callOpenAIChat(messages, jsonMode = false) {
   if (!apiKey) return null;
   const baseUrl = (process.env.OPENAI_BASE_URL || "https://cc-ai.xyz").replace(/\/+$/, "").replace(/\/v1$/i, "");
   const model = process.env.OPENAI_MODEL || "gpt-5.4";
+  const reasoningEffort = process.env.OPENAI_REASONING_EFFORT || "xhigh";
   const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 120000);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
@@ -6517,6 +6518,7 @@ async function callOpenAIChat(messages, jsonMode = false) {
         model,
         messages,
         temperature: 0.1,
+        reasoning_effort: reasoningEffort || undefined,
         response_format: jsonMode ? { type: "json_object" } : undefined
       }),
       signal: controller.signal
