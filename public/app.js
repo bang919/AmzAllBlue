@@ -779,6 +779,7 @@ function systemScheduleStatus(task) {
   if (!task.lastStartedAt) return "尚未执行";
   if (task.lastStatus === "RETRY_WAIT") return `执行失败，将于 ${formatDate(task.nextRetryAt)} 自动重试（第 ${Number(task.retryCount || 1)}/2 次）`;
   if (task.lastStatus === "FAILED") return `上次失败：${task.lastError || "未知错误"}`;
+  if (task.lastStatus === "CANCELLED") return `已停止：${task.lastError || "用户已停止任务"}`;
   if (task.lastStatus === "SKIPPED") return `上次跳过：${task.lastError || "无需执行"}`;
   if (task.lastStatus === "RUNNING") return `正在执行 · ${formatDate(task.lastStartedAt)}`;
   return `上次完成：${formatDate(task.lastCompletedAt || task.lastStartedAt)}`;
@@ -790,12 +791,15 @@ function renderSystemSchedules() {
   list.innerHTML = systemSchedules.map(task => `
     <section class="system-schedule-card ${task.enabled ? "enabled" : ""}" data-system-schedule="${escapeHtml(task.key)}">
       <label class="system-schedule-switch"><input data-system-schedule-enabled type="checkbox" ${task.enabled ? "checked" : ""}><span></span></label>
-      <div class="system-schedule-copy"><strong>${escapeHtml(task.label)}</strong><p>${escapeHtml(task.description)}</p><small class="${["FAILED", "SKIPPED", "RETRY_WAIT"].includes(task.lastStatus) ? "failed" : ""}">${escapeHtml(systemScheduleStatus(task))}</small></div>
+      <div class="system-schedule-copy"><strong>${escapeHtml(task.label)}</strong><p>${escapeHtml(task.description)}</p><small class="${["FAILED", "SKIPPED", "RETRY_WAIT", "CANCELLED"].includes(task.lastStatus) ? "failed" : ""}">${escapeHtml(systemScheduleStatus(task))}</small></div>
       <div class="system-schedule-controls">
         ${task.scheduleType === "DAILY"
           ? `<label class="system-schedule-value">执行时间（北京时间）<input data-system-schedule-time type="time" value="${escapeHtml(task.timeBeijing || "09:00")}"></label>`
           : `<label class="system-schedule-value">执行间隔（分钟）<input data-system-schedule-interval type="number" min="${Number(task.minIntervalMinutes || 1)}" step="1" value="${Number(task.intervalMinutes || 60)}"></label>`}
-        <button type="button" class="secondary-button system-schedule-run" data-system-schedule-run ${task.lastStatus === "RUNNING" ? "disabled" : ""}>立即执行</button>
+        <div class="system-schedule-actions">
+          <button type="button" class="secondary-button system-schedule-run" data-system-schedule-run ${task.lastStatus === "RUNNING" ? "disabled" : ""}>立即执行</button>
+          ${task.lastStatus === "RUNNING" ? `<button type="button" class="danger-button system-schedule-stop" data-system-schedule-stop>停止</button>` : ""}
+        </div>
       </div>
     </section>`).join("");
 }
@@ -838,6 +842,20 @@ async function runSystemScheduleNow(button) {
     renderSystemSchedules();
   } finally {
     setBusy(button, false, "立即执行");
+  }
+}
+
+async function stopSystemSchedule(button) {
+  const card = button.closest("[data-system-schedule]");
+  const taskKey = card?.dataset.systemSchedule || "";
+  if (!taskKey) return;
+  setBusy(button, true, "停止中…");
+  try {
+    const data = await api(`/api/system/schedules/${encodeURIComponent(taskKey)}/stop`, { method: "POST", body: {} });
+    systemSchedules = data.tasks || [];
+    renderSystemSchedules();
+  } finally {
+    setBusy(button, false, "停止");
   }
 }
 
@@ -4879,6 +4897,8 @@ $("#systemScheduleList").addEventListener("change", event => {
 $("#systemScheduleList").addEventListener("click", event => {
   const runButton = event.target.closest("[data-system-schedule-run]");
   if (runButton) runSystemScheduleNow(runButton).catch(error => alert(error.message));
+  const stopButton = event.target.closest("[data-system-schedule-stop]");
+  if (stopButton) stopSystemSchedule(stopButton).catch(error => alert(error.message));
 });
 $("#adsKeywordSearch").addEventListener("input", renderAdsKeywordRows);
 $("#adsKeywordForm").addEventListener("submit", saveAdsKeywordDraft);
