@@ -861,9 +861,10 @@ async function ensureAppMysqlSchema() {
     UPDATE system_schedule_settings s
     JOIN (
       SELECT MAX(completed_at) last_success_at
-      FROM ads_ai_batch_runs WHERE status = 'COMPLETE'
+      FROM ads_ai_batch_runs
+      WHERE status = 'COMPLETE' AND keyword_count > 0
     ) history ON history.last_success_at IS NOT NULL
-    SET s.last_success_at = IF(s.last_success_at IS NULL OR s.last_success_at < history.last_success_at, history.last_success_at, s.last_success_at)
+    SET s.last_success_at = history.last_success_at
     WHERE s.task_key = 'ADS_AI_ANALYSIS'
   `);
   await pool.query(`
@@ -8459,7 +8460,7 @@ async function autoExecuteAdsAiRecommendations(runId, input) {
   const rows = await getMysqlPool().query(`
     SELECT id, action_type FROM ads_ai_recommendations
     WHERE analysis_run_id = ? AND status = 'PENDING'
-  `).then(([result]) => result);
+  `, [runId]).then(([result]) => result);
   const executed = [];
   for (const row of rows) {
     if (!adsAiApprovalAllows(row.action_type, mode)) continue;
