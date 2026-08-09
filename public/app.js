@@ -3783,9 +3783,10 @@ function renderAdsMatchCell(keyword, matchType) {
       const value = 1 + Number(adjustment || 0) / 100;
       return Number.isInteger(value) ? String(value) : value.toFixed(1).replace(/\.0$/, "");
     };
-    const placementBid = adjustment => unit ? asMoney(Number(unit.bid) * (1 + Number(adjustment || 0) / 100), currency) : "-";
+    const matchMoney = value => asMoney(value, currency).replace(/^US\$/, "$");
+    const placementBid = adjustment => unit ? matchMoney(Number(unit.bid) * (1 + Number(adjustment || 0) / 100)) : "-";
     return `<div class="ads-match-summary">
-      <span class="ads-match-cpc">CPC：${unit ? asMoney(unit.bid, currency) : "-"}</span>
+      <span class="ads-match-cpc">CPC：${unit ? matchMoney(unit.bid) : "-"}</span>
       <span class="ads-match-pill on">已开始</span>
       <span class="ads-match-placements">顶部 x${multiplier(enabledCampaign.topOfSearchAdjustment)} = ${placementBid(enabledCampaign.topOfSearchAdjustment)}<br>其余 x${multiplier(enabledCampaign.restOfSearchAdjustment)} = ${placementBid(enabledCampaign.restOfSearchAdjustment)}<br>商品 x${multiplier(enabledCampaign.productPageAdjustment)} = ${placementBid(enabledCampaign.productPageAdjustment)}</span>
     </div>`;
