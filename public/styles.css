@@ -3123,6 +3123,10 @@ td.sif-index-col > span {
 .ads-object-state.ready { background: #dcfce7; color: #15803d; }
 .ads-match-pill.paused { background: #f1f5f9; color: #64748b; }
 .ads-match-pill.error { background: #fee2e2; color: #b91c1c; }
+.ads-match-summary { display: grid; justify-items: start; gap: 4px; min-width: 62px; line-height: 1.2; }
+.ads-match-summary .ads-match-pill { padding: 3px 7px; }
+.ads-match-cpc { color: #475569; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.ads-match-placements { color: #64748b; font-size: 10px; line-height: 1.45; white-space: nowrap; }
 
 .ads-table-empty,
 .ads-empty-detail,

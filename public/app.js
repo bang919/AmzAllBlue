@@ -3775,7 +3775,20 @@ function renderAdsMatchCell(keyword, matchType) {
   if (campaigns.some(campaign => campaign.creationStatus === "CREATING")) return `<span class="ads-match-pill draft">创建中</span>`;
   if (campaigns.some(campaign => campaign.creationStatus === "NOT_CREATED")) return `<span class="ads-match-pill draft">创建中</span>`;
   if (campaigns.some(campaign => campaign.creationStatus !== "COMPLETE")) return `<span class="ads-match-pill error">未完成</span>`;
-  if (campaigns.some(campaign => campaign.desiredState === "ENABLED")) return `<span class="ads-match-pill on">已开始</span>`;
+  const enabledCampaign = campaigns.find(campaign => campaign.desiredState === "ENABLED");
+  if (enabledCampaign) {
+    const unit = enabledCampaign.units[0];
+    const currency = adsWorkspace.profile?.currencyCode || "USD";
+    const multiplier = adjustment => {
+      const value = 1 + Number(adjustment || 0) / 100;
+      return Number.isInteger(value) ? String(value) : value.toFixed(1).replace(/\.0$/, "");
+    };
+    return `<div class="ads-match-summary">
+      <span class="ads-match-cpc">CPC：${unit ? asMoney(unit.bid, currency) : "-"}</span>
+      <span class="ads-match-pill on">已开始</span>
+      <span class="ads-match-placements">顶部 x${multiplier(enabledCampaign.topOfSearchAdjustment)}<br>其余 x${multiplier(enabledCampaign.restOfSearchAdjustment)}<br>商品 x${multiplier(enabledCampaign.productPageAdjustment)}</span>
+    </div>`;
+  }
   return `<span class="ads-match-pill paused">已暂停</span>`;
 }
 
