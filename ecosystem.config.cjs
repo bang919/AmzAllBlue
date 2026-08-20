@@ -3,9 +3,8 @@
     name: "AmzAllBlue",
     script: "./server.mjs",     // 相对当前目录
     interpreter: "node",
-    watch: true,
-    // 数据缓存和请求调试记录由运行中的任务持续写入；不能把它们当成代码变更。
-    // 保留 watch 后，PM2 仍会在源码更新时重载，并会在进程异常退出时自动拉起。
-    ignore_watch: ["node_modules", "logs", "data"]
+    // 只监控源码位置，避免运行数据、Git 元数据或日志导致重启循环。
+    // PM2 仍会在进程异常退出时自动拉起服务。
+    watch: ["server.mjs", "lib", "public", "scripts"]
   }]
 };

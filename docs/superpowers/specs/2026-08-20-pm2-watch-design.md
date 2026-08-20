@@ -6,7 +6,7 @@
 
 ## 方案
 
-在 `ecosystem.config.cjs` 保持 `watch: true`，并将 `data` 加入 `ignore_watch`。`data` 中的缓存、令牌与网络调试日志均是运行时数据，不应触发服务重载。
+在 `ecosystem.config.cjs` 使用源码目录白名单：`server.mjs`、`lib`、`public` 和 `scripts`。`data` 中的缓存、令牌与网络调试日志，以及 `.git` 元数据，均不在监控范围内，因此不会触发服务重载。
 
 ## 验证
 
