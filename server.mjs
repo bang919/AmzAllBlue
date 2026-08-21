@@ -8784,7 +8784,14 @@ async function executeAdsAiBatchAnalysisRuns(runs, assertActive = null) {
       const result = resultsByKeywordId.get(run.input.context.keywordId);
       try {
         if (assertActive) await assertActive();
-        if (!result) throw new Error("AI 批量结果缺少该关键词");
+        if (!result) {
+          // 模型偶尔会漏掉批量响应中的某个关键词。不要让已成功的批量结果
+          // 因此失效；仅对遗漏项走既有的单条分析流程重试一次。
+          await executeAdsAiAnalysisRun(run.runId, run.input);
+          if (assertActive) await assertActive();
+          completed.push({ keywordId: run.input.context.keywordId, runId: run.runId, status: "COMPLETE", retriedIndividually: true });
+          continue;
+        }
         const { keywordId, ...rawKeywordOutput } = result;
         const output = validateAdsAiOutput(rawKeywordOutput, run.input);
         await persistAdsAiAnalysisOutput(run.runId, run.input, output);
