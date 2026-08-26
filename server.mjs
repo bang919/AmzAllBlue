@@ -1173,7 +1173,13 @@ async function runSystemScheduleTaskNow(taskKey) {
 }
 
 function parseSifCurl(curlText) {
-  const source = String(curlText || "").trim();
+  // Chrome 在 Windows 的“Copy as cURL (cmd)”中会用 ^ 转义引号和续行符；
+  // 先统一为常规 cURL 格式，后面的解析可同时兼容 Windows、macOS 和 Linux。
+  const source = String(curlText || "")
+    .replace(/\^\r?\n/g, " ")
+    .replace(/\^"/g, '"')
+    .replace(/\^'/g, "'")
+    .trim();
   if (!source) throw new Error("请粘贴从 SIF 复制的 cURL 请求");
   const urlMatch = source.match(/https:\/\/www\.sif\.com\/api\/[^\s'\"]*/i);
   if (!urlMatch) throw new Error("未找到有效的 SIF API 请求地址");
